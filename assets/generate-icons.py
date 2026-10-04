@@ -29,12 +29,21 @@ therefore multiplied by alpha before averaging and divided out again afterwards:
 Verified: partial-alpha edge pixels stay magenta (rgb(235, 2, 163) at 16px from
 the earlier artwork) instead of darkening.
 
-## Symbolic variants are alpha silhouettes
+## Symbolic variants knock the mark out of the badge
 
 A freedesktop *symbolic* icon is a single-colour shape that the toolkit
 recolours to match the active theme, so it must not carry the artwork's own
-colours. Keeping only the alpha channel and discarding RGB is the correct
-derivation, not a lossy approximation.
+colours.
+
+It is tempting to keep only the alpha channel and discard RGB. That is wrong for
+this artwork: the badge is fully opaque, so an alpha silhouette is a featureless
+solid block with no mark in it at all -- a black square. The mark is defined by
+*colour* (dark on magenta), not by coverage.
+
+Instead the mark is detected by luminance and made transparent, leaving a
+single-colour badge with the mark cut out of it, which is the conventional
+symbolic treatment for a filled badge. Colour is forced to black, which is the
+conventional "currentColor" placeholder -- the toolkit recolours it.
 
 ## Note on the source alpha
 
@@ -141,7 +150,7 @@ def resize_premultiplied(src, size):
     for j in range(size):
         y0, y1 = min(int(ys[j]), height), min(max(int(ys[j]) + 1, int(ys[j + 1])), height)
         for i in range(size):
-            x0, x1 = min(int(xs[j]), width), min(max(int(xs[j]) + 1, int(xs[j + 1])), width)
+            x0, x1 = min(int(xs[i]), width), min(max(int(xs[i]) + 1, int(xs[i + 1])), width)
             if y1 <= y0 or x1 <= x0:
                 out[j, i] = 0
                 continue
@@ -155,25 +164,123 @@ def resize_premultiplied(src, size):
     return out
 
 
-def silhouette(src):
-    """Alpha-only copy: a symbolic icon is recoloured by the toolkit."""
+# Rec. 601 luma weights.
+_LUMA = np.array([0.299, 0.587, 0.114])
+
+
+def symbolic(src):
+    """Single-colour badge with the mark knocked out, for the active theme.
+
+    An alpha-only silhouette does not work here: the badge is opaque, so it
+    would be a featureless black square. The mark is found by luminance instead
+    -- the artwork is bright magenta with near-black strokes, so the dark
+    fraction is a clean separator -- and made transparent.
+    """
     height, width, _ = src.shape
+    rgb = src[..., :3].astype(np.float64)
+    alpha = src[..., 3].astype(np.float64)
+
+    # The badge is one large flat colour, so its luma is the *mode* of the
+    # opaque pixels. Anything meaningfully darker is the mark. Percentiles are
+    # unreliable here because after downscaling the mark can be a small
+    # minority, and at 16px it barely registers at all.
+    opaque = alpha > 200
+    luma = rgb @ _LUMA
+    if not opaque.any():
+        mark = np.zeros((height, width), dtype=bool)
+    else:
+        badge = np.median(luma[opaque])
+        spread = max(1.0, 0.10 * badge)
+        mark = (luma < badge - spread) & opaque
+
     out = np.zeros((height, width, 4), dtype=np.uint8)
-    out[..., 3] = src[..., 3]
+    # Smooth the knockout so the mark does not alias into ragged pixels.
+    frac = mark.astype(np.float64)
+    if height > 2 and width > 2:
+        frac = (
+            frac
+            + np.roll(frac, 1, axis=0)
+            + np.roll(frac, -1, axis=0)
+            + np.roll(frac, 1, axis=1)
+            + np.roll(frac, -1, axis=1)
+        ) / 5.0
+        frac = np.clip((frac - 0.2) / 0.6, 0.0, 1.0)
+    out[..., 3] = np.clip(alpha * (1.0 - frac), 0, 255).astype(np.uint8)
     return out
 
 
+def check_not_banded(path):
+    """Fail if an icon came out as horizontal bands.
+
+    Regression guard. An earlier version of `resize_premultiplied` indexed the
+    column edges with the *row* variable, so every output row sampled one single
+    x-window. The result was flat horizontal stripes of varying thickness with
+    the artwork's mark averaged away -- which is exactly what it looked like.
+
+    The signature is that each row is internally uniform, so no row ever
+    contains both the badge colour and the darker mark. With the artwork's mark
+    present, plenty of rows must.
+    """
+    img = load_png(path)
+    size = img.shape[0]
+    if size < 32:
+        return  # Too small for the mark to survive; nothing to assert.
+    alpha = img[..., 3]
+    luma = img[..., :3].astype(np.float64) @ _LUMA
+    opaque = alpha > 200
+    if not opaque.any():
+        raise SystemExit(f"{path}: no opaque pixels")
+    badge = np.median(luma[opaque])
+    dark = opaque & (luma < badge - max(1.0, 0.10 * badge))
+    mixed = sum(1 for y in range(size) if dark[y].any() and (opaque[y] & ~dark[y]).any())
+    if mixed < 3:
+        raise SystemExit(
+            f"{path}: only {mixed} row(s) contain both badge and mark -- the icon is "
+            "probably banded; see the resize_premultiplied index handling"
+        )
+
+
 def main():
-    src = load_png(SOURCE)
     for size in SIZES:
         target = os.path.join(HERE, "icons", f"{size}x{size}", "apps")
         os.makedirs(target, exist_ok=True)
-        write_png(os.path.join(target, f"{NAME}.png"), resize_premultiplied(src, size))
-        write_png(
-            os.path.join(target, f"{NAME}-symbolic.png"), silhouette(resize_premultiplied(src, size))
-        )
+        small = resize_premultiplied(src, size)
+        main_path = os.path.join(target, f"{NAME}.png")
+        write_png(main_path, small)
+        check_not_banded(main_path)
+        # Scale FIRST, then knock the mark out at that resolution. Doing it the
+        # other way round does not work: the mark is only a couple of source
+        # pixels wide, so knocking it out at 1600px and then averaging produces
+        # ~20% alpha at 64px, which reads as solid badge again.
+        write_png(os.path.join(target, f"{NAME}-symbolic.png"), symbolic(small))
         print(f"wrote {size}x{size}")
 
 
+def check():
+    """Re-derive every icon and confirm the committed files match, byte for byte."""
+    src = load_png(SOURCE)
+    bad = []
+    for size in SIZES:
+        target = os.path.join(HERE, "icons", f"{size}x{size}", "apps")
+        small = resize_premultiplied(src, size)
+        for name, want in (
+            (f"{NAME}.png", small),
+            (f"{NAME}-symbolic.png", symbolic(small)),
+        ):
+            path = os.path.join(target, name)
+            if not os.path.exists(path):
+                bad.append(f"missing {path}")
+                continue
+            if load_png(path).tobytes() != want.tobytes():
+                bad.append(f"{path} differs from what the generator produces")
+        check_not_banded(os.path.join(target, f"{NAME}.png"))
+    if bad:
+        raise SystemExit("icon check failed:\n  " + "\n  ".join(bad))
+    print(f"icons OK: {len(SIZES)} sizes match the generator and none are banded")
+
+
 if __name__ == "__main__":
-    main()
+    if "--check" in sys.argv:
+        check()
+    else:
+        main()

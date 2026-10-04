@@ -31,6 +31,11 @@ jobs:
             libdbus-1-dev \
             libssl-dev \
             pkg-config
+      - name: Check icons are reproducible and not banded
+        run: |
+          sudo apt-get install -y python3-numpy
+          python3 assets/generate-icons.py --check
+
       - name: Check format
         run: cargo fmt --check
       - name: Clippy
