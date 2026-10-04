@@ -8,7 +8,7 @@ GIL under real-time audio processing. Same feature set, native speed, no
 interpreter.
 
 **Repository:** <https://github.com/mrproject72/mini-eq-RR>
-*(not the upstream Python project, and not published on PyPI)*
+*(not the upstream Python project)*
 
 ## Features
 
