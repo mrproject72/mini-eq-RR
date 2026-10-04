@@ -1129,17 +1129,22 @@ impl MiniEqWindow {
                     log::info!("Output device: following the system default");
                     return;
                 }
-                // Picking a specific device needs the filter chain's own
-                // output re-targeted (docs/PLAN gap 5). That is not
-                // implemented: writing `target.object` on the EQ output node
-                // is accepted by PipeWire but has no effect, so the only
-                // safe route is a link rebuild, which needs validation
-                // against a real device switch. Say so rather than
-                // pretending the selection took effect.
-                log::warn!(
-                    "Output device {chosen} selected, but the EQ output is not re-targeted yet"
+                // Rebuilding the filter chain is disruptive: the sink node is
+                // destroyed and recreated, so there is a brief audio gap and
+                // every routed stream has to be re-pointed at the new node. Do
+                // it off the UI's critical path.
+                // Inline on the GTK thread: PipeWire is main-thread-only, and
+                // the existing System-EQ switch handler already does its
+                // routing work the same way.
+                let ok = backend_for_select
+                    .borrow_mut()
+                    .as_mut()
+                    .map(|b| b.retarget_output(chosen))
+                    .unwrap_or(false);
+                log::info!(
+                    "Output switch to {chosen}: {}",
+                    if ok { "ok" } else { "FAILED" }
                 );
-                let _ = backend_for_select;
             });
         }
 

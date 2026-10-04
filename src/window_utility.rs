@@ -9,7 +9,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 
 /// Dropdown index 0: follow whatever the system default output is.
-pub const FOLLOW_DEFAULT_LABEL: &str = "Follow default output";
+pub const FOLLOW_DEFAULT_LABEL: &str = "Default Output";
 
 use crate::window_analyzer;
 use crate::window_graph;

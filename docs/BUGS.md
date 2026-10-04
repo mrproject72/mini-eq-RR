@@ -117,18 +117,45 @@ Verified on this machine: `pw-dump` reports 6 `Audio/Sink` nodes, of which
 `mini_eq_sink` is ours; the app now enumerates the other **5** —
 HDMI, onboard analog, Logitech USB, PUPGSIS USB and Multi-Output.
 
-### Not fixed: choosing a device does not re-target the EQ
+### Selecting a device now really re-targets the EQ — but it costs a rebuild
 
-Selecting a specific device is accepted by the dropdown but **does not move the
-audio**, and logs a warning saying so. This is gap 5.
+The dropdown used to accept a selection and do nothing. Investigating why turned
+up three separate causes:
 
-Investigated: writing `target.object` on `mini_eq_sink_output` via `pw-metadata`
-is accepted (exit 0) but has **no effect** — the property is set by the module's
-load-time args, not by per-node metadata. (`target.node` reads `None` both
-before and after; it is derived and is not the property to write.) So the only
-remaining route is rebuilding the filter chain's output link, which is the
-risky operation the handover flags as needing validation against a real device
-switch. Shipping a dropdown that silently pretends to work was the alternative.
+1. **The wrong key.** Upstream writes `target.object` with the sink's
+   **`object.serial`** (and `target.node` with its id). Writing a device *name*
+   — which is what `pw-metadata` takes and what the app's own
+   `create_filter_chain` puts in `playback.props.target.object` — is silently
+   ignored.
+2. **It would not have worked anyway.** The output client is created with
+   `node.passive = true`, so PipeWire deliberately does not re-target it after
+   creation. Verified: with the correct serial and both keys written, the
+   metadata write reported success and `target.object` did not move.
+3. **The live node proxy was captured only once**, guarded by
+   `filter_node.borrow().is_none()`. After any module reload it would still hold
+   a dead node, so every subsequent live band push would have gone nowhere. This
+   was a latent bug in the pre-existing `update_band_coefficients` path, not
+   something this change introduced.
+
+Because of (2), the destination is fixed at module load, so changing device
+means **rebuilding the filter chain**. `retarget_output()` therefore:
+
+- validates the sink exists, so a bad name never triggers a disruptive rebuild;
+- reloads the module with the new `output_sink` in its args;
+- **waits (bounded, 2 s) for the recreated `mini_eq_sink` to appear** —
+  `pw_context_load_module` returns before the registry carries the new node, so
+  an immediate re-route failed with "Creation failed";
+- re-routes all playback streams, because the recreated sink has a **new
+  `object.serial`** and every stream still points at the old one;
+- clears the cached node proxy on unload so the listener re-captures (fix (3)).
+
+Verified live: the filter output's `target.object` moved
+`alsa_output.pci-0000_04_00.6.analog-stereo` -> `alsa_output.pci-0000_04_00.1.hdmi-stereo-extra1`
+and streams were re-routed.
+
+**Cost:** the sink node is destroyed and recreated, so there is a brief audio
+gap on every device switch, and this has **not** been validated by ear. Needs a
+human listening test on a real switch.
 
 ### P1 — user-visible, small fix
 

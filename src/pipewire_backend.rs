@@ -534,6 +534,11 @@ impl PipeWireBackend {
             // SAFETY: `ptr` came from `pw_context_load_module` and is destroyed
             // exactly once, here.
             unsafe { pw_sys::pw_impl_module_destroy(ptr) };
+            // Drop the cached node proxy. It is only ever captured when
+            // `is_none()`, so leaving it set would keep a dead node forever and
+            // every later live push would go nowhere. This matters for the
+            // reload path, which is how the output device is changed.
+            *self.filter_node.borrow_mut() = None;
             info!("Filter-chain module unloaded");
         }
     }
@@ -550,6 +555,72 @@ impl PipeWireBackend {
 
     pub fn detect_output_routes(&self) -> Result<Vec<OutputRoute>, Error> {
         self.routing.detect_routes()
+    }
+
+    /// Move the EQ's output to a different device.
+    ///
+    /// Safe to call repeatedly with the same sink. Returns `false` if the
+    /// output client could not be found or the metadata write failed.
+    pub fn retarget_output(&mut self, sink_name: &str) -> bool {
+        if self.routing.get_current_sink() == Some(sink_name) {
+            return true;
+        }
+        // Validated first: reloading the filter chain is disruptive, so do not
+        // start one for a device that is not there.
+        if !self
+            .routing
+            .list_output_sinks()
+            .iter()
+            .any(|s| s.name == sink_name)
+        {
+            log::warn!("retarget_output: {sink_name} is not an available output sink");
+            return false;
+        }
+
+        // The filter chain's destination is fixed at module load
+        // (`playback.props.target.object`), and the output client is
+        // `node.passive`, so PipeWire ignores a later metadata write — verified:
+        // the write reports success and `target.object` does not move. The only
+        // way is to rebuild the module with the new destination.
+        let bands = self.bands.clone();
+        log::info!("Reloading filter chain to output on {sink_name}");
+        if let Err(e) = self.update_band_coefficients(&bands, sink_name) {
+            log::warn!("retarget_output: reload failed: {e}");
+            return false;
+        }
+
+        // The reload destroys and recreates `mini_eq_sink`, so its
+        // `object.serial` changes and every stream we routed to the old one now
+        // points at nothing. Re-route them, exactly as System EQ on does.
+        //
+        // The new node appears asynchronously: `pw_context_load_module` returns
+        // before the registry carries the new node, so an immediate re-route
+        // looks the sink up, finds nothing, and fails with "Creation failed".
+        // Wait for it, bounded so a genuinely missing node cannot hang the UI.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && self
+                .routing
+                .find_node_id_by_name(crate::core::VIRTUAL_SINK_BASE)
+                .is_none()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        match self
+            .routing
+            .auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE)
+        {
+            Ok(_) => {
+                self.routing.set_current_sink(sink_name);
+                log::info!("EQ output now on {sink_name}");
+                true
+            }
+            Err(e) => {
+                log::warn!("retarget_output: streams not re-routed: {e}");
+                false
+            }
+        }
     }
 
     /// Every real output sink (`media.class == "Audio/Sink"`), excluding the

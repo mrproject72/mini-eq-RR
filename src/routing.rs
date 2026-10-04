@@ -356,6 +356,68 @@ impl RoutingEngine {
         self.roundtrip()
     }
 
+    /// Look up a sink's node id and `object.serial`, both of which
+    /// `retarget_filter_output` needs.
+    pub fn sink_id_and_serial(&self, sink_name: &str) -> Option<(u32, String)> {
+        let registry = self.core.get_registry().ok()?;
+        let found = Arc::new(Mutex::new(None));
+        let found_clone = found.clone();
+        let target = sink_name.to_string();
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ != ObjectType::Node {
+                    return;
+                }
+                let Some(props) = &global.props else { return };
+                if props.get("node.name").unwrap_or("") != target {
+                    return;
+                }
+                let serial = props.get("object.serial").unwrap_or("").to_string();
+                if !serial.is_empty() {
+                    *found_clone.lock().unwrap() = Some((global.id, serial));
+                }
+            })
+            .register();
+        let _ = self.roundtrip();
+        found.lock().unwrap().clone()
+    }
+
+    /// Re-point the EQ's own output at a different sink.
+    ///
+    /// `create_filter_chain` sets `playback.props.target.object` at module load
+    /// time, so the output client is born pointing at one device. Writing
+    /// metadata is the supported way to move it afterwards, and must use the
+    /// same keys and the same **object.serial** that `set_stream_target` uses for
+    /// playback streams — a device *name* is silently ignored.
+    ///
+    /// Returns the metadata subject that was written, so callers can verify the
+    /// move actually happened rather than assuming it.
+    pub fn retarget_filter_output(
+        &mut self,
+        sink_bound_id: u32,
+        sink_serial: &str,
+    ) -> Result<u32, Error> {
+        self.ensure_default_metadata()?;
+        // The output client's *node name* is `<VIRTUAL_SINK_BASE>_output`
+        // (see `create_filter_chain`). `OUTPUT_CLIENT_NAME` is its
+        // node.description, which is why looking that up found nothing.
+        let output_node_name = format!("{VIRTUAL_SINK_BASE}_output");
+        let subject = self
+            .find_node_id_by_name(&output_node_name)
+            .ok_or(Error::CreationFailed)?;
+        let md = self.default_metadata.as_ref().unwrap();
+        md.set_property(
+            subject,
+            "target.node",
+            Some("Spa:Id"),
+            Some(&sink_bound_id.to_string()),
+        );
+        md.set_property(subject, "target.object", Some("Spa:Id"), Some(sink_serial));
+        self.roundtrip()?;
+        Ok(subject)
+    }
+
     /// Clear a stream's routing target so WirePlumber returns it to the
     /// default sink (System EQ off).
     pub fn clear_stream_target(&mut self, stream_id: u32) -> Result<(), Error> {

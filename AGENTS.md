@@ -251,7 +251,7 @@ cargo run -- --headless --background --duration 30
 
 ### Current state (2026-10-04)
 - `cargo check --release` compiles with 0 warnings, 0 errors.
-- `cargo test --lib` passes: 111 tests, 0 failures.
+- `cargo test --lib` passes: 114 tests, 0 failures.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
 - ~15,300 lines of Rust across 31 modules.
 - Upstream reference fetched: `https://github.com/bhack/mini-eq.git`
@@ -330,10 +330,9 @@ git ls-tree --name-only -r upstream/main | head -80
 - Preset lifecycle incomplete: no save/save-as, import/export/delete, fallback
   presets, or output-preset linking.
 - Filter-chain output does not follow a default-sink change (the monitor does),
-  and cannot yet be pointed at a chosen device: the Output dropdown now lists
-  every real sink but selecting one does not re-target the EQ (it logs a
-  warning). `pw-metadata target.object` on the EQ output node is accepted but
-  inert, so this needs the filter chain rebuilt. Needs two physical outputs.
+  though the Output dropdown can now be pointed at a chosen device — it
+  rebuilds the filter chain, so there is a brief audio gap per switch and it
+  still needs a human listening test.
 - No app icons: `desktop_integration.rs` points at a nonexistent `assets/icons`,
   so the `.desktop` file's `Icon=` resolves to nothing.
 - No Flatpak manifest, no GNOME Shell extension. (CI **does** exist at

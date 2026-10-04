@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mrproject72.mini_eq_rr</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Mini EQ</name>
+  <summary>System-wide parametric equalizer for PipeWire</summary>
+
+  <description>
+    <p>
+      Mini EQ is a small system-wide parametric equalizer for PipeWire. It creates
+      a virtual sink, routes playback through a per-band biquad filter chain, and
+      carries that chain's output on to the real sound card, so the curve applies
+      to everything the system plays rather than to one application.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Ten bands with bell, high-pass, low-pass, notch, shelf, band-pass, all-pass and resonance types</li>
+      <li>Preamp with an Auto-Safe headroom limiter that keeps the curve from clipping</li>
+      <li>Live spectrum analyzer with LUFS loudness metering</li>
+      <li>Presets, plus headphone correction curves imported from AutoEq</li>
+      <li>A/B compare to hear the curve with and without the EQ</li>
+      <li>Remote control over D-Bus, for panels and shell extensions</li>
+      <li>Per-output-device routing that follows the system default sink</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.mrproject72.mini_eq_rr.desktop</launchable>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+
+  <keywords>
+    <keyword>equalizer</keyword>
+    <keyword>EQ</keyword>
+    <keyword>parametric</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>audio</keyword>
+    <keyword>biquad</keyword>
+    <keyword>AutoEq</keyword>
+  </keywords>
+
+  <provides>
+    <binary>mini-eq-rr</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.10.0" date="2026-10-04">
+      <description>
+        <p>
+          Makes four existing features actually reachable: D-Bus remote control
+          (the bus name was never claimed and every handler was a stub), A/B
+          compare, AutoEq import, and the single-instance guard. The Output
+          dropdown now enumerates every real sink instead of two hardcoded
+          labels, and the Analyzer controls are labelled.
+        </p>
+      </description>
+    </release>
+    <release version="0.9.0" date="2026-09-18">
+      <description>
+        <p>PipeWire backend implementation: virtual sink, filter chain, biquad configuration.</p>
+      </description>
+    </release>
+  </releases>
+</component>

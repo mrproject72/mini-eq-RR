@@ -55,7 +55,12 @@ pub fn install_desktop_integration() -> anyhow::Result<()> {
 
     let hicolor_dir = data_home.join("icons/hicolor");
     remove_legacy_raster_app_icons(&hicolor_dir);
-    copy_app_icons(&hicolor_dir);
+    // `copy_app_icons` appends the `hicolor` theme component itself, so hand it
+    // the parent icons dir. Passing `hicolor_dir` produced
+    // `icons/hicolor/hicolor/scalable/apps/...`, where nothing looks for icons.
+    // This went unnoticed for as long as the source tree was missing and the
+    // function returned early.
+    copy_app_icons(&data_home.join("icons"));
 
     refresh_desktop_database(&applications_dir);
     refresh_icon_cache(&hicolor_dir);
@@ -227,4 +232,66 @@ pub fn build_native_autostart_desktop_file(command: &[String], _auto_route: bool
 #[allow(unused_imports)]
 fn _asset_path() -> std::path::PathBuf {
     app_data_file_path("mini-eq-rr")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `install_desktop_integration` used to hand `copy_app_icons` a path that
+    /// already ended in `hicolor`, and `copy_app_icons` appends that component
+    /// itself. The result was `icons/hicolor/hicolor/scalable/apps/...`, which
+    /// no icon lookup finds. The bug was invisible while
+    /// `APP_ICON_SEARCH_PATH` pointed at a directory that did not exist.
+    #[test]
+    fn app_icon_assets_exist_and_are_valid_xml() {
+        let dir = std::path::Path::new(APP_ICON_SEARCH_PATH);
+        assert!(
+            dir.exists(),
+            "{APP_ICON_SEARCH_PATH} must exist or no icon is ever installed"
+        );
+        let icon = dir
+            .join("scalable/apps")
+            .join(format!("{APP_ICON_NAME}.svg"));
+        assert!(icon.exists(), "expected {}", icon.display());
+        let body = std::fs::read_to_string(&icon).expect("icon readable");
+        assert!(body.contains("<svg"), "icon must be an SVG");
+        // `--` is illegal *inside* an XML comment body. This file really did
+        // ship with `--accent-color` in a comment, which broke parsing. Strip
+        // the delimiters before looking for further occurrences.
+        for line in body
+            .lines()
+            .filter(|l| l.contains("<!--") || l.contains("-->"))
+        {
+            let inner = line.replace("<!--", "").replace("-->", "");
+            assert!(
+                !inner.contains("--"),
+                "XML comment body has a stray '--': {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_file_points_at_an_icon_we_ship() {
+        let desktop = build_desktop_file();
+        assert!(desktop.contains(&format!("Icon={APP_ICON_NAME}")));
+        assert!(desktop.contains("Exec=mini-eq-rr"));
+        // Icon name and Exec must agree with what we actually package.
+        assert!(
+            desktop.contains(&format!("StartupWMClass={APP_ID}")),
+            "StartupWMClass must match APP_ID"
+        );
+    }
+
+    #[test]
+    fn metainfo_is_well_formed_and_declares_the_binary() {
+        let path = std::path::Path::new("assets/metainfo").join(format!("{APP_ID}.metainfo.xml"));
+        let body = std::fs::read_to_string(&path).expect("metainfo readable");
+        assert!(body.contains("<component type=\"desktop-application\">"));
+        assert!(body.contains("<binary>mini-eq-rr</binary>"));
+        assert!(
+            body.contains(&format!("<id>{APP_ID}</id>")),
+            "metainfo id must match APP_ID"
+        );
+    }
 }
