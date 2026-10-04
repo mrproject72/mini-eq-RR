@@ -139,28 +139,98 @@ def write_png(path, arr):
     open(path, "wb").write(blob)
 
 
+# Lanczos window radius, in filter (destination-normalised) units. 3 is the
+# usual compromise: sharp enough to keep the mark legible at 16px, without the
+# ringing that a wider kernel introduces on hard-edged artwork.
+LANCZOS_A = 3
+
+
+def _lanczos(x):
+    """Windowed sinc, evaluated at a distance normalised by the filter width."""
+    if x == 0.0:
+        return 1.0
+    if abs(x) >= LANCZOS_A:
+        return 0.0
+    px = np.pi * x
+    return (np.sin(px) / px) * (np.sin(px / LANCZOS_A) / (px / LANCZOS_A))
+
+
+def _axis_taps(in_len, out_len):
+    """Per-output-pixel (first source index, normalised weights) table.
+
+    When downscaling, the filter is stretched by the reduction factor so its
+    support covers the whole source footprint of one destination pixel. That
+    stretching is the entire point: a filter whose support is fixed in *source*
+    pixels aliases badly at 100x reductions, which is what made the small icons
+    look blurred and speckled.
+    """
+    scale = max(1.0, in_len / out_len)
+    inv = 1.0 / scale
+    support = LANCZOS_A * scale
+    taps = []
+    for i in range(out_len):
+        centre = (i + 0.5) * scale
+        lo = max(0, int(centre - support + 0.5))
+        hi = min(in_len, int(centre + support + 0.5))
+        if hi <= lo:
+            hi = min(in_len, lo + 1)
+        idx = np.arange(lo, hi)
+        w = np.array([_lanczos((j - centre + 0.5) * inv) for j in idx], dtype=np.float64)
+        total = w.sum()
+        if abs(total) < 1e-12:
+            w = np.ones(len(idx), dtype=np.float64)
+            total = float(len(idx))
+        taps.append((lo, w / total))
+    return taps
+
+
+def _apply_axis(data, out_len, axis):
+    """Separable 1D resample of `data` along `axis` (0 = rows, 1 = columns)."""
+    in_len = data.shape[axis]
+    taps = _axis_taps(in_len, out_len)
+    moved = np.moveaxis(data, axis, 0)
+    out = np.empty((out_len,) + moved.shape[1:], dtype=np.float64)
+    for i, (lo, w) in enumerate(taps):
+        hi = lo + len(w)
+        if hi > in_len:  # clamp at the right edge
+            w = w[: in_len - lo]
+            hi = in_len
+        out[i] = np.tensordot(moved[lo:hi], w, axes=(0, 0))
+    return np.moveaxis(out, 0, axis)
+
+
 def resize_premultiplied(src, size):
-    """Area-average downscale in premultiplied-alpha space. See module docstring."""
-    height, width, _ = src.shape
+    """Downscale in premultiplied-alpha space with a Lanczos filter.
+
+    Two things are required for a clean result, and both were got wrong at
+    least once here:
+
+    - **Premultiplied alpha.** Averaging straight RGBA bleeds the RGB of fully
+      transparent pixels into the edges. Those pixels carry whatever colour the
+      source stored there -- near-black in this artwork -- and the result is a
+      dark halo.
+    - **A filter stretched to the reduction factor.** Plain area averaging is a
+      box filter: correct for coverage, but it aliases. At 1600 -> 16 (100x) the
+      small icons came out blurred and speckled. Stretching a Lanczos kernel
+      over the full source footprint of each destination pixel is what actually
+      anti-aliases.
+    """
     alpha = src[..., 3].astype(np.float64) / 255.0
-    pm = src[..., :3].astype(np.float64) * alpha[..., None]
+    pm = np.concatenate([src[..., :3].astype(np.float64) * alpha[..., None], alpha[..., None]], axis=2)
+    # Horizontal then vertical: separable, so this is O(n) rather than O(n^2).
+    pm = _apply_axis(pm, size, axis=1)
+    pm = _apply_axis(pm, size, axis=0)
+
+    out_alpha = np.clip(pm[..., 3], 0.0, 1.0)
+    rgb = np.zeros_like(pm[..., :3])
+    # Unpremultiply; where coverage is ~0 the colour is undefined, so leave black.
+    safe = out_alpha[..., None] > 1e-6
+    rgb[safe[..., 0]] = pm[..., :3][safe[..., 0]] / out_alpha[..., None][safe[..., 0]]
+
     out = np.empty((size, size, 4), dtype=np.uint8)
-    ys = np.linspace(0, height, size + 1)
-    xs = np.linspace(0, width, size + 1)
-    for j in range(size):
-        y0, y1 = min(int(ys[j]), height), min(max(int(ys[j]) + 1, int(ys[j + 1])), height)
-        for i in range(size):
-            x0, x1 = min(int(xs[i]), width), min(max(int(xs[i]) + 1, int(xs[i + 1])), width)
-            if y1 <= y0 or x1 <= x0:
-                out[j, i] = 0
-                continue
-            coverage = alpha[y0:y1, x0:x1].mean()
-            if coverage <= 1e-9:
-                out[j, i] = 0
-                continue
-            mean_pm = pm[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
-            out[j, i, :3] = np.clip(mean_pm / coverage + 0.5, 0, 255).astype(np.uint8)
-            out[j, i, 3] = int(coverage * 255 + 0.5)
+    out[..., :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(out_alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0, :3] = 0
     return out
 
 
@@ -209,6 +279,52 @@ def symbolic(src):
     return out
 
 
+def _edge_energy(icon):
+    """Total absolute gradient across all channels: higher means sharper."""
+    f = icon.astype(np.float64)
+    total = 0.0
+    for axis in (0, 1):
+        if f.shape[axis] > 1:
+            total += float(np.abs(np.diff(f, axis=axis)).mean())
+    return total
+
+
+def _box_resize(src, size):
+    """Plain area average, kept only as the yardstick for the sharpness check."""
+    height, width, _ = src.shape
+    out = np.empty((size, size, 4), dtype=np.float64)
+    ys = np.linspace(0, height, size + 1)
+    xs = np.linspace(0, width, size + 1)
+    for j in range(size):
+        y0, y1 = int(ys[j]), max(int(ys[j]) + 1, int(ys[j + 1]))
+        for i in range(size):
+            x0, x1 = int(xs[i]), max(int(xs[i]) + 1, int(xs[i + 1]))
+            out[j, i] = src[min(y0, height) : min(y1, height), min(x0, width) : min(x1, width)].reshape(
+                -1, 4
+            ).mean(axis=0)
+    return out
+
+
+def check_not_blurred(path, box_version):
+    """Fail if the icon is no sharper than a plain box average.
+
+    Area averaging is a box filter: fine for coverage, but it aliases badly at
+    100x reductions and the small icons came out blurred and speckled. Comparing
+    against the box result is self-validating -- no magic threshold to tune, and
+    it fails automatically if anyone swaps the resampler back to averaging.
+    """
+    icon = load_png(path).astype(np.float64)
+    if icon.shape[0] < 16:
+        return
+    sharp = _edge_energy(icon)
+    flat = _edge_energy(box_version)
+    if sharp <= flat * 1.15:
+        raise SystemExit(
+            f"{path}: edge energy {sharp:.1f} is not meaningfully above a plain "
+            f"box average ({flat:.1f}) -- the icon is blurred; see resize_premultiplied"
+        )
+
+
 def check_not_banded(path):
     """Fail if an icon came out as horizontal bands.
 
@@ -241,6 +357,7 @@ def check_not_banded(path):
 
 
 def main():
+    src = load_png(SOURCE)
     for size in SIZES:
         target = os.path.join(HERE, "icons", f"{size}x{size}", "apps")
         os.makedirs(target, exist_ok=True)
@@ -248,6 +365,7 @@ def main():
         main_path = os.path.join(target, f"{NAME}.png")
         write_png(main_path, small)
         check_not_banded(main_path)
+        check_not_blurred(main_path, _box_resize(src, size))
         # Scale FIRST, then knock the mark out at that resolution. Doing it the
         # other way round does not work: the mark is only a couple of source
         # pixels wide, so knocking it out at 1600px and then averaging produces
@@ -274,6 +392,9 @@ def check():
             if load_png(path).tobytes() != want.tobytes():
                 bad.append(f"{path} differs from what the generator produces")
         check_not_banded(os.path.join(target, f"{NAME}.png"))
+        check_not_blurred(
+            os.path.join(target, f"{NAME}.png"), _box_resize(src, size)
+        )
     if bad:
         raise SystemExit("icon check failed:\n  " + "\n  ".join(bad))
     print(f"icons OK: {len(SIZES)} sizes match the generator and none are banded")
