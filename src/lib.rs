@@ -21,7 +21,6 @@ pub mod routing;
 pub mod settings;
 pub mod style;
 pub mod window;
-pub mod window_analyzer;
 pub mod window_autoeq;
 pub mod window_band_editor;
 pub mod window_band_fader;

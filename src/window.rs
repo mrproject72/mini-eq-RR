@@ -83,6 +83,21 @@ fn recompute_solo_active(faders: &[Rc<RefCell<crate::band_fader::EqBandFader>>])
     }
 }
 
+/// The sink the output monitor must tap: the one the filter chain actually
+/// plays out to.
+///
+/// The monitor reads a physical sink's monitor ports, so tapping anything but
+/// the engine's own destination means listening to a sink no audio is
+/// reaching — the spectrum and the peak meter simply freeze. The system
+/// default is only a fallback for the case where the engine never started.
+fn resolve_monitor_target(engine_sink: &Rc<RefCell<String>>, be: &mut PipeWireBackend) -> String {
+    let current = engine_sink.borrow().clone();
+    if !current.is_empty() {
+        return current;
+    }
+    be.default_output_sink().unwrap_or_default()
+}
+
 /// Main application window.
 pub struct MiniEqWindow {
     pub window: adw::ApplicationWindow,
@@ -100,6 +115,11 @@ impl MiniEqWindow {
         engine_sink: String,
         app_state: Arc<crate::remote_control::AppState>,
     ) -> Self {
+        // The sink the filter chain actually plays out to. Shared mutable
+        // state because the Output dropdown rebuilds the chain onto a
+        // different device, and everything downstream has to follow it: the
+        // live DSP pushes, the output monitor's tap and D-Bus `GetState`.
+        let engine_sink: Rc<RefCell<String>> = Rc::new(RefCell::new(engine_sink));
         let window = adw::ApplicationWindow::new(app);
         let (default_width, default_height) = window_state::initial_window_default_size();
         window.set_default_size(default_width, default_height);
@@ -222,14 +242,10 @@ impl MiniEqWindow {
         let preset_btn = gtk4::ToggleButton::new();
         preset_btn.set_icon_name("view-list-symbolic");
         preset_btn.set_tooltip_text(Some("Presets (F9)"));
-        let analyzer_btn = gtk4::ToggleButton::new();
-        analyzer_btn.set_icon_name("audio-x-generic-symbolic");
-        analyzer_btn.set_tooltip_text(Some("Signal Analyzer"));
         let headroom_btn = gtk4::ToggleButton::new();
         headroom_btn.set_icon_name("audio-volume-high-symbolic");
         headroom_btn.set_tooltip_text(Some("Output / Device"));
         panel_switch_box.append(&preset_btn);
-        panel_switch_box.append(&analyzer_btn);
         panel_switch_box.append(&headroom_btn);
         header_bar.pack_start(&panel_switch_box);
 
@@ -564,14 +580,10 @@ impl MiniEqWindow {
             let stack = utility.container.clone();
             let split_view_for_panel = split_view.clone();
             let guard = Rc::new(std::cell::Cell::new(false));
-            let all_buttons: Vec<gtk4::ToggleButton> = vec![
-                preset_btn.clone(),
-                analyzer_btn.clone(),
-                headroom_btn.clone(),
-            ];
+            let all_buttons: Vec<gtk4::ToggleButton> =
+                vec![preset_btn.clone(), headroom_btn.clone()];
             let pages = [
                 crate::window_utility::PAGE_PRESET,
-                crate::window_utility::PAGE_ANALYZER,
                 crate::window_utility::PAGE_OUTPUT,
             ];
             for (btn, page) in all_buttons.iter().zip(pages.iter()) {
@@ -635,28 +647,24 @@ impl MiniEqWindow {
         });
 
         let band_faders_for_compact = band_faders.clone();
-        let analyzer_for_compact = utility.analyzer.clone();
         let graph_for_compact = utility.graph.clone();
         let band_scrolled_for_compact = band_scrolled.clone();
         compact_bp.connect_apply(move |_| {
             for fader in band_faders_for_compact.iter() {
                 fader.borrow().set_height(164);
             }
-            analyzer_for_compact.borrow_mut().set_height(80);
             graph_for_compact
                 .borrow_mut()
                 .set_mode(crate::window_graph::GraphMode::Compact);
             band_scrolled_for_compact.set_min_content_height(164);
         });
         let band_faders_for_compact = band_faders.clone();
-        let analyzer_for_compact = utility.analyzer.clone();
         let graph_for_compact = utility.graph.clone();
         let band_scrolled_for_compact = band_scrolled.clone();
         compact_bp.connect_unapply(move |_| {
             for fader in band_faders_for_compact.iter() {
                 fader.borrow().set_height(208);
             }
-            analyzer_for_compact.borrow_mut().set_height(120);
             graph_for_compact
                 .borrow_mut()
                 .set_mode(crate::window_graph::GraphMode::Default);
@@ -677,11 +685,7 @@ impl MiniEqWindow {
         // handlers also drive `show-sidebar`, so we set it directly here too
         // to keep the two paths consistent.
         let split_for_f9 = split_view.clone();
-        let f9_buttons = [
-            preset_btn.clone(),
-            analyzer_btn.clone(),
-            headroom_btn.clone(),
-        ];
+        let f9_buttons = [preset_btn.clone(), headroom_btn.clone()];
         let key_controller = gtk4::EventControllerKey::new();
         key_controller.connect_key_pressed(move |_, key, _, _| {
             if key == gtk4::gdk::Key::F9 {
@@ -712,8 +716,14 @@ impl MiniEqWindow {
             let band_faders = band_faders.clone();
             let backend = backend.clone();
             let engine_sink = engine_sink.clone();
-            let monitor_loudness_value = utility.monitor_loudness_value.clone();
-            let monitor_summary = utility.monitor_summary.clone();
+            let monitor_loudness_value = utility.monitor.loudness_value.clone();
+            let monitor_summary = utility.monitor.summary.clone();
+            // Shared Freeze state. The spectrum is the graph overlay and the
+            // loudness readout lives in the monitor strip, so freezing has to
+            // gate both -- which is exactly what upstream's `analyzer_frozen`
+            // does to `on_analyzer_levels` / `on_analyzer_loudness`.
+            let monitor_frozen = utility.monitor.frozen.clone();
+            let monitor_display_gain = utility.monitor.display_gain_scale.clone();
             let headroom_warning = headroom_warning.clone();
             // Debounce state: only reload the filter-chain when the effective
             // state actually changed and at most every 400 ms, so fader drags
@@ -725,12 +735,6 @@ impl MiniEqWindow {
             let last_push = Rc::new(RefCell::new(
                 std::time::Instant::now() - std::time::Duration::from_millis(500),
             ));
-            // The spectrum analyzer panel. The backend already captures the
-            // audio (analyzer.start_capture) and D-Bus already exposes the
-            // levels, but nothing ever pushed them into the panel, so it
-            // rendered blank -- the analyzer looked "missing" even though
-            // the whole pipeline existed except for this last hop.
-            let analyzer_panel = utility.analyzer.clone();
             // Handles the remote-control drain needs. `window` is used for
             // PresentWindow/Quit; `route_switch` so a D-Bus SetRoutingEnabled
             // moves the real widget (and the widget's own handler pushes the
@@ -741,11 +745,11 @@ impl MiniEqWindow {
             let presets_handle = utility.presets.clone();
             let app_state_handle = app_state.clone();
 
-            // Wire the analyzer panel controls to the backend. These sliders
-            // existed but were decorative -- nothing read them.
+            // Wire the Monitor Settings controls (the only place the app
+            // exposes them, as upstream) to the backend.
             {
                 let backend_ctl = backend.clone();
-                let smoothing = utility.analyzer.borrow().smoothing_scale.clone();
+                let smoothing = utility.monitor.smoothing_scale.clone();
                 smoothing.connect_value_changed(move |sc| {
                     if let Some(be) = backend_ctl.borrow_mut().as_mut() {
                         be.set_analyzer_smoothing(sc.value() / 100.0);
@@ -754,7 +758,7 @@ impl MiniEqWindow {
             }
             {
                 let backend_ctl = backend.clone();
-                let gain = utility.analyzer.borrow().display_gain_scale.clone();
+                let gain = utility.monitor.display_gain_scale.clone();
                 gain.connect_value_changed(move |sc| {
                     if let Some(be) = backend_ctl.borrow_mut().as_mut() {
                         be.set_analyzer_display_gain(sc.value());
@@ -762,43 +766,25 @@ impl MiniEqWindow {
                 });
             }
             {
-                let panel = utility.analyzer.clone();
-                let freeze = utility.analyzer.borrow().freeze_switch.clone();
-                freeze.connect_state_set(move |_sw, on| {
-                    panel.borrow().set_frozen(on);
-                    glib::Propagation::Proceed
-                });
-            }
-            // The panel's enable toggle MIRRORS the graph-header Monitor
-            // switch rather than being a second independent control: both drive
-            // the same monitor, and the tick keeps the panel's toggle showing
-            // the true state. The guard stops set_active() re-triggering
-            // `toggled` and fighting the header switch.
-            let analyzer_toggle_sync = Rc::new(std::cell::Cell::new(false));
-            {
-                let backend_ctl = backend.clone();
-                let toggle = utility.analyzer.borrow().enabled_toggle.clone();
-                let guard = analyzer_toggle_sync.clone();
-                toggle.connect_toggled(move |tb| {
-                    if guard.get() {
-                        return;
-                    }
-                    let want = tb.is_active();
-                    let mut b = backend_ctl.borrow_mut();
-                    let Some(be) = b.as_mut() else { return };
-                    if want {
-                        if !be.monitor_enabled() {
-                            if let Some(target) = be.default_output_sink() {
-                                if let Err(e) = be.start_monitor(&target) {
-                                    log::warn!("analyzer enable failed: {}", e);
-                                }
-                            }
+                let frozen = monitor_frozen.clone();
+                let summary = monitor_summary.clone();
+                utility
+                    .monitor
+                    .freeze_switch
+                    .connect_state_set(move |_sw, on| {
+                        frozen.set(on);
+                        if on {
+                            summary.set_text("Frozen");
                         }
-                    } else if be.monitor_enabled() {
-                        be.stop_monitor();
-                    }
-                });
+                        glib::Propagation::Proceed
+                    });
             }
+
+            // Freeze plumbing for the tick: the flag itself plus the last frame
+            // to hold while it is set.
+            let monitor_frozen_tick = monitor_frozen.clone();
+            let monitor_display_gain_tick = monitor_display_gain.clone();
+            let held_levels: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
 
             glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
                 // --- Remote control (D-Bus) -----------------------------
@@ -878,24 +864,31 @@ impl MiniEqWindow {
                     .as_ref()
                     .and_then(|be| be.monitor_peak_dbfs());
 
-                // Push the live spectrum into the analyzer panel. Cheap when
-                // the monitor is off: monitor_levels() returns empty and we
-                // skip the update rather than redrawing a blank frame.
-                let levels = backend
+                // The live spectrum, read ONCE per tick and shared by the graph
+                // overlay and D-Bus. Cheap when the monitor is off:
+                // monitor_levels() returns empty, so nothing is drawn.
+                let fresh_levels = backend
                     .borrow()
                     .as_ref()
                     .map(|be| be.monitor_levels())
                     .unwrap_or_default();
-                if !levels.is_empty() {
-                    analyzer_panel.borrow().update(&levels);
-                }
+                // Freeze holds the last frame instead of accepting new ones, so
+                // the graph spectrum stands still. Upstream gates the same way
+                // (`analyzer_frozen` in `on_analyzer_levels_idle`).
+                let frozen = monitor_frozen_tick.get();
+                let levels = if frozen {
+                    held_levels.borrow().clone()
+                } else {
+                    *held_levels.borrow_mut() = fresh_levels.clone();
+                    fresh_levels
+                };
 
                 // Publish what the D-Bus interface reports, reusing the levels
                 // already read above rather than asking the backend twice.
                 // `visible` is derived rather than tracked so it cannot drift.
                 app_state_handle.publish(
                     levels.clone(),
-                    analyzer_panel.borrow().display_gain_scale.value(),
+                    monitor_display_gain_tick.value(),
                     window_handle.is_visible(),
                     backend.borrow().is_some(),
                     backend
@@ -911,21 +904,6 @@ impl MiniEqWindow {
                 if !levels.is_empty() {
                     app_state_handle.maybe_emit_analyzer_levels_changed();
                 }
-                // Keep the panel's enable toggle reflecting reality.
-                {
-                    let real = backend
-                        .borrow()
-                        .as_ref()
-                        .map(|be| be.monitor_enabled())
-                        .unwrap_or(false);
-                    let toggle = analyzer_panel.borrow().enabled_toggle.clone();
-                    if toggle.is_active() != real {
-                        analyzer_toggle_sync.set(true);
-                        toggle.set_active(real);
-                        analyzer_toggle_sync.set(false);
-                    }
-                }
-
                 if headroom.borrow().auto_safe_enabled() {
                     let raw_peak = crate::core::estimate_response_peak_db(
                         &bands,
@@ -953,18 +931,15 @@ impl MiniEqWindow {
                 let preamp_db = headroom.borrow().preamp_value();
                 {
                     let mut g = graph.borrow_mut();
-                    // Feed live spectrum from the output monitor (empty when
+                    // Feed the live spectrum from the output monitor (empty when
                     // the monitor is off, so the overlay draws nothing).
-                    let analyzer_levels: Vec<f64> = backend
-                        .borrow()
-                        .as_ref()
-                        .map(|be| be.monitor_levels())
-                        .unwrap_or_default();
-                    g.update(preamp_db, &bands, &analyzer_levels);
+                    g.update(preamp_db, &bands, &levels);
                 }
                 // Live loudness readout in the monitor strip (short-term LUFS).
+                // Frozen too: upstream only advances the loudness snapshot when
+                // `analyzer_frozen` is clear.
                 if let Some(be) = backend.borrow().as_ref() {
-                    if be.monitor_enabled() {
+                    if be.monitor_enabled() && !frozen {
                         if let Some(loud) = be.monitor_loudness() {
                             let lufs = loud.shortterm_lufs;
                             if lufs.is_finite() {
@@ -1028,10 +1003,13 @@ impl MiniEqWindow {
                         .unwrap_or(false);
                     if live_ready {
                         if let Some(be) = backend.borrow_mut().as_mut() {
-                            if !engine_sink.is_empty() {
+                            // Re-read the engine sink every tick: the Output
+                            // dropdown can move it while this timer runs.
+                            let sink_now = engine_sink.borrow().clone();
+                            if !sink_now.is_empty() {
                                 let _ = be.set_preamp(preamp_db);
                                 *be.get_bands_mut() = bands.clone();
-                                match be.update_state_live_or_reload(&engine_sink, eq_enabled) {
+                                match be.update_state_live_or_reload(&sink_now, eq_enabled) {
                                     Ok(()) => {
                                         log::debug!(
                                             "Backend state applied (eq_enabled={eq_enabled})"
@@ -1070,6 +1048,9 @@ impl MiniEqWindow {
         let output_names_for_refresh = output_names.clone();
         let dropdown_for_refresh = output_dropdown.clone();
         let backend_for_outputs = backend.clone();
+        // True while index 0 ("Default Output") is selected. The default-sink
+        // watcher below must not fight an explicitly chosen device.
+        let output_follows_default = Rc::new(std::cell::Cell::new(true));
 
         let refresh_output_sinks = std::rc::Rc::new(move || {
             let sinks = backend_for_outputs
@@ -1117,16 +1098,38 @@ impl MiniEqWindow {
         {
             let names_for_select = output_names.clone();
             let backend_for_select = backend.clone();
+            let engine_sink_for_select = engine_sink.clone();
+            let follow_default_for_select = output_follows_default.clone();
+            let state_for_select = app_state.clone();
+            let summary_for_select = utility.monitor.summary.clone();
             output_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
                 let idx = dd.selected() as usize;
                 let names = names_for_select.borrow();
-                let Some(chosen) = names.get(idx) else {
-                    return;
+                // Index 0 means "follow the system default". That still has to
+                // be resolved to a concrete sink: the filter chain's
+                // destination is fixed when the module loads, so going back to
+                // the default has to rebuild the chain onto whatever the
+                // default currently is — the same work as picking a device.
+                let chosen = if idx == 0 {
+                    follow_default_for_select.set(true);
+                    backend_for_select
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(|be| be.default_output_sink())
+                        .unwrap_or_default()
+                } else {
+                    follow_default_for_select.set(false);
+                    match names.get(idx) {
+                        Some(name) => name.clone(),
+                        None => return,
+                    }
                 };
-                if idx == 0 {
-                    // Already the behaviour: the filter chain follows the
-                    // system default output.
-                    log::info!("Output device: following the system default");
+                if chosen.is_empty() {
+                    log::warn!("Output device: selection resolved to no sink");
+                    return;
+                }
+                if Some(chosen.as_str()) == Some(engine_sink_for_select.borrow().as_str()) {
+                    log::debug!("Output device: already on {chosen}");
                     return;
                 }
                 // Rebuilding the filter chain is disruptive: the sink node is
@@ -1139,12 +1142,35 @@ impl MiniEqWindow {
                 let ok = backend_for_select
                     .borrow_mut()
                     .as_mut()
-                    .map(|b| b.retarget_output(chosen))
+                    .map(|b| b.retarget_output(&chosen))
                     .unwrap_or(false);
                 log::info!(
                     "Output switch to {chosen}: {}",
                     if ok { "ok" } else { "FAILED" }
                 );
+                if !ok {
+                    return;
+                }
+                *engine_sink_for_select.borrow_mut() = chosen.clone();
+                if state_for_select.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str())
+                {
+                    *state_for_select.output_sink.lock().unwrap() = Some(chosen.clone());
+                    state_for_select.emit_state_changed();
+                }
+                // The monitor taps the monitor ports of a PHYSICAL sink, and
+                // those ports are not touched by the chain rebuild — so after
+                // a switch it is still listening to the sink the EQ just left,
+                // where nothing plays any more. That is what froze the
+                // spectrum and the peak meter the moment another output was
+                // chosen. Follow the new output.
+                if let Some(be) = backend_for_select.borrow_mut().as_mut() {
+                    if be.monitor_enabled() {
+                        match be.retarget_monitor(&chosen) {
+                            Ok(()) => summary_for_select.set_text("On \u{00b7} Live (retargeted)"),
+                            Err(e) => log::warn!("Monitor retarget to {chosen} failed: {e}"),
+                        }
+                    }
+                }
             });
         }
 
@@ -1159,8 +1185,10 @@ impl MiniEqWindow {
             let last_default_sink: Rc<std::cell::Cell<String>> =
                 Rc::new(std::cell::Cell::new(String::new()));
             let backend_sink_watch = backend.clone();
-            let summary_sink_watch = utility.monitor_summary.clone();
+            let summary_sink_watch = utility.monitor.summary.clone();
             let refresh_outputs_watch = refresh_output_sinks.clone();
+            let follow_default_watch = output_follows_default.clone();
+            let engine_sink_watch = engine_sink.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 // Detect the system default output changing and follow it
                 // with the MONITOR. The monitor is a separate capture
@@ -1176,9 +1204,18 @@ impl MiniEqWindow {
                 refresh_outputs_watch();
 
                 if let Some(be) = backend_sink_watch.borrow_mut().as_mut() {
+                    // Only while the user has NOT picked a device. After an
+                    // explicit choice this watcher would pull the monitor off
+                    // the sink the EQ is actually playing to, freezing it
+                    // again — the same failure the dropdown had.
+                    let follow = follow_default_watch.get();
+                    let on_engine_sink = follow
+                        || be.default_output_sink().as_deref()
+                            == Some(engine_sink_watch.borrow().as_str());
                     if let Some(now) = be.refresh_default_audio_sink_name() {
                         let prev = last_default_sink.replace(now.clone());
-                        if !prev.is_empty() && prev != now && be.monitor_enabled() {
+                        if !prev.is_empty() && prev != now && be.monitor_enabled() && on_engine_sink
+                        {
                             log::info!("Default output changed {prev} -> {now}, following monitor");
                             match be.retarget_monitor(&now) {
                                 Ok(()) => {
@@ -1295,7 +1332,7 @@ impl MiniEqWindow {
         {
             let backend_for_monitor = backend.clone();
             let monitor_target = engine_sink.clone();
-            let summary = utility.monitor_summary.clone();
+            let summary = utility.monitor.summary.clone();
             utility
                 .graph
                 .borrow()
@@ -1303,11 +1340,7 @@ impl MiniEqWindow {
                 .connect_state_set(move |_switch, on| {
                     if let Some(be) = backend_for_monitor.borrow_mut().as_mut() {
                         if on {
-                            let target = if monitor_target.is_empty() {
-                                be.default_output_sink().unwrap_or_default()
-                            } else {
-                                monitor_target.clone()
-                            };
+                            let target = resolve_monitor_target(&monitor_target, be);
                             if target.is_empty() {
                                 log::warn!("Monitor: no output sink to capture");
                                 summary.set_text("Off · no sink");
@@ -1340,17 +1373,13 @@ impl MiniEqWindow {
             let want_monitor = crate::settings::load_monitor_enabled();
             {
                 let sw = utility.graph.borrow().monitor_switch.clone();
-                let summary = utility.monitor_summary.clone();
+                let summary = utility.monitor.summary.clone();
                 let backend_restore = backend.clone();
                 let monitor_target = engine_sink.clone();
                 sw.set_active(want_monitor);
                 if want_monitor {
                     if let Some(be) = backend_restore.borrow_mut().as_mut() {
-                        let target = if monitor_target.is_empty() {
-                            be.default_output_sink().unwrap_or_default()
-                        } else {
-                            monitor_target.clone()
-                        };
+                        let target = resolve_monitor_target(&monitor_target, be);
                         if !target.is_empty() && be.start_monitor(&target).is_ok() {
                             log::info!("Monitor restored on {target}");
                             summary.set_text("On · Live");

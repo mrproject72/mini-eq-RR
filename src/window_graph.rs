@@ -23,7 +23,6 @@ fn db_to_y(db_value: f64, height: f64) -> f64 {
 pub enum GraphMode {
     Default,
     Compact,
-    Roomy,
 }
 
 impl GraphMode {
@@ -31,7 +30,6 @@ impl GraphMode {
         match self {
             GraphMode::Default => 196,
             GraphMode::Compact => 156,
-            GraphMode::Roomy => 280,
         }
     }
 }

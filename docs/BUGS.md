@@ -157,6 +157,46 @@ and streams were re-routed.
 gap on every device switch, and this has **not** been validated by ear. Needs a
 human listening test on a real switch.
 
+### FIXED 2026-10-04 — the monitor died on every output switch
+
+Reported by the user: *"the monitor is working only on the initial default
+output source: the moment I switch to another output the monitor stops
+working."*
+
+**Cause.** The monitor taps the **monitor ports of a physical sink**
+(`alsa_output...:monitor_FL/FR -> mini-eq-analyzer:input_FL/FR`, see
+`pump_monitor_link`). The filter-chain rebuild performed by `retarget_output`
+does not touch those ports — they belong to the ALSA node, not to the EQ — so
+after a switch the capture stream was still listening to the sink the EQ had
+just left, where no audio arrives. Spectrum and peak meter froze.
+
+The dropdown handler only called `retarget_output()`; the monitor was moved to a
+new sink **only** by the 500 ms default-sink watcher, which fires when the
+*system default* changes. Choosing a device in the dropdown does not change the
+system default, so the monitor never followed.
+
+**Fix** (all in `window.rs`):
+
+- `engine_sink` became `Rc<RefCell<String>>` — the one place that records which
+  sink the chain actually plays out to — and the dropdown updates it on a
+  successful switch, together with `AppState::output_sink` so D-Bus `GetState`
+  agrees.
+- After a successful `retarget_output()`, the monitor is retargeted too
+  (`retarget_monitor`) when it is enabled.
+- `resolve_monitor_target()` is now the single rule for where the monitor taps:
+  **the sink the filter chain targets**, with the system default only as a
+  fallback for when the engine never started. The analyzer panel's enable
+  toggle and the startup restore both used `default_output_sink()` directly and
+  had the same latent bug.
+- The default-sink watcher no longer fires while an explicit device is selected,
+  which would otherwise pull the monitor off the engine's own sink and freeze it
+  again.
+
+Index 0 ("Default Output") also used to be a pure no-op — it logged "following
+the system default" without touching anything, so selecting it left the chain
+on the previously chosen device. It now resolves the current default and runs
+the same switch path.
+
 ### P1 — user-visible, small fix
 
 - ~~**AutoEq is unreachable: the dialog is never constructed.**~~ **FIXED
@@ -413,3 +453,60 @@ When reporting bugs, please include:
 5. System information (PipeWire version, GTK version, OS)
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for details.
+
+### FIXED 2026-10-04 — duplicated analyzer controls, and Freeze with the wrong scope
+
+User report: the Analyzer panel showed Smoothing and Display Gain sliders and
+then a settings icon "with the same options".
+
+- The Monitor strip's gear popover (`build_monitor_panel`) built a second
+  Smoothing scale, Display Gain scale and Freeze switch as **locals that were
+  never returned**, so nothing read them: the controls looked live and were
+  inert. The Rust-only Analyzer sidebar page held the only wired copy.
+- Upstream (`window_utility.py:255-355`) has exactly one spectrum — overlaid on
+  the frequency graph — and exactly one settings UI, that gear popover. The
+  sidebar page with its own spectrum and its own sliders had no upstream
+  counterpart.
+
+Fixed by deleting `window_analyzer.rs` (the page keeps the monitor strip) and
+wiring the popover's controls to the backend.
+
+Scope, which the duplication made ambiguous:
+
+- Smoothing → `analyzer.response_speed`, and Display Gain → applied inside
+  `display_levels()`. Both therefore always affected the **shared** level
+  stream, i.e. the graph spectrum and the D-Bus levels, not just the panel.
+- Freeze → the sidebar panel only; the graph overlay ignored it and kept
+  scrolling. Upstream gates the level stream itself
+  (`window_analyzer.py:320` and `:353`), so a freeze holds the spectrum and the
+  LUFS readout there. Now matched.
+
+One deliberate difference from upstream: upstream's preview tick *decays* the
+held frame to nothing while frozen (`window_analyzer.py:374-403`), we hold it
+still. Holding still is what a control labelled Freeze is expected to do.
+
+### FIXED 2026-10-04 — the Analyzer sidebar page removed, settings moved to the main window
+
+Follow-up to the duplicate-controls fix above. The user asked to catch up with
+upstream instead of keeping a second surface for the same three settings.
+
+- The Analyzer page existed only to hold the (already deleted) duplicate spectrum
+  and the wired copy of Smoothing / Display Gain / Freeze. Removed: page
+  constant, stack child, header toggle button and `window_analyzer.rs`.
+- The gear button (the upstream location for those settings,
+  `window_utility.py:255-355`) is now in the **main window's output control
+  row**, in a fixed-width cell immediately **before the Smooth dropdown**.
+- The sidebar keeps two pages, Preset and Output. Output carries the device
+  settings plus the monitor's LUFS readout, which is the only piece of the old
+  strip that was actually showing live data.
+
+Left undone and now recorded as gaps (see `docs/PLAN/graph-parity-2026-10-04.md`):
+
+- The LUFS **meter bar** is gone rather than faked: the DrawingArea never had a
+  draw func, so it was an empty box. Upstream draws a real one
+  (`window_analyzer.py:123`).
+- `EqBandFader.hovered` had no controller setting it. Rather than delete the field
+  and the hover branch in the draw function, it is now wired
+  (`EventControllerMotion` + `ns-resize` cursor), which is upstream behaviour.
+- `GraphMode::Roomy` removed as unreachable. Upstream instead interpolates the
+  graph height from the window height (`window_layout.py:646-660`).

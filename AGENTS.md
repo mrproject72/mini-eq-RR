@@ -107,7 +107,6 @@ src/
 ├── desktop_integration.rs     # Desktop file, autostart, icons
 ├── routing + window_*         # See below
 ├── window.rs                  # Main GTK window (1460 lines — the big one)
-├── window_analyzer.rs         # Analyzer panel
 ├── window_autoeq.rs           # AutoEq import dialog (reachable since 2026-10-04)
 ├── window_band_editor.rs      # Selected-band editor
 ├── window_band_fader.rs       # Fader construction helpers
@@ -242,9 +241,14 @@ cargo run -- --headless --background --duration 30
 
 - **Phase 0**: ✅ Complete — Source-linked divergence assessment against upstream `bhack/mini-eq` main branch; full 8-phase Rust conversion plan documented at `docs/PLAN/divergence-assessment-and-rust-plan.md`.
 - **Phase 1**: ⏳ In Progress — Backend engine parity: `pipewire_backend.rs` and `routing.rs` compile but are unverified on live PipeWire; virtual sink/filter-chain/output node creation and stream routing are stubs.
-- **Phase 2**: ✅ Complete — Graph and fader interactions: fader rendering/interaction converged with upstream Python; 3-layer graph overlay with click+drag editing; responsive fader heights.
+- **Phase 2**: ⏳ Partial — Fader rendering/interaction converged with upstream Python; responsive fader heights; the 3-layer graph overlay exists, but **the graph has no click/drag editing** (no `GestureClick`/`GestureDrag` is attached to it — the graph is display-only). See `docs/PLAN/graph-parity-2026-10-04.md` for the full inventory of missing graph behaviour (per-band dots, band dragging, axis labels, plot margins, analyzer bars+line).
 - **Phase 3**: ✅ Complete — Adaptive shell: `AdwOverlaySplitView` + `AdwClamp(max=1480)` + `AdwToastOverlay`, breakpoints at 1320sp/1080sp, F9 toggle, toolbar with output dropdown + route switch + inspector toggle.
-- **Phase 4**: ✅ Complete — Utility/sidebar: preset section + system section with headroom 3-segment meter + monitor strip.
+- **Phase 4**: ✅ Complete — Utility/sidebar: **two** pages, Preset and Output
+  (device settings + the monitor's LUFS readout). The "Analyzer" page and the
+  sidebar's own spectrum were removed 2026-10-04: the spectrum is the graph
+  overlay and the monitor's Smoothing / Display Gain / Freeze settings live in
+  the **main window's** output control row, in the gear button immediately before
+  the Smooth dropdown.
 - **Phase 5**: ✅ Complete — Analyzer and headroom: FFT spectrum, LUFS metering, smoothing/display-gain/freeze controls, 3-segment headroom meter with Set Safe button.
 - **Phase 6**: ⏳ Partial — Presets: rename, name prompt, revert/reapply baseline, reset-to-neutral and file monitoring are implemented; **no save/save-as, delete, import/export, fallback presets, or output-preset linking**. AutoEq: **reachable** — dialog opened from the Presets panel, index fetched on open, import saves + loads a preset (2026-10-04). Preferences: functional dialog wired to settings persistence.
 - **Phase 7**: ✅ Complete — DSP/core math: biquad coefficients and constants match upstream for 9 selectable filter types; `total_response_db`, `format_frequency`, index maps, graph response helpers all implemented. Window state: monitor geometry fallback implemented.

@@ -97,6 +97,7 @@ const OUTPUT_ROW_COMPACT_WIDTH: i32 = 1000;
 // second line at the minimum window width. When captions are shown
 // (window >= OUTPUT_ROW_COMPACT_WIDTH) the cells grow to fit, which is
 // fine because there is room at that width.
+const CELL_W_MONITOR: i32 = 40;
 const CELL_W_SMOOTH: i32 = 96;
 const CELL_W_AUTO_SAFE: i32 = 72;
 const CELL_W_PREAMP: i32 = 96;
@@ -140,6 +141,18 @@ fn build_output_control_row(utility: &UtilityPane) -> gtk4::FlowBox {
         )),
         &headroom.auto_safe_switch,
         &mut labels,
+    );
+    // Monitor settings first: the gear button that opens Smoothing / Display
+    // Gain / Freeze. It leads the row, immediately before the Smooth dropdown,
+    // so the two controls that shape how editing feels sit together.
+    row.insert(
+        &fixed_cell(
+            CELL_W_MONITOR,
+            None,
+            &utility.monitor.settings_button,
+            &mut labels,
+        ),
+        -1,
     );
     // One cell for Smooth: the switch and its width spin live inside the
     // menu popover, so the row spends a single cell on them.

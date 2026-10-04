@@ -132,6 +132,41 @@ impl EqBandFader {
             drawing_area.set_tooltip_text(Some("Band Gain"));
         }
 
+        // Hover highlight + resize cursor, matching upstream
+        // `band_fader.py` (`on_motion_enter`/`on_motion_leave`,
+        // `set_cursor_from_name("ns-resize")`). `hovered` was read by the draw
+        // function but nothing ever set it: no motion controller was attached,
+        // so the highlight could never appear.
+        {
+            let enter_fader = fader.clone();
+            let enter = gtk4::EventControllerMotion::new();
+            enter.connect_enter(move |_, _x, _y| {
+                let mut f = enter_fader.borrow_mut();
+                if f.hovered {
+                    return;
+                }
+                f.hovered = true;
+                f.drawing_area.queue_draw();
+            });
+            fader.borrow().drawing_area.add_controller(enter);
+
+            let leave_fader = fader.clone();
+            let leave = gtk4::EventControllerMotion::new();
+            leave.connect_leave(move |_| {
+                let mut f = leave_fader.borrow_mut();
+                if !f.hovered {
+                    return;
+                }
+                f.hovered = false;
+                f.drawing_area.queue_draw();
+            });
+            fader.borrow().drawing_area.add_controller(leave);
+
+            if let Some(cursor) = gtk4::gdk::Cursor::from_name("ns-resize", None) {
+                fader.borrow().drawing_area.set_cursor(Some(&cursor));
+            }
+        }
+
         // Drag gesture for gain adjustment
         {
             let f1 = fader.clone();
