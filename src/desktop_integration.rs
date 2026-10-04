@@ -94,13 +94,13 @@ fn copy_app_icons(target_dir: &std::path::Path) {
         return;
     }
 
-    fn walk_svg(dir: &std::path::Path, source: &std::path::Path, target: &std::path::Path) {
+    fn walk_icon(dir: &std::path::Path, source: &std::path::Path, target: &std::path::Path) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    walk_svg(&path, source, target);
-                } else if path.extension().is_some_and(|e| e == "svg")
+                    walk_icon(&path, source, target);
+                } else if path.extension().is_some_and(|e| e == "svg" || e == "png")
                     && let Ok(rel) = path.strip_prefix(source)
                 {
                     let dest = target.join("hicolor").join(rel);
@@ -113,7 +113,7 @@ fn copy_app_icons(target_dir: &std::path::Path) {
         }
     }
 
-    walk_svg(source_dir, source_dir, target_dir);
+    walk_icon(source_dir, source_dir, target_dir);
 }
 
 fn refresh_desktop_database(applications_dir: &std::path::Path) {
@@ -244,33 +244,57 @@ mod tests {
     /// no icon lookup finds. The bug was invisible while
     /// `APP_ICON_SEARCH_PATH` pointed at a directory that did not exist.
     #[test]
-    fn app_icon_assets_exist_and_are_valid_xml() {
+    fn app_icon_assets_exist_at_every_hicolor_size() {
         let dir = std::path::Path::new(APP_ICON_SEARCH_PATH);
         assert!(
             dir.exists(),
             "{APP_ICON_SEARCH_PATH} must exist or no icon is ever installed"
         );
-        let icon = dir
-            .join("scalable/apps")
-            .join(format!("{APP_ICON_NAME}.svg"));
-        assert!(icon.exists(), "expected {}", icon.display());
-        let body = std::fs::read_to_string(&icon).expect("icon readable");
-        assert!(body.contains("<svg"), "icon must be an SVG");
-        // `--` is illegal *inside* an XML comment body. This file really did
-        // ship with `--accent-color` in a comment, which broke parsing. Strip
-        // the delimiters before looking for further occurrences.
-        for line in body
-            .lines()
-            .filter(|l| l.contains("<!--") || l.contains("-->"))
-        {
-            let inner = line.replace("<!--", "").replace("-->", "");
+
+        // The icon is a raster design (assets/parametric_eq_mixer_icon.png),
+        // so it ships as PNGs at the standard hicolor sizes rather than a
+        // scalable SVG. `copy_app_icons` only used to copy `.svg`, which would
+        // have silently installed nothing again.
+        for size in [16, 24, 32, 48, 64, 128, 256, 512] {
+            let icon = dir
+                .join(format!("{size}x{size}/apps"))
+                .join(format!("{APP_ICON_NAME}.png"));
+            assert!(icon.exists(), "expected {}", icon.display());
+            let body = std::fs::read(&icon).expect("icon readable");
+            assert_eq!(
+                &body[..8],
+                b"\x89PNG\r\n\x1a\n",
+                "{} is not a PNG",
+                icon.display()
+            );
             assert!(
-                !inner.contains("--"),
-                "XML comment body has a stray '--': {line}"
+                body.len() > 100,
+                "{} looks truncated ({} bytes)",
+                icon.display(),
+                body.len()
+            );
+
+            let symbolic = dir
+                .join(format!("{size}x{size}/apps"))
+                .join(format!("{APP_ICON_NAME}-symbolic.png"));
+            assert!(
+                symbolic.exists(),
+                "expected a symbolic variant at {}",
+                symbolic.display()
             );
         }
     }
 
+    #[test]
+    fn icons_reach_the_hicolor_theme_root() {
+        // `copy_app_icons` appends `hicolor` itself, so callers must hand it the
+        // parent icons dir. Passing the hicolor dir produced
+        // `icons/hicolor/hicolor/...`, where nothing looks for icons.
+        assert!(
+            !APP_ICON_SEARCH_PATH.ends_with("hicolor"),
+            "search path must not already end in the hicolor component"
+        );
+    }
     #[test]
     fn desktop_file_points_at_an_icon_we_ship() {
         let desktop = build_desktop_file();

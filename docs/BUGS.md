@@ -172,7 +172,7 @@ human listening test on a real switch.
   `window_layout.rs`, `window_presets.rs` and `window_utility.rs` returns
   nothing, so the dialog can never open. Upstream `window_autoeq.py` has 37
   methods. README:23 advertises the feature; it does not work.
-- **The app installs no icon.** `desktop_integration.rs` sets
+- ~~**The app installs no icon.**~~ **FIXED — using the supplied artwork.** `desktop_integration.rs` sets
   `APP_ICON_SEARCH_PATH = "assets/icons"`, but `src/assets` does not exist, so
   `copy_app_icons` hits its `if !source_dir.exists() { return; }` and silently
   installs nothing while the generated `.desktop` file still declares

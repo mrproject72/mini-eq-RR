@@ -96,6 +96,7 @@ src/
 ├── band_fader.rs              # Individual EQ band control widget
 ├── analyzer.rs                # FFT spectrum analysis
 ├── ebur128.rs                 # LUFS loudness metering (FFI)
+├── assets/                    # App icons (16-512px + symbolic) and AppStream metainfo
 ├── autoeq.rs                  # AutoEq search + APO preset parsing
 ├── settings.rs                # User settings persistence (JSON, not GSettings)
 ├── dbus_control.rs            # D-Bus interface XML, dispatch, signal emission
@@ -251,7 +252,7 @@ cargo run -- --headless --background --duration 30
 
 ### Current state (2026-10-04)
 - `cargo check --release` compiles with 0 warnings, 0 errors.
-- `cargo test --lib` passes: 114 tests, 0 failures.
+- `cargo test --lib` passes: 115 tests, 0 failures.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
 - ~15,300 lines of Rust across 31 modules.
 - Upstream reference fetched: `https://github.com/bhack/mini-eq.git`
@@ -285,9 +286,11 @@ Full analysis and prioritised next steps:
   presets, or output-preset linking.
 - **Filter-chain output does not follow a default-sink change** (the monitor
   does). Needs two-output hardware to validate.
-- **No Flatpak manifest, no GNOME Shell extension, no app icons.**
+- No Flatpak manifest, no GNOME Shell extension. (CI **does** exist at
+  `.github/workflows/ci.yml`.)
 - **Zero automated coverage** of `pipewire_backend.rs` (834 lines) and
-  `routing.rs` (758 lines) — only `pipewire_backend.rs` pod encoding is covered; both still lack behavioural tests.
+  `routing.rs` (758 lines) — only `pipewire_backend.rs` pod encoding is
+  covered; both still lack behavioural tests.
 
 ### Build instructions
 
@@ -333,8 +336,9 @@ git ls-tree --name-only -r upstream/main | head -80
   though the Output dropdown can now be pointed at a chosen device — it
   rebuilds the filter chain, so there is a brief audio gap per switch and it
   still needs a human listening test.
-- No app icons: `desktop_integration.rs` points at a nonexistent `assets/icons`,
-  so the `.desktop` file's `Icon=` resolves to nothing.
+- ~~No app icons.~~ **FIXED 2026-10-04** — icons ship at 16–512px plus symbolic
+  variants, derived from `assets/parametric_eq_mixer_icon.png` with
+  premultiplied-alpha downscaling.
 - No Flatpak manifest, no GNOME Shell extension. (CI **does** exist at
   `.github/workflows/ci.yml`.)
 - `pipewire_backend.rs` (834 lines) and `routing.rs` (758 lines) have **zero**
