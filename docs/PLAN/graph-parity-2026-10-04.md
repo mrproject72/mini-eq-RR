@@ -97,11 +97,40 @@ Rust-only artifact: `ctx.move_to(0.0, center_y)` before the polyline
   (`window_analyzer.py:123 on_loudness_meter_draw`), so it is a genuine gap, not
   a deletion. Only the live LUFS number and the status line are kept.
 
+## Progress
+
+**Done 2026-10-04 (steps 1 and 2, one commit).** Needs a visual check by the
+user; there is no screenshot tool on this Wayland session.
+
+- Plot margins `58/62/26/34` applied to all three layers, and the mappers
+  rewritten to take them: `frequency_to_x` / `x_to_frequency` / `db_to_y` /
+  `y_to_db`, matching upstream signatures. `x_to_frequency` and `y_to_db` are
+  the inverses the drag editing needs and are unit-tested as round trips.
+- Background is now upstream's: rounded, vertically graded plot area with a
+  border; 9 dB grid lines (-24..24 step 6) with 0 dB at 1.6 px and every line
+  labelled; the analyzer's own dBFS scale (-60/-40/-20/0) with right-hand
+  labels, drawn only while the monitor is running; 11 labelled frequency lines;
+  "20 Hz" / "20 kHz" edge labels and a "Monitor" caption.
+- `GraphPalette` carries both the dark and light palettes (upstream's tables),
+  so the graph is no longer a dark slab in a light theme.
+- **A dot per active band** with upstream's radii (5.8 selected / 4.2
+  effective / 3.6 solo-muted), state colours and the 12 px selected halo, plus
+  the selected-band focus line now confined to the plot rect.
+- **Dot Y bug fixed**: it is `total_response_db(...)` at the band's frequency,
+  so a dot sits on the curve instead of floating off it whenever the preamp is
+  non-zero or bands overlap. Pinned by
+  `test_band_dot_y_is_the_total_response_not_the_raw_gain`.
+- The curve no longer starts with `move_to(0, centre_y)`, which drew a vertical
+  spike up the left edge.
+- The analyzer overlay honours the plot rect, so the spectrum lines up with the
+  frequency axis and the curve instead of sitting a label width away, and uses
+  the upstream bar colour/alpha with the upstream gap rule.
+
 ## Ordered next steps (user-visible value first)
 
-1. **Plot margins + axis labels** (small) — prerequisite for anything that needs
-   graph-space ↔ frequency/gain mapping to be correct.
-2. **A dot per active band** with state colours + `total_response_db` dot Y (small).
+1. ~~**Plot margins + axis labels**~~ — DONE.
+2. ~~**A dot per active band** with state colours + `total_response_db` dot
+   Y~~ — DONE.
 3. **Graph drag editing** (medium): GestureClick + GestureDrag, 32 px dot
    hit-test, 2 px threshold, X→freq / Y→gain with other-band subtraction,
    Shift→Q, live DSP push through the existing `gain_request` path so the

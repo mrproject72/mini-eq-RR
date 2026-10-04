@@ -510,3 +510,26 @@ Left undone and now recorded as gaps (see `docs/PLAN/graph-parity-2026-10-04.md`
   (`EventControllerMotion` + `ns-resize` cursor), which is upstream behaviour.
 - `GraphMode::Roomy` removed as unreachable. Upstream instead interpolates the
   graph height from the window height (`window_layout.py:646-660`).
+
+### FIXED 2026-10-04 — the Smoothing slider needed a monitor restart
+
+User report: *"in the setting gears we have smooth level bar but it doesn't have
+a realtime effect on the EQ: only when I restart the monitor (off and then on
+again) it applies the new setting."*
+
+`response_speed` lived on `OutputSpectrumAnalyzer`, and the capture callback
+captured it **by value** when the stream was created
+(`analyzer.rs`, `let response_speed = self.response_speed;` feeding the
+`move` closure on `.process`). So `set_response_speed()` mutated a field nobody
+read any more, and the only thing that could pick up a new value was a fresh
+`start_capture` — exactly what switching the monitor off and on does.
+
+It now lives in the `Arc<MonitorShared>` the callback already holds, with
+`MonitorShared::set_response_speed` / `response_speed()` as the two ends of that
+seam. Pinned by
+`the_smoothing_value_the_ui_writes_is_the_one_the_dsp_reads`, which writes
+through the UI-side accessor and reads it back for the smoothing alpha.
+
+Display gain never had this bug, which is why only one of the two sliders looked
+broken: it is applied in `display_levels()` on the way to the UI, not inside the
+realtime callback.

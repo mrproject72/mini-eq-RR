@@ -933,7 +933,18 @@ impl MiniEqWindow {
                     let mut g = graph.borrow_mut();
                     // Feed the live spectrum from the output monitor (empty when
                     // the monitor is off, so the overlay draws nothing).
-                    g.update(preamp_db, &bands, &levels);
+                    //
+                    // The graph also needs to know the A/B state (so a bypass
+                    // greys the curve, as upstream does) and the display gain
+                    // (so the analyzer's dBFS labels sit on the bars' scale).
+                    g.update(
+                        preamp_db,
+                        &bands,
+                        &levels,
+                        !bypass_switch_handle.is_active(),
+                        monitor_display_gain_tick.value(),
+                        !levels.is_empty(),
+                    );
                 }
                 // Live loudness readout in the monitor strip (short-term LUFS).
                 // Frozen too: upstream only advances the loudness snapshot when

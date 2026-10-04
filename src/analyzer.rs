@@ -38,6 +38,42 @@ pub struct MonitorShared {
     /// clipping warning. Separate from `peak_sample` (the all-time max used
     /// by diagnostics).
     pub window_peak: Mutex<f32>,
+    /// Smoothing (analyzer response speed), shared rather than owned by
+    /// `OutputSpectrumAnalyzer`.
+    ///
+    /// It is read on the realtime capture thread and written by the UI slider,
+    /// and it used to live on the analyzer struct, where the capture callback
+    /// captured it BY VALUE when the stream was created. Moving the slider
+    /// then did nothing until the monitor was toggled off and on, because only
+    /// a fresh `start_capture` re-read the field. `display_gain_db` never had
+    /// this problem: it is applied in `display_levels()`, i.e. on the way to the
+    /// UI, not inside the capture callback.
+    pub response_speed: Mutex<f64>,
+}
+
+impl MonitorShared {
+    /// Shared state with the smoothing seeded to the analyzer's own default,
+    /// so a capture thread started before any UI interaction behaves the same
+    /// as one started after.
+    pub fn new() -> Self {
+        Self {
+            response_speed: Mutex::new(ANALYZER_RESPONSE_DEFAULT),
+            ..Default::default()
+        }
+    }
+
+    /// Written by the UI (Smoothing slider), read by the realtime callback on
+    /// every captured buffer. Shared rather than owned by
+    /// `OutputSpectrumAnalyzer` precisely so that a slider move does not need a
+    /// capture restart to take effect.
+    pub fn set_response_speed(&self, speed: f64) {
+        *self.response_speed.lock().unwrap() =
+            speed.clamp(ANALYZER_RESPONSE_MIN, ANALYZER_RESPONSE_MAX);
+    }
+
+    pub fn response_speed(&self) -> f64 {
+        *self.response_speed.lock().unwrap()
+    }
 }
 
 /// DSP state owned by the capture callbacks (loop thread only, via Mutex).
@@ -67,7 +103,6 @@ pub struct OutputSpectrumAnalyzer {
     pub fft_size: usize,
     pub enabled: bool,
     pub display_gain_db: f64,
-    pub response_speed: f64,
     pub levels: Vec<f64>,
     pub loudness_snapshot: Option<AnalyzerLoudnessSnapshot>,
 }
@@ -250,7 +285,7 @@ impl OutputSpectrumAnalyzer {
             format_pod_bytes: build_capture_enum_format(ANALYZER_CAPTURE_RATE),
             format_answer_bytes: Arc::new(build_capture_format(ANALYZER_CAPTURE_RATE)),
             port_config_answer_bytes: Arc::new(build_capture_port_config()),
-            shared: Arc::new(MonitorShared::default()),
+            shared: Arc::new(MonitorShared::new()),
             processor: Arc::new(Mutex::new(MonitorProcessor {
                 ring_mono: Vec::new(),
                 prev_powers: vec![0.0; ANALYZER_BIN_COUNT],
@@ -261,7 +296,6 @@ impl OutputSpectrumAnalyzer {
             fft_size,
             enabled: false,
             display_gain_db: ANALYZER_DISPLAY_GAIN_DEFAULT,
-            response_speed: ANALYZER_RESPONSE_DEFAULT,
             levels,
             loudness_snapshot: None,
         })
@@ -315,7 +349,6 @@ impl OutputSpectrumAnalyzer {
         let processor = self.processor.clone();
         let sample_rate = self.sample_rate;
         let fft_size = self.fft_size;
-        let response_speed = self.response_speed;
         let answer_bytes = self.format_answer_bytes.clone();
         let port_config_bytes = self.port_config_answer_bytes.clone();
 
@@ -348,14 +381,7 @@ impl OutputSpectrumAnalyzer {
                 }
             })
             .process(move |stream, _| {
-                process_capture_buffers(
-                    stream,
-                    &shared,
-                    &processor,
-                    sample_rate,
-                    fft_size,
-                    response_speed,
-                );
+                process_capture_buffers(stream, &shared, &processor, sample_rate, fft_size);
             })
             .state_changed(|stream, _, old, new| {
                 debug!("Analyzer stream state: {old:?} -> {new:?}");
@@ -491,8 +517,10 @@ impl OutputSpectrumAnalyzer {
         self.display_gain_db = gain_db.clamp(ANALYZER_DISPLAY_GAIN_MIN, ANALYZER_DISPLAY_GAIN_MAX);
     }
 
+    /// Takes effect on the next captured buffer, with no restart: the value is
+    /// read out of `shared` inside the realtime callback.
     pub fn set_response_speed(&mut self, speed: f64) {
-        self.response_speed = speed.clamp(ANALYZER_RESPONSE_MIN, ANALYZER_RESPONSE_MAX);
+        self.shared.set_response_speed(speed);
     }
 
     pub fn get_display_norm(&self, band_index: usize) -> f64 {
@@ -515,7 +543,6 @@ fn process_capture_buffers(
     processor: &Arc<Mutex<MonitorProcessor>>,
     sample_rate: f64,
     fft_size: usize,
-    response_speed: f64,
 ) {
     let mut proc = processor.lock().unwrap();
     let mut new_frames = 0usize;
@@ -625,6 +652,9 @@ fn process_capture_buffers(
 
     let powers = samples_to_log_band_powers(&window, sample_rate, fft_size);
     if powers.len() == proc.prev_powers.len() && !powers.is_empty() {
+        // Read the smoothing the UI last set, not a value captured when the
+        // stream was created: the slider must be live.
+        let response_speed = shared.response_speed();
         let alpha = analyzer_smoothing_alpha(response_speed, new_frames, sample_rate);
         let smoothed = smooth_power_values(&proc.prev_powers, &powers, alpha);
         proc.prev_powers = smoothed.clone();
@@ -1180,6 +1210,37 @@ mod tests {
         assert_eq!(analyzer_db_to_display_norm(6.0, 0.0), 1.0);
         // with display gain
         assert!(analyzer_db_to_display_norm(-70.0, 10.0) > 0.0);
+    }
+
+    /// Regression guard: the Smoothing slider used to do nothing until the
+    /// monitor was switched off and on again.
+    ///
+    /// `response_speed` lived on `OutputSpectrumAnalyzer`, and the capture
+    /// callback captured it BY VALUE when the stream was created, so the only
+    /// way a new value reached the DSP was a fresh `start_capture`. It now
+    /// lives in the `Arc<MonitorShared>` the callback already holds, and these
+    /// are the accessors on both sides of that seam: the UI writes through
+    /// `set_response_speed`, the realtime thread reads `response_speed()`.
+    #[test]
+    fn the_smoothing_value_the_ui_writes_is_the_one_the_dsp_reads() {
+        let shared = MonitorShared::new();
+        assert_eq!(shared.response_speed(), ANALYZER_RESPONSE_DEFAULT);
+
+        let slow = analyzer_smoothing_alpha(shared.response_speed(), 1584, SAMPLE_RATE);
+        shared.set_response_speed(ANALYZER_RESPONSE_MAX);
+        let fast = analyzer_smoothing_alpha(shared.response_speed(), 1584, SAMPLE_RATE);
+
+        // More response speed == less smoothing == a larger alpha per frame.
+        assert!(
+            fast > slow,
+            "a faster response must smooth less ({fast} should exceed {slow})"
+        );
+
+        // The setter's clamp is what the analyzer relies on.
+        shared.set_response_speed(1e9);
+        assert_eq!(shared.response_speed(), ANALYZER_RESPONSE_MAX);
+        shared.set_response_speed(-1e9);
+        assert_eq!(shared.response_speed(), ANALYZER_RESPONSE_MIN);
     }
 
     #[test]
