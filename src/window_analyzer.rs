@@ -22,6 +22,53 @@ pub struct AnalyzerPanel {
     pub frozen: Rc<std::cell::Cell<bool>>,
 }
 
+/// One labelled control row: a title on the left, the control on the right,
+/// and a dim value readout between them.
+///
+/// Upstream uses `Adw.ActionRow(title=...)` with the control and a value label
+/// as suffixes (`window_utility.py`, "Smoothing" / "Display Gain" / "Freeze").
+/// The previous Rust version crammed two bare sliders and a bare switch into a
+/// single unlabelled horizontal box, so nothing on screen said what any of them
+/// did — only a tooltip, which needs the pointer.
+fn labelled_row<C: IsA<gtk4::Widget>>(
+    title_text: &str,
+    tooltip: Option<&str>,
+    control: &C,
+    value_label: Option<&gtk4::Label>,
+) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    row.set_activatable(false);
+    row.set_selectable(false);
+    if let Some(t) = tooltip {
+        row.set_tooltip_text(Some(t));
+    }
+
+    let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    box_.set_margin_top(6);
+    box_.set_margin_bottom(6);
+    box_.set_margin_start(12);
+    box_.set_margin_end(12);
+
+    let title = gtk4::Label::new(Some(title_text));
+    title.set_hexpand(true);
+    title.set_xalign(0.0);
+    title.set_width_chars(12);
+    box_.append(&title);
+
+    if let Some(label) = value_label {
+        label.set_css_classes(&["dim-label"]);
+        label.set_width_chars(6);
+        label.set_xalign(1.0);
+        box_.append(label);
+    }
+
+    let control = control.upcast_ref::<gtk4::Widget>();
+    control.set_valign(gtk4::Align::Center);
+    box_.append(control);
+    row.set_child(Some(&box_));
+    row
+}
+
 impl AnalyzerPanel {
     pub fn new() -> Self {
         let enabled_toggle = gtk4::ToggleButton::new();
@@ -45,18 +92,39 @@ impl AnalyzerPanel {
         // reproduces the analyzer's own default.
         let smoothing_adj = gtk4::Adjustment::new(30.0, 15.0, 95.0, 1.0, 5.0, 0.0);
         let smoothing_scale = gtk4::Scale::new(gtk4::Orientation::Horizontal, Some(&smoothing_adj));
-        smoothing_scale.set_hexpand(true);
-        smoothing_scale.set_tooltip_text(Some("Smoothing"));
+        smoothing_scale.set_size_request(116, -1);
+        smoothing_scale.set_tooltip_text(Some(
+            "How quickly the spectrum reacts. Lower is smoother and steadier.",
+        ));
 
         let display_gain_adj = gtk4::Adjustment::new(0.0, -12.0, 32.0, 1.0, 4.0, 0.0);
         let display_gain_scale =
             gtk4::Scale::new(gtk4::Orientation::Horizontal, Some(&display_gain_adj));
-        display_gain_scale.set_hexpand(true);
-        display_gain_scale.set_tooltip_text(Some("Display Gain"));
+        display_gain_scale.set_size_request(116, -1);
+        display_gain_scale.set_tooltip_text(Some(
+            "Display-only boost for the spectrum. Does not change the audio.",
+        ));
 
         let freeze_switch = gtk4::Switch::new();
-        freeze_switch.set_tooltip_text(Some("Freeze"));
         freeze_switch.set_valign(gtk4::Align::Center);
+        freeze_switch.set_tooltip_text(Some("Hold the current spectrum still"));
+
+        // Live value readouts, so the sliders are not just unlabelled but also
+        // unreadable. Upstream shows the same two figures as dim labels.
+        let smoothing_value = gtk4::Label::new(Some("30%"));
+        let display_gain_value = gtk4::Label::new(Some("+0 dB"));
+        {
+            let lbl = smoothing_value.clone();
+            smoothing_scale.connect_value_changed(move |s| {
+                lbl.set_text(&format!("{:.0}%", s.value()));
+            });
+        }
+        {
+            let lbl = display_gain_value.clone();
+            display_gain_scale.connect_value_changed(move |s| {
+                lbl.set_text(&format!("{:+.0} dB", s.value()));
+            });
+        }
 
         // NOTE: this panel used to carry its own `lufs_value_label` and
         // `summary_label`, but nothing ever wrote to them -- they sat at a
@@ -71,11 +139,31 @@ impl AnalyzerPanel {
         container.append(&header);
         container.append(&drawing_area);
 
-        let controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        controls.append(&smoothing_scale);
-        controls.append(&display_gain_scale);
-        controls.append(&freeze_switch);
-        container.append(&controls);
+        // Labelled rows, matching upstream's ActionRow layout. A `ListBox` with
+        // `boxed-list` styling is used rather than AdwActionRow because the
+        // panel lives in a plain sidebar stack, not an AdwPreferencesGroup.
+        let settings = gtk4::ListBox::new();
+        settings.set_selection_mode(gtk4::SelectionMode::None);
+        settings.add_css_class("boxed-list");
+        settings.append(&labelled_row(
+            "Smoothing",
+            Some("How quickly the spectrum reacts"),
+            &smoothing_scale,
+            Some(&smoothing_value),
+        ));
+        settings.append(&labelled_row(
+            "Display Gain",
+            Some("Display-only boost for the spectrum; does not change the audio"),
+            &display_gain_scale,
+            Some(&display_gain_value),
+        ));
+        settings.append(&labelled_row(
+            "Freeze",
+            Some("Hold the current spectrum still"),
+            &freeze_switch,
+            None,
+        ));
+        container.append(&settings);
 
         let levels = Rc::new(RefCell::new(vec![0.0; 64]));
         let draw_levels = levels.clone();

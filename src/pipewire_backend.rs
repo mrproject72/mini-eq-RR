@@ -61,6 +61,81 @@ pub struct PipeWireBackend {
     pending_monitor_target: Option<String>,
 }
 
+/// `SPA_PROP_params` — the `SPA_PROP_START_Other` (0x80000) entry that carries
+/// control values on a props object, so its value is 0x80001.
+///
+/// `spa/include/spa/param/props.h` documents its payload as
+/// `Struct((String : key, Pod : value)*)` — a flat run of string/value pairs.
+/// `spa/plugins/filter-graph/filter-graph.c:parse_params()` reads it with a
+/// sequential `spa_pod_parser`: `push_struct`, then repeatedly
+/// `get_string(name)` followed by a value. There is **no item count and no
+/// dict flag**, and the loop `break`s on the first field it cannot read as a
+/// string.
+///
+/// That last detail matters: an earlier attempt "fixed" this by emitting
+/// `SPA_POD_PROP_FLAG_HINT_DICT` and a leading `Int: n_items`, on the theory
+/// that upstream's `GLib.Variant("a{sd}", …)` implied a dict. Both were wrong.
+/// The leading `Int` made `get_string` fail on field zero, so the parser
+/// aborted immediately and *every* control was dropped — which presented as the
+/// EQ becoming completely inert once systemwide routing was on.
+const PARAM_PROPS: u32 = 0x80001;
+
+/// Serialise control values into the `SPA_PARAM_Props` pod that PipeWire's
+/// filter-graph parses.
+///
+/// The payload shape is dictated by `parse_params()` in
+/// `spa/plugins/filter-graph/filter-graph.c`:
+///
+/// ```text
+/// Object(Props)
+///   prop key   = SPA_PROP_params (0x80001)
+///   prop flags = 0
+///   prop value = Struct( (String : key, Double : value)* )
+/// ```
+///
+/// `parse_params` walks the struct with `spa_pod_parser` and `break`s as soon
+/// as a field is not a string, so the payload must start with a string and
+/// must contain no count or type tag.
+///
+/// Split out of `apply_live_controls` so the wire format can be pinned by a
+/// unit test; this module previously had no tests at all.
+fn build_props_controls_pod_bytes(controls: &[(String, f64)]) -> Option<Vec<u8>> {
+    let mut data: Vec<u8> = Vec::new();
+    let built = {
+        let mut builder = Builder::new(&mut data);
+        let mut obj_frame = MaybeUninit::zeroed();
+        let mut struct_frame = MaybeUninit::zeroed();
+        let mut ok = true;
+
+        // SAFETY: both frames stay alive until popped, and the builder owns
+        // `data` and is dropped before it is returned.
+        unsafe {
+            ok &= builder
+                .push_object(
+                    &mut obj_frame,
+                    pipewire::spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+                    ParamType::Props.as_raw(),
+                )
+                .is_ok();
+            ok &= builder.add_prop(PARAM_PROPS, 0).is_ok();
+            ok &= builder.push_struct(&mut struct_frame).is_ok();
+            // Must begin with a string: parse_params breaks on the first
+            // non-string field, so no count or type tag may precede the pairs.
+            if ok {
+                for (name, value) in controls {
+                    ok &= builder.add_string(name).is_ok();
+                    ok &= builder.add_double(*value).is_ok();
+                }
+            }
+            builder.pop(struct_frame.assume_init_mut());
+            builder.pop(obj_frame.assume_init_mut());
+            ok
+        }
+    };
+
+    built.then_some(data)
+}
+
 impl PipeWireBackend {
     pub fn new(bands: Vec<EqBand>) -> Result<Self, Error> {
         info!("Initializing PipeWire backend");
@@ -347,47 +422,7 @@ impl PipeWireBackend {
             return Ok(true);
         }
 
-        // Build the SPA_PARAM_Props object whose `params` property is a struct
-        // of alternating (control-name string, value double) pairs — the exact
-        // wire format parsed by filter-graph's `parse_params`.
-        let mut data: Vec<u8> = Vec::new();
-        {
-            let mut builder = Builder::new(&mut data);
-            let mut obj_frame = MaybeUninit::zeroed();
-            let mut struct_frame = MaybeUninit::zeroed();
-
-            // SAFETY: frames are kept alive until popped; the builder owns its
-            // data buffer and is dropped before we read `data`.
-            unsafe {
-                builder
-                    .push_object(
-                        &mut obj_frame,
-                        pipewire::spa::utils::SpaTypes::ObjectParamProps.as_raw(),
-                        ParamType::Props.as_raw(),
-                    )
-                    .map_err(|_| Error::CreationFailed)?;
-                // SPA_Props_params == 0x80001 (524289), confirmed via
-                // `pw-cli set-param` echo: `Props:params (524289)`. Using
-                // 0x80000 makes filter-graph's parse_params never find the
-                // control values (silent EQ).
-                builder
-                    .add_prop(0x80001, 0)
-                    .map_err(|_| Error::CreationFailed)?;
-                builder
-                    .push_struct(&mut struct_frame)
-                    .map_err(|_| Error::CreationFailed)?;
-                for (name, value) in &controls {
-                    builder
-                        .add_string(name)
-                        .map_err(|_| Error::CreationFailed)?;
-                    builder
-                        .add_double(*value)
-                        .map_err(|_| Error::CreationFailed)?;
-                }
-                builder.pop(struct_frame.assume_init_mut());
-                builder.pop(obj_frame.assume_init_mut());
-            }
-        }
+        let data = build_props_controls_pod_bytes(&controls).ok_or(Error::CreationFailed)?;
 
         let pod = Pod::from_bytes(&data).ok_or(Error::CreationFailed)?;
         node.set_param(ParamType::Props, 0, pod);
@@ -405,7 +440,11 @@ impl PipeWireBackend {
     /// A filter-type change is a graph topology change (the biquad `label`
     /// is fixed at module-load time), so it forces a restart instead of a
     /// live push — matching upstream `set_filter_controls`.
-    pub fn update_state_live_or_reload(&mut self, output_sink: &str) -> Result<(), Error> {
+    pub fn update_state_live_or_reload(
+        &mut self,
+        output_sink: &str,
+        eq_enabled: bool,
+    ) -> Result<(), Error> {
         // With the `bq_raw` coefficient strategy the filter TYPE lives in the
         // coefficients, not the node label, so a type change is a live push
         // just like Freq/Q/Gain. The graph topology never changes and the
@@ -420,7 +459,11 @@ impl PipeWireBackend {
         if !self.has_live_node() {
             return Ok(());
         }
-        match self.apply_live_controls(true) {
+        // `eq_enabled` is the A/B compare / D-Bus `SetEqEnabled` flag. It was
+        // previously hardcoded to `true`, which left the A/B compare switch
+        // wired to nothing: the widget had no handler and the push always ran
+        // the bands wet.
+        match self.apply_live_controls(eq_enabled) {
             Ok(true) => Ok(()),
             _ => {
                 let bands = self.bands.clone();
@@ -831,4 +874,102 @@ fn registry_link_snapshot(mainloop: &MainLoopRc, core: &CoreRc) -> Result<Vec<Li
             .iterate(Timeout::Finite(std::time::Duration::from_millis(20)));
     }
     Ok(links.lock().unwrap().drain(..).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the silent no-op push.
+    ///
+    /// The pod used to be built with `flags = 0` and no leading item count, so
+    /// PipeWire discarded every control without error and the EQ was frozen at
+    /// its load-time curve. `pipewire_backend.rs` had no tests, so nothing
+    /// caught it. These assertions pin the wire format that filter-graph
+    /// actually parses.
+    /// Pins the wire format that `parse_params()` actually parses.
+    ///
+    /// The payload must be `Struct((String, value)*)` with no count and no
+    /// dict flag: `parse_params` does `push_struct` and then reads a string,
+    /// and **breaks** on the first field it cannot read as a string. An earlier
+    /// version emitted `SPA_POD_PROP_FLAG_HINT_DICT` plus a leading
+    /// `Int: n_items`; that leading Int made the parser abort at field zero,
+    /// silently dropping every control and leaving the EQ completely inert.
+    /// This test exists to stop that shape coming back.
+    #[test]
+    fn props_pod_is_a_bare_struct_of_string_value_pairs() {
+        let controls = vec![
+            ("band_l_0:b0".to_string(), 1.5),
+            ("band_l_0:b1".to_string(), 0.25),
+        ];
+        let data = build_props_controls_pod_bytes(&controls).expect("pod should build");
+        let pod = Pod::from_bytes(&data).expect("pod bytes should parse");
+
+        let obj = pod.as_object().expect("pod should be an Object");
+        let props: Vec<_> = obj.props().collect();
+        assert_eq!(props.len(), 1, "expected exactly one property");
+
+        let prop = props[0];
+        assert_eq!(
+            prop.key().0,
+            PARAM_PROPS,
+            "property key must be SPA_PROP_params (0x80001)"
+        );
+
+        let st = prop
+            .value()
+            .as_struct()
+            .expect("property value should be a Struct");
+        let fields: Vec<_> = st.fields().collect();
+        assert_eq!(
+            fields.len(),
+            controls.len() * 2,
+            "expected exactly (String, value) pairs"
+        );
+        // The payload MUST start with a string; parse_params breaks otherwise.
+        assert!(
+            fields[0].is_string(),
+            "first field must be a String control name, got {:?}",
+            fields[0].type_()
+        );
+        assert!(fields[1].is_double(), "value must be a Double");
+    }
+
+    /// Every control name must survive serialisation, and none may be preceded
+    /// by a count or tag.
+    #[test]
+    fn props_pod_carries_every_control_name() {
+        let controls: Vec<(String, f64)> = (0..16)
+            .flat_map(|i| ["l", "r"].map(move |s| (format!("band_{s}_{i}:b0"), i as f64 * 0.5)))
+            .collect();
+        let data = build_props_controls_pod_bytes(&controls).expect("pod should build");
+        let pod = Pod::from_bytes(&data).expect("pod bytes should parse");
+        let raw = pod.as_bytes();
+        for (name, _) in &controls {
+            assert!(
+                raw.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the serialised payload"
+            );
+        }
+        let obj = pod.as_object().expect("object");
+        let prop = obj.props().next().expect("one property");
+        let st = prop.value().as_struct().expect("struct");
+        let fields: Vec<_> = st.fields().collect();
+        assert_eq!(
+            fields.len(),
+            controls.len() * 2,
+            "no count or tag may precede the string/value pairs"
+        );
+        // Every other field must be the control name: a String pod carrying
+        // the expected text.
+        for (i, (name, _)) in controls.iter().enumerate() {
+            let field = fields[i * 2];
+            assert!(field.is_string(), "field {i} should be a String");
+            let bytes = field.as_bytes();
+            assert!(
+                bytes.windows(name.len()).any(|w| w == name.as_bytes()),
+                "field {i} does not carry {name:?}"
+            );
+        }
+    }
 }

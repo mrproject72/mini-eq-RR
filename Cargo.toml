@@ -1,6 +1,6 @@
 [package]
 name = "mini-eq-rr"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "mini-eq RR — Rust rewrite of the mini-eq PipeWire system-wide parametric equalizer."
 license = "GPL-3.0-or-later"
@@ -58,7 +58,7 @@ thiserror = "1"
 
 # Parsing / networking
 regex = "1.13"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
 
 [build-dependencies]
 

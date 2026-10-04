@@ -1,7 +1,7 @@
 //! AutoEq import dialog with curve preview.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::cairo::Context;
@@ -14,6 +14,14 @@ use crate::core::{
 };
 
 /// AutoEq import dialog.
+///
+/// This used to be unreachable: nothing constructed it, so the search box,
+/// results list and curve preview could never be used even though all three
+/// were built. It is now opened from the Presets panel.
+///
+/// Import used to be a `println!` stub. It now hands the parsed bands, preamp
+/// and profile name to a caller-supplied callback, which is what turns the
+/// dialog into a working feature.
 pub struct AutoEqDialog {
     pub dialog: gtk4::Dialog,
     pub search_entry: gtk4::SearchEntry,
@@ -25,6 +33,9 @@ pub struct AutoEqDialog {
     pub preview_preamp: Rc<RefCell<f64>>,
     _entries: Rc<RefCell<Vec<AutoEqEntry>>>,
     _cache_dir: PathBuf,
+    /// Invoked with `(bands, preamp_db, profile_name)` when the user confirms
+    /// an import. Set via [`AutoEqDialog::set_import_callback`].
+    on_import: Rc<RefCell<Option<Box<dyn Fn(Vec<crate::core::EqBand>, f64, String)>>>>,
 }
 
 impl AutoEqDialog {
@@ -79,6 +90,8 @@ impl AutoEqDialog {
         let entries = Rc::new(RefCell::new(Vec::new()));
         let preview_bands = Rc::new(RefCell::new(Vec::new()));
         let preview_preamp = Rc::new(RefCell::new(0.0));
+        let on_import: Rc<RefCell<Option<Box<dyn Fn(Vec<crate::core::EqBand>, f64, String)>>>> =
+            Rc::new(RefCell::new(None));
 
         let entries_for_search = entries.clone();
         let results_list_for_search = results_list.clone();
@@ -123,29 +136,12 @@ impl AutoEqDialog {
         let status_for_refresh = status_label.clone();
         let cache_dir_for_refresh = cache_dir.clone();
         refresh_button.connect_clicked(move |_| {
-            status_for_refresh.set_text("Refreshing...");
-            let cache_dir = cache_dir_for_refresh.clone();
-            let entries_for_refresh = entries_for_refresh.clone();
-            let results_list_for_refresh = results_list_for_refresh.clone();
-            let status_for_refresh = status_for_refresh.clone();
-
-            glib::MainContext::default().spawn_local(async move {
-                match crate::autoeq::load_autoeq_entries(&cache_dir).await {
-                    Ok(new_entries) => {
-                        *entries_for_refresh.borrow_mut() = new_entries;
-                        while let Some(child) = results_list_for_refresh.first_child() {
-                            results_list_for_refresh.remove(&child);
-                        }
-                        status_for_refresh.set_text(&format!(
-                            "Loaded {} profiles",
-                            entries_for_refresh.borrow().len()
-                        ));
-                    }
-                    Err(e) => {
-                        status_for_refresh.set_text(&format!("Error: {}", e));
-                    }
-                }
-            });
+            load_entries_into(
+                &cache_dir_for_refresh,
+                &entries_for_refresh,
+                &results_list_for_refresh,
+                &status_for_refresh,
+            );
         });
 
         let entries_for_select = entries.clone();
@@ -155,57 +151,92 @@ impl AutoEqDialog {
         let status_for_select = status_label.clone();
         let cache_dir_for_select = cache_dir.clone();
         results_list.connect_selected_rows_changed(move |list| {
-            if let Some(row) = list.selected_row() {
-                if let Some(child) = row.child() {
-                    if let Some(label) = child.downcast_ref::<gtk4::Label>() {
-                        let name = label.label();
-                        let entries = entries_for_select.borrow();
-                        if let Some(entry) = entries.iter().find(|e| e.name == name) {
-                            status_for_select.set_text("Loading curve preview...");
-                            let entry = entry.clone();
-                            let cache_dir = cache_dir_for_select.clone();
-                            let preview_bands = preview_bands_for_select.clone();
-                            let preview_preamp = preview_preamp_for_select.clone();
-                            let preview_area = preview_area_for_select.clone();
-                            let status = status_for_select.clone();
-                            glib::MainContext::default().spawn_local(async move {
-                                match download_autoeq_preset(&entry, &cache_dir, SAMPLE_RATE).await
-                                {
-                                    Ok(preset) => match parse_apo_file(&preset.path) {
-                                        Ok((preamp, bands)) => {
-                                            status.set_text(&format!(
-                                                "{} — {} bands",
-                                                entry.name,
-                                                bands.len()
-                                            ));
-                                            *preview_bands.borrow_mut() = bands;
-                                            *preview_preamp.borrow_mut() = preamp;
-                                            preview_area.queue_draw();
-                                        }
-                                        Err(e) => {
-                                            status.set_text(&format!("Parse error: {}", e));
-                                        }
-                                    },
-                                    Err(e) => {
-                                        status.set_text(&format!("Download error: {}", e));
-                                    }
-                                }
-                            });
-                        }
+            let Some(row) = list.selected_row() else {
+                return;
+            };
+            let Some(child) = row.child() else {
+                return;
+            };
+            let Some(label) = child.downcast_ref::<gtk4::Label>() else {
+                return;
+            };
+            let name = label.label().to_string();
+            let entry = {
+                let entries = entries_for_select.borrow();
+                entries.iter().find(|e| e.name == name).cloned()
+            };
+            let Some(entry) = entry else {
+                return;
+            };
+
+            status_for_select.set_text("Loading curve preview...");
+            let cache_dir = cache_dir_for_select.clone();
+            let preview_bands = preview_bands_for_select.clone();
+            let preview_preamp = preview_preamp_for_select.clone();
+            let preview_area = preview_area_for_select.clone();
+            let status = status_for_select.clone();
+            let entry_name = entry.name.clone();
+
+            // Blocking HTTP must not run on the GLib main loop (it would freeze
+            // the UI). GTK objects are not `Send`, so only the plain result
+            // crosses to a worker thread; widgets are then updated from a local
+            // main-loop continuation fed by a channel.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    download_autoeq_preset(&entry, &cache_dir, SAMPLE_RATE).and_then(|preset| {
+                        parse_apo_file(&preset.path).map(|(preamp, bands)| (preamp, bands))
+                    }),
+                );
+            });
+            glib::MainContext::default().spawn_local(async move {
+                let result = rx
+                    .recv()
+                    .unwrap_or_else(|_| Err("Download failed".to_string()));
+                match result {
+                    Ok((preamp, bands)) => {
+                        status.set_text(&format!("{entry_name} — {} bands", bands.len()));
+                        *preview_bands.borrow_mut() = bands;
+                        *preview_preamp.borrow_mut() = preamp;
+                        preview_area.queue_draw();
                     }
+                    Err(e) => status.set_text(&e),
                 }
-            }
+            });
         });
 
         let results_list_for_import = results_list.clone();
+        let preview_bands_for_import = preview_bands.clone();
+        let preview_preamp_for_import = preview_preamp.clone();
+        let status_for_import = status_label.clone();
+        let on_import_for_click = on_import.clone();
+        let import_button_for_click = import_button.clone();
         import_button.connect_clicked(move |_| {
-            if let Some(row) = results_list_for_import.selected_row() {
-                if let Some(child) = row.child() {
-                    if let Some(label) = child.downcast_ref::<gtk4::Label>() {
-                        let name = label.label();
-                        println!("Importing AutoEq preset: {}", name);
-                    }
+            let bands = preview_bands_for_import.borrow().clone();
+            if bands.is_empty() {
+                status_for_import.set_text("Select a profile first");
+                return;
+            }
+            let preamp = *preview_preamp_for_import.borrow();
+            let name = results_list_for_import
+                .selected_row()
+                .and_then(|row| row.child())
+                .and_then(|child| {
+                    child
+                        .downcast_ref::<gtk4::Label>()
+                        .map(|l| l.label().to_string())
+                })
+                .unwrap_or_else(|| "AutoEq import".to_string());
+
+            let borrowed = on_import_for_click.borrow();
+            match borrowed.as_ref() {
+                Some(cb) => {
+                    cb(bands, preamp, name.clone());
+                    status_for_import.set_text(&format!("Imported {}", name));
+                    import_button_for_click.set_sensitive(false);
                 }
+                // A dialog with no handler could only look broken; say so.
+                None => status_for_import.set_text("Import is not available"),
             }
         });
 
@@ -229,6 +260,12 @@ impl AutoEqDialog {
             draw_autoeq_preview(ctx, width, height, preamp, &bands);
         });
 
+        // Populate the profile index as soon as the dialog opens. Previously the
+        // entries list started empty and was only filled by the refresh button,
+        // so the first search always reported "No results found" until the user
+        // happened to press refresh.
+        load_entries_into(&cache_dir, &entries, &results_list, &status_label);
+
         dialog.present();
         Self {
             dialog,
@@ -241,12 +278,71 @@ impl AutoEqDialog {
             preview_preamp,
             _entries: entries,
             _cache_dir: cache_dir,
+            on_import,
         }
+    }
+
+    /// Fetch (or read from the on-disk cache) the AutoEq profile index, store
+    /// it and update the status line. One shared code path for the initial load
+    /// and the refresh button.
+    pub fn refresh_entries(&self) {
+        load_entries_into(
+            &self._cache_dir,
+            &self._entries,
+            &self.results_list,
+            &self.status_label,
+        );
     }
 
     pub fn show(&self) {
         self.dialog.present();
     }
+
+    /// Supply the handler that receives an imported profile. Without it the
+    /// Import button reports "Import is not available" rather than pretending.
+    pub fn set_import_callback(&self, cb: Box<dyn Fn(Vec<crate::core::EqBand>, f64, String)>) {
+        *self.on_import.borrow_mut() = Some(cb);
+    }
+}
+
+/// Fetch (or read from the on-disk cache) the AutoEq profile index, store it in
+/// `entries`, clear any stale rows and update `status`.
+fn load_entries_into(
+    cache_dir: &Path,
+    entries: &Rc<RefCell<Vec<AutoEqEntry>>>,
+    results_list: &gtk4::ListBox,
+    status: &gtk4::Label,
+) {
+    status.set_text("Loading AutoEq profiles...");
+    let cache_dir = cache_dir.to_path_buf();
+    let entries = entries.clone();
+    let results_list = results_list.clone();
+    let status = status.clone();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::autoeq::load_autoeq_entries(&cache_dir));
+    });
+    glib::MainContext::default().spawn_local(async move {
+        let result = rx
+            .recv()
+            .unwrap_or_else(|_| Err("AutoEq request failed".to_string()));
+        match result {
+            Ok(new_entries) => {
+                let count = new_entries.len();
+                *entries.borrow_mut() = new_entries;
+                while let Some(child) = results_list.first_child() {
+                    results_list.remove(&child);
+                }
+                status.set_text(&if count == 0 {
+                    "No AutoEq profiles available (offline?)".to_string()
+                } else {
+                    format!("{count} profiles — type to search")
+                });
+            }
+            Err(e) => status.set_text(&format!("AutoEq unavailable: {e}")),
+        }
+    });
 }
 
 fn draw_autoeq_preview(

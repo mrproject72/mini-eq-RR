@@ -2,17 +2,15 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use adw::prelude::*;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use mini_eq_rr::background;
 use mini_eq_rr::core::default_bands;
-use mini_eq_rr::dbus_control::{MiniEqAppHandler, MiniEqDBusControl};
+use mini_eq_rr::dbus_control::MiniEqDBusControl;
 use mini_eq_rr::pipewire_backend::PipeWireBackend;
+use mini_eq_rr::remote_control::AppState;
 
 #[derive(Parser)]
 #[command(name = "mini-eq")]
@@ -53,101 +51,24 @@ enum Commands {
     CheckDeps,
 }
 
-/// Shared application state for D-Bus handler.
-///
-/// The D-Bus handler is invoked from the GLib main thread only, so this struct
-/// deliberately does not implement `Send`/`Sync`. The PipeWire backend is *not*
-/// stored here — it is owned locally by `launch_gui`, because `PipeWireBackend`
-/// wraps `MainLoopRc` and is neither `Send` nor `Sync`.
-struct AppState {
-    eq_enabled: Mutex<bool>,
-    routed: Mutex<bool>,
-    preset_name: Mutex<Option<String>>,
-    output_sink: Mutex<Option<String>>,
-    background_mode: Mutex<bool>,
-    start_at_login: Mutex<bool>,
-    start_active_at_login: Mutex<bool>,
-    analyzer_enabled: Mutex<bool>,
-    window_visible: Mutex<bool>,
-}
-
-impl AppState {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            eq_enabled: Mutex::new(true),
-            routed: Mutex::new(false),
-            preset_name: Mutex::new(None),
-            output_sink: Mutex::new(None),
-            background_mode: Mutex::new(background::load_background_mode()),
-            start_at_login: Mutex::new(background::load_start_at_login()),
-            start_active_at_login: Mutex::new(background::load_start_active_at_login()),
-            analyzer_enabled: Mutex::new(false),
-            window_visible: Mutex::new(true),
-        })
-    }
-}
-
-impl MiniEqAppHandler for AppState {
-    fn eq_enabled(&self) -> bool {
-        *self.eq_enabled.lock().unwrap()
-    }
-    fn routed(&self) -> bool {
-        *self.routed.lock().unwrap()
-    }
-    fn output_sink(&self) -> Option<String> {
-        self.output_sink.lock().unwrap().clone()
-    }
-
-    fn set_eq_enabled(&self, enabled: bool) {
-        *self.eq_enabled.lock().unwrap() = enabled;
-    }
-    fn route_system_audio(&self, enabled: bool) {
-        *self.routed.lock().unwrap() = enabled;
-    }
-
-    fn current_preset_name(&self) -> Option<String> {
-        self.preset_name.lock().unwrap().clone()
-    }
-    fn background_mode(&self) -> bool {
-        *self.background_mode.lock().unwrap()
-    }
-    fn start_at_login(&self) -> bool {
-        *self.start_at_login.lock().unwrap()
-    }
-    fn start_active_at_login(&self) -> bool {
-        *self.start_active_at_login.lock().unwrap()
-    }
-    fn analyzer_enabled(&self) -> bool {
-        *self.analyzer_enabled.lock().unwrap()
-    }
-    fn analyzer_levels(&self) -> Vec<f64> {
-        Vec::new()
-    }
-    fn analyzer_display_gain_db(&self) -> f64 {
-        0.0
-    }
-    fn window_visible(&self) -> bool {
-        *self.window_visible.lock().unwrap()
-    }
-    fn ui_shutting_down(&self) -> bool {
-        false
-    }
-
-    fn present_main_window(&self, _startup_id: Option<&str>) {}
-    fn quit_fully(&self) {}
-    fn load_library_preset(&self, _name: &str) {}
-}
-
+/// Shared application state for the D-Bus handler lives in
+/// `mini_eq_rr::remote_control::AppState` — the window has to write into it on
+/// every state mutation, so it cannot live in this binary crate.
+// (see `AppState` there for the command queue that bridges the `Send` D-Bus
+// vtable to the main-thread GTK objects)
 fn main() {
     let cli = Cli::parse();
 
+    // One-shot subcommands and `--check-deps` do not touch PipeWire, so they run
+    // before the instance guard: they must keep working while the app is
+    // already open.
     if let Some(command) = &cli.command {
         match command {
             Commands::InstallDesktop => {
                 match mini_eq_rr::desktop_integration::install_desktop_integration() {
                     Ok(()) => println!("Installed desktop launcher and app icons."),
                     Err(e) => {
-                        eprintln!("Failed to install desktop integration: {}", e);
+                        eprintln!("Failed to install desktop integration: {e}");
                         std::process::exit(1);
                     }
                 }
@@ -164,6 +85,25 @@ fn main() {
         print_dependency_report();
         return;
     }
+
+    // Single-instance guard. Two instances would both try to own
+    // `mini_eq_sink`, so the second must not start. The kernel drops the lock
+    // if we die, so a crash never leaves the app unlaunchable.
+    let _instance_guard = match mini_eq_rr::instance::InstanceGuard::try_acquire() {
+        Ok(guard) => Some(guard),
+        Err(mini_eq_rr::instance::AcquireError::AlreadyRunning(pid)) => {
+            eprintln!(
+                "mini-eq RR is already running{}. Use that window instead of starting a second one.",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            // A broken lock must not make the app unusable.
+            eprintln!("Warning: {e}");
+            None
+        }
+    };
 
     env_logger::init();
 
@@ -288,19 +228,35 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
         }
     }
 
-    // Register D-Bus control
+    // Register D-Bus control.
+    // `output_sink` is resolved to the real engine sink above; publish it so
+    // the first GetState already reports it instead of an empty string.
+    if !engine_sink.is_empty() {
+        *app_state.output_sink.lock().unwrap() = Some(engine_sink.clone());
+    }
     let dbus_control = MiniEqDBusControl::new(app_state.clone());
     if let Err(e) = dbus_control.register() {
         log::warn!("Failed to register D-Bus control: {}", e);
+    } else if let Some(conn) = dbus_control
+        .connection_handle()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        // Hand the connection to AppState so the window can emit
+        // StateChanged / AnalyzerLevelsChanged on UI-initiated changes.
+        app_state.set_connection(conn);
     }
 
     let backend_for_activate = shared_backend.clone();
     let sink_for_activate = engine_sink.clone();
+    let state_for_activate = app_state.clone();
     app.connect_activate(move |app| {
         let window = mini_eq_rr::window::MiniEqWindow::new(
             app,
             backend_for_activate.clone(),
             sink_for_activate.clone(),
+            state_for_activate.clone(),
         );
         window.present();
     });

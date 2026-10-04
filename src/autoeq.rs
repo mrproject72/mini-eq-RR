@@ -355,14 +355,21 @@ const AUTOEQ_PARAMETRIC_EQ_CONFIG: &str = "8_PEAKING_WITH_SHELVES";
 const AUTOEQ_UNKNOWN_TARGET_LABEL: &str = "Unknown";
 
 /// Download and cache the AutoEq entries JSON from autoeq.app.
-pub async fn load_autoeq_entries(cache_dir: &Path) -> Result<Vec<AutoEqEntry>, String> {
+///
+/// Synchronous on purpose. This is called from a GTK app whose main loop is
+/// GLib, not Tokio, and `reqwest`'s async client needs a Tokio reactor: a
+/// `glib::MainContext::spawn_local` around it aborts the process with
+/// "there is no reactor running, must be called from the context of a Tokio 1.x
+/// runtime". Callers must therefore run this on a worker thread and hop back to
+/// the main context to touch widgets.
+pub fn load_autoeq_entries(cache_dir: &Path) -> Result<Vec<AutoEqEntry>, String> {
     let cache_path = cache_dir.join("autoeq").join("entries.json");
 
     if let Ok(cached) = std::fs::read_to_string(&cache_path) {
         return parse_autoeq_app_entries(&cached);
     }
 
-    let client = reqwest::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(AUTOEQ_REQUEST_TIMEOUT_SECONDS))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
@@ -371,10 +378,8 @@ pub async fn load_autoeq_entries(cache_dir: &Path) -> Result<Vec<AutoEqEntry>, S
         .get(AUTOEQ_APP_ENTRIES_URL)
         .header("User-Agent", "Mini EQ")
         .send()
-        .await
         .map_err(|e| format!("could not download AutoEq entries: {}", e))?
         .text()
-        .await
         .map_err(|e| format!("could not read AutoEq entries response: {}", e))?;
 
     let entries = parse_autoeq_app_entries(&text)?;
@@ -557,12 +562,15 @@ fn format_autoeq_parametric_eq(parametric_eq: &serde_json::Value) -> Result<Stri
 }
 
 /// Download and cache an AutoEq preset for the given entry.
-pub async fn download_autoeq_preset(
+///
+/// Synchronous for the same reason as [`load_autoeq_entries`]: run on a worker
+/// thread, not on the GLib main loop.
+pub fn download_autoeq_preset(
     entry: &AutoEqEntry,
     cache_dir: &Path,
     sample_rate: f64,
 ) -> Result<AutoEqDownloadedPreset, String> {
-    let client = reqwest::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(AUTOEQ_REQUEST_TIMEOUT_SECONDS))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
@@ -573,12 +581,10 @@ pub async fn download_autoeq_preset(
         .post(AUTOEQ_APP_EQUALIZE_URL)
         .json(&body)
         .send()
-        .await
         .map_err(|e| format!("could not download AutoEq data: {}", e))?;
 
     let data: serde_json::Value = resp
         .json()
-        .await
         .map_err(|e| format!("AutoEq response is not valid JSON: {}", e))?;
 
     let parametric_eq = &data["parametric_eq"];
@@ -667,6 +673,43 @@ mod tests {
         let result = parse_apo_file(&tmp);
         assert!(result.is_err());
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Uses the real shape returned by `https://autoeq.app/entries`, which is a
+    /// flat object mapping headphone name -> list of measurement records:
+    /// `{"HD650": [{"form": "...", "rig": "...", "source": "..."}], ...}`
+    /// (6033 names as of 2026-10-04). A parser that only handled a list, or a
+    /// flat record, would silently yield zero profiles.
+    #[test]
+    fn test_parse_entries_real_api_shape() {
+        let payload = r#"{
+            "HD650": [{"form": "over-ear", "rig": "HD650", "source": "oratory1990"}],
+            "1Custom SA02": [{"form": "in-ear", "rig": "711", "source": "crinacle"}],
+            "M50x": [
+                {"form": "over-ear", "rig": "", "source": "rtings"},
+                {"form": "over-ear", "rig": "ANC", "source": "crinacle"}
+            ]
+        }"#;
+        let entries = parse_autoeq_app_entries(payload).expect("payload should parse");
+        assert_eq!(entries.len(), 4, "one entry per name/measurement pair");
+
+        let hd650 = entries.iter().find(|e| e.name == "HD650").expect("HD650");
+        assert_eq!(hd650.source, "oratory1990");
+        assert_eq!(hd650.form, "over-ear");
+        assert_eq!(hd650.rig, "HD650");
+
+        // Multiple measurements of one headphone must all be offered.
+        let m50x: Vec<&AutoEqEntry> = entries.iter().filter(|e| e.name == "M50x").collect();
+        assert_eq!(m50x.len(), 2, "both M50x measurements should be listed");
+
+        // And they must be searchable.
+        let hits = search_autoeq_entries(&entries, "hd650", 10);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_entries_rejects_malformed_json() {
+        assert!(parse_autoeq_app_entries("not json").is_err());
     }
 
     #[test]

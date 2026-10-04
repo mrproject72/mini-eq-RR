@@ -2,18 +2,115 @@
 
 ## Open Bugs
 
+### RESOLVED — A/B compare and the System-wide EQ switch
+
+**Verified working 2026-10-04** (user-confirmed: both the System-wide EQ switch
+and A/B, with System-wide EQ on).
+
+**Cause of the earlier "A/B does nothing" reports: the EQ was out of the audio
+path.** `routed: false` was confirmed via `GetState` while those reports were
+being filed. The A/B switch bypasses the EQ *inside* `mini_eq_sink`, so with
+systemwide routing off, playback streams go straight to the sound card and no EQ
+control — including A/B — can affect anything. Same behaviour as upstream.
+
+Fixed by making the switch **insensitive while routing is off**, with a tooltip
+explaining why, and re-enabling it with an explanatory tooltip when routing goes
+on. Seeded from the routing switch's real state at startup, since `state-set`
+never fires for an initial state. That removes the "looks live but does nothing"
+trap that made this so hard to diagnose.
+
+**A wrong turn is recorded here on purpose.** An intermediate change tried to
+"fix" the props pod by emitting `SPA_POD_PROP_FLAG_HINT_DICT` and a leading
+`Int: n_items`, by analogy with upstream's `GLib.Variant("a{sd}", …)`. That was
+wrong and it made the EQ completely inert. Reverted.
+
+Ground truth from PipeWire source (`spa/include/spa/param/props.h`,
+`spa/plugins/filter-graph/filter-graph.c`):
+
+- `SPA_PROP_START_Other = 0x80000` and `SPA_PROP_params` is the first entry, so
+  the property key is **0x80001**.
+- Payload is `Struct((String : key, Pod : value)*)` — **no item count, no dict
+  flag**.
+- `parse_params()` `break`s on the first field it cannot read as a string, which
+  is why the bogus leading `Int` dropped every control.
+- `find_port()` splits `node:control` on `:` and resolves the node by name across
+  the whole graph, so `band_l_0:b0` naming is correct.
+
+The original encoding was therefore already right. It is now pinned by
+`props_pod_is_a_bare_struct_of_string_value_pairs` and
+`props_pod_carries_every_control_name` — the first asserts the payload *starts
+with a string*, so the broken shape cannot return silently. `pipewire_backend.rs`
+previously had **no tests at all**.
+
+Also changed, and kept because they are correct regardless:
+
+- The 400 ms fader-drag debounce no longer applies to A/B; a bypass toggle
+  pushes on the next tick.
+- `A/B compare: bypassed=… (eq_enabled=…)` logs at INFO on every toggle, and each
+  backend push logs `eq_enabled`. The switch previously gave no feedback at all.
+
+### Measurement traps hit while investigating this
+
+Recorded because they will bite again on this machine:
+
+- The app's analyzer **auto-normalises** — it reports an identical value for a
+  +18 dB and a −18 dB curve. Identical readings prove nothing about level. Two
+  of my conclusions during this session were wrong because of it.
+- `pw-record` captured digital silence (−80 dBFS) even for a tone played
+  straight to the sound card.
+- `pw-top` exposes no dB columns in this build.
+- `filter_type: 0` is **Off** (Bell is `1`), and the preset preamp key is
+  `preamp_db`, not `preamp`. Both mistakes silently yield flat test fixtures.
+
+Only a human ear is reliable here. When in doubt, read PipeWire's source.
+
+### ~~**No single-instance guard.**~~ **FIXED 2026-10-04**
+
+`instance.rs` defined an `InstanceGuard` that was an in-process
+`Arc<Mutex<bool>>` and was **never instantiated**, so it could not prevent
+anything: two instances could run at once and both would try to own
+`mini_eq_sink`.
+
+Now a real exclusive `flock` on `$XDG_RUNTIME_DIR/mini-eq-rr.lock`, acquired in
+`main()` after the one-shot subcommands (which must keep working while the app is
+open). A second launch prints the holder's PID and exits 1. The kernel releases
+the lock when the holder dies, so a crash never leaves the app unlaunchable.
+
+**No orphaned-filter-chain reaping was added, and that is deliberate.** Upstream
+`instance.py` also walks `/proc` killing orphaned `pipewire -c ...` children,
+because the *Python* app spawns the filter chain as a child process. This port
+does not — `PipeWireBackend` uses `pw_context_load_module`, so the module lives
+in the daemon and is owned by our client connection. Verified empirically: after
+`kill -9` of a running instance, `mini_eq_sink` and `mini_eq_sink_output` are
+both gone within a few seconds. A `/proc` scanner that kills processes would be a
+liability, not a safety net.
+
+Verified live: second instance refused with the holder PID; restart after
+`kill -9` succeeds; restart after `SIGTERM` succeeds; `--check-deps` still works
+while running.
+
 ### P1 — user-visible, small fix
 
-- **Analyzer renders blank: it is never fed data.** `AnalyzerPanel::update(&self,
-  levels: &[f64])` exists and the panel has a drawing area, header, smoothing /
-  display-gain / freeze controls, and it IS in the sidebar stack
-  (`PAGE_ANALYZER`). But **nothing ever calls `update()`** — `grep` finds no
-  consumer of `utility.analyzer` outside `window_utility.rs`. Meanwhile the
-  backend *does* capture the data (`pipewire_backend.rs:150
-  analyzer.start_capture(...)`) and D-Bus exposes it
-  (`dbus_control.rs:398 handler.analyzer_levels()`). So the pipeline exists
-  end-to-end except for the last hop into the panel. Fix: feed
-  `utility.analyzer.update(levels)` from the existing 33 ms tick.
+- ~~**AutoEq is unreachable: the dialog is never constructed.**~~ **FIXED
+  2026-10-04.** Four separate defects, not one — see below.
+
+- ~~**AutoEq is unreachable: the dialog is never constructed.**~~
+  *(original entry, kept for context)*
+  `autoeq.rs` (705 lines) is complete and tested — `search_autoeq_entries`,
+  `load_autoeq_entries`, `download_autoeq_preset`,
+  `format_autoeq_parametric_eq`, cache handling — but nothing calls it.
+  `window_autoeq.rs` has three functions (`new`, `show`,
+  `draw_autoeq_preview`) and `grep` for `AutoEq` across `window.rs`,
+  `window_layout.rs`, `window_presets.rs` and `window_utility.rs` returns
+  nothing, so the dialog can never open. Upstream `window_autoeq.py` has 37
+  methods. README:23 advertises the feature; it does not work.
+- **The app installs no icon.** `desktop_integration.rs` sets
+  `APP_ICON_SEARCH_PATH = "assets/icons"`, but `src/assets` does not exist, so
+  `copy_app_icons` hits its `if !source_dir.exists() { return; }` and silently
+  installs nothing while the generated `.desktop` file still declares
+  `Icon=io.github.mrproject72.mini_eq_rr`.
+- ~~**Analyzer renders blank: it is never fed data.**~~ **FIXED** — the 33 ms
+  tick now calls `utility.analyzer.update(&levels)`.
 - ~~**Cannot name a new preset or rename one.**~~ **FIXED.** Add now
   prompts for a name (suggesting the old `preset_N` as a default) and a
   Rename button was added to the toolbar. Rename uses `fs::rename` on the
@@ -28,21 +125,9 @@
   existing (previously unreachable) `PreferencesDialog`, About shows an
   `AdwAboutDialog` wired to `CARGO_PKG_VERSION` and the new repo, Quit
   closes the window.
-
-- ~~**The entire app menu is dead — no GActions are registered anywhere.**~~
-  **FIXED.** `app.preferences`, `app.about` and `app.quit` are now
-  registered as `gio::SimpleAction`s on the window. Preferences opens the
-  existing (previously unreachable) `PreferencesDialog`, About shows an
-  `AdwAboutDialog` wired to `CARGO_PKG_VERSION` and the new repo, Quit
-  closes the window.
-  `create_menu_model()` wires `app.about`, `app.preferences` and
-  `app.quit`, but `grep` finds **zero** `create_action` / `add_action`
-  calls in the whole codebase. Every hamburger-menu item is a no-op.
-  `window_preferences.rs` is actually fully functional (it loads and
-  saves background mode, start-at-login and the active-at-login flag) —
-  it is simply **unreachable** because nothing handles `app.preferences`.
-  Fix: register the three actions on the window/app and present the
-  existing dialog. Small job, high user-visible payoff.
+  (Note: they need the `win.` prefix, not `app.` — the actions live on the
+  `ApplicationWindow`, not the `GApplication`. Without the prefix GTK found no
+  action and rendered every item insensitive.)
 - **Appearance is applied but never persisted.** `window.rs` calls
   `AppearanceSettings::load()` + `apply_appearance_preference`, but there
   are **0** call sites for `AppearanceSettings::save` / `save_appearance`,
@@ -101,6 +186,87 @@
 
 ## Fixed Bugs
 
+- **A/B compare felt broken because it waited on the fader-drag debounce.**
+  The bypass state was correctly folded into the push signature, but the whole
+  push was still gated on `last_push.elapsed() >= 400ms` — a debounce that
+  exists to stop *fader drags* thrashing the DSP. A single deliberate A/B
+  toggle therefore took up to 400ms, and toggling back inside that window
+  cancelled it entirely, so the switch could produce no audible change at all.
+  The debounce now applies only to band/preamp edits; a bypass change pushes on
+  the next tick immediately (measured: applied within 200ms).
+
+  The DSP side was verified correct, not assumed: `bq_raw_control_values` with
+  `eq_enabled=false` collapses every band node to unity gain (b0 == a0, all
+  other coefficients 0) and differs from the active set. That matches upstream
+  `filter_chain.py` formula-for-formula. Pinned by
+  `test_eq_bypass_pushes_flat_response_not_the_active_curve`.
+
+  **Worth knowing when testing this:** bypass is only audible if the EQ curve is
+  actually doing something. On a flat curve (all bands 0 dB or `Off`) the
+  bypassed and active responses are identical, so there is correctly nothing to
+  hear. Boost a band first.
+- **Analyzer controls were unlabelled.** Two `Scale` widgets and a `Switch` were
+  appended straight into one horizontal `Box` with only tooltips, so nothing on
+  screen identified them. Now three labelled rows — "Smoothing" (with a live
+  `NN%` readout), "Display Gain" (with a `+N dB` readout) and "Freeze" — using a
+  `boxed-list` `ListBox`, mirroring upstream's `Adw.ActionRow` layout in
+  `window_utility.py`. Tooltips now explain what each does rather than merely
+  naming it.
+- **The D-Bus control service was completely unreachable, and everything behind
+  it was a stub.** Four independent defects stacked up, so no remote client
+  could do anything at all:
+  1. `acquire_bus_name()` existed but **was never called**. Registering the
+     object on the connection does not claim the well-known name, so
+     `gdbus call --dest io.github.mrproject72.mini_eq_rr` returned
+     `ServiceUnknown`. `register()` now owns the name itself.
+  2. `AppState` (`main.rs`) was the only `MiniEqAppHandler` impl and was
+     disconnected from the window — `window.rs` had zero references to it.
+     `SetEqEnabled` / `SetRoutingEnabled` flipped a `Mutex<bool>` nothing read;
+     `SetPreset`, `PresentWindow` and `Quit` were empty; `AnalyzerLevels`
+     always returned `[]`. `GetState` reported `eq_enabled=true`
+     unconditionally.
+  3. `on_method_call` read arguments with `params.get::<bool>()`, but `params`
+     is the whole argument **tuple** — a one-arg method arrives as `(b)`.
+     Every setter therefore answered `InvalidArguments`. Latent until (1) made
+     the service reachable.
+  4. `array_from_iter::<Variant>(...)` inferred the wrong element type and
+     tripped a `glib` `is_type` assertion at runtime. `ListPresets` and
+     `AnalyzerLevelsChanged` both panicked. Fixed with
+     `array_from_iter_with_type`.
+
+  Fixed by moving `AppState` into the library as `src/remote_control.rs` and
+  bridging the `Send` D-Bus vtable to the main-thread widgets with a command
+  queue (`RemoteCommand`) drained at the top of the 33 ms tick — draining
+  before `bands` is computed, so a preset loaded over D-Bus is pushed to the
+  filter chain in the same tick. The window now mirrors state back into
+  `AppState` (route switch, preset selection, bypass), so `GetState` and all
+  three signals are live. Verified on a running instance: `GetState`,
+  `ListPresets`, `SetEqEnabled`, `SetRoutingEnabled`, `SetPreset`,
+  `PresentWindow` all take effect; `StateChanged`, `PresetsChanged` and
+  `AnalyzerLevelsChanged` (~10/s) all emit. See
+  `docs/PLAN/gap-closure-2026-10-04.md` Gap 1.
+
+- **A/B compare (bypass) switch was a dead widget.** `utility.bypass_switch`
+  was built and added to the graph header but had **no handler**, and
+  `update_state_live_or_reload` hardcoded `eq_enabled = true`, so bands were
+  always pushed wet. It now has a `state-set` handler, the tick folds the
+  switch state into the push signature, and `eq_enabled` is passed through to
+  `apply_live_controls`. `MiniEqAppHandler` gained `running()` (upstream:
+  `controller is not None`) — `build_state` previously hardcoded
+  `running: false`.
+
+- **`AnalyzerLevelsChanged` was value-gated, which starved it.** The first
+  implementation emitted only when the level vector differed from the last
+  publish. Silence and steady tones produce an identical spectrum every frame,
+  so the signal never fired at all. Now time-throttled at 100 ms, matching
+  upstream `CONTROL_ANALYZER_EMIT_INTERVAL_SECONDS`.
+
+- **`target/debug/mini-eq` is a stale artifact that shadows the real binary.**
+  The crate builds `mini-eq-rr`; `target/debug/mini-eq` is left over from before
+  the rename (mtime 2026-09-28). `docs/2026-09-28-handover.md` instructs
+  running `./target/debug/mini-eq`, so a live check can silently test 6-day-old
+  code. Delete it and correct the handover/`dev-restart.sh`.
+
 - **Headroom/Auto-Safe peak estimate was graph-clamped (under-compensated stacked boosts).** `estimate_response_peak_db` sampled through the display-clamped `total_response_db` (±36 dB), so 4× HiShelf @ +20 dB (true peak ~+84 dB) reported only +36 dB and Auto-Safe pinned at the −24 dB floor could never clear the warning. Split into `total_response_db_unclamped` + clamped wrapper; the estimate now uses the unclamped path (upstream `clamp_output=False`). Locked in by `test_estimate_response_peak_db_is_unclamped`. See `2026-09-28-updates.md`.
 - **System EQ toggle unwired / GUI had no backend path / output dropdown placeholder.** Resolved in the 2026-09-27 sessions: the window owns `PipeWireBackend`, fader/preamp edits push live `SPA_PARAM_Props` (`bq_raw`), the output dropdown is populated from detected routes, and System EQ routes/unroutes app streams via default metadata. See `2026-09-27-handover.md`.
 - **EQ detached on filter-type change.** The native-biquad strategy reloaded the module on type change, recreating the virtual sink with a new node id and orphaning routed streams. Switched to the upstream `bq_raw` strategy (type encoded in coefficients, fixed topology, live pushes only). See `2026-09-27-updates.md`.
@@ -119,18 +285,14 @@
 
 ## Known Issues
 
-- **App ID still uses upstream's namespace (`io.github.mrproject72.mini_eq_rr`) —
-  needs a decision before any public release.** `core::APP_ID`,
-  `analyzer::ANALYZER_APPLICATION_ID`, the D-Bus service name
-  (`io.github.mrproject72.MiniEqRR.Control`) and the autostart file
-  (`io.github.mrproject72.mini_eq_rr.desktop`) all identify as the **original
-  Python project**. Consequences: it collides with a real upstream install
-  on the same machine (single-instance lock, D-Bus name ownership, desktop
-  file, autostart entry) and it misrepresents authorship. Renaming touches
-  config dir, D-Bus interface, autostart and window-matching, so it was
-  deliberately **not** changed as part of the display-level rename to
-  "mini-eq RR". Decide the new ID (e.g. `io.github.mrproject72.mini_eq_rr`)
-  and migrate config deliberately.
+- **App ID decision — settled, but a config migration is still missing.**
+  `core::APP_ID`, `analyzer::ANALYZER_APPLICATION_ID`, the D-Bus service name
+  and the autostart file all use `io.github.mrproject72.mini_eq_rr`. This was
+  verified to be consistent across `core.rs`, `dbus_control.rs` and
+  `desktop_integration.rs`, and it no longer collides with an upstream install
+  on the same machine. Config lives in `~/.config/mini-eq-rr`, so an existing
+  `~/.config/mini-eq` is **not** picked up — add a one-shot migration if that
+  matters.
 - **Auto-Safe lowers the volume noticeably — EXPECTED BEHAVIOUR, not a bug.**
   With Auto-Safe engaged the whole output is attenuated by
   **`1 dB + your maximum EQ boost`**, because

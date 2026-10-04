@@ -73,6 +73,11 @@ pub const INTROSPECTION_XML: &str = r#"<node>
 /// Trait representing the application state that the D-Bus interface can query
 /// and control. Mirrors the Python protocols.
 pub trait MiniEqAppHandler: Send + Sync + 'static {
+    /// Whether the EQ engine (upstream: the controller) exists. Upstream
+    /// reports `controller is not None`.
+    fn running(&self) -> bool {
+        true
+    }
     fn eq_enabled(&self) -> bool;
     fn routed(&self) -> bool;
     fn output_sink(&self) -> Option<String>;
@@ -131,7 +136,10 @@ pub fn build_state(handler: &dyn MiniEqAppHandler) -> HashMap<String, glib::Vari
         "capabilities".to_string(),
         glib::Variant::from(CAPABILITIES.to_vec()),
     );
-    state.insert("running".to_string(), glib::Variant::from(false));
+    state.insert(
+        "running".to_string(),
+        glib::Variant::from(handler.running()),
+    );
     state.insert(
         "eq_enabled".to_string(),
         glib::Variant::from(handler.eq_enabled()),
@@ -220,6 +228,9 @@ pub struct MiniEqDBusControl {
     handler: Arc<dyn MiniEqAppHandler>,
     connection: Arc<Mutex<Option<gio::DBusConnection>>>,
     registration_id: Arc<Mutex<Option<gio::RegistrationId>>>,
+    /// Owner id for the well-known bus name. Must be retained for as long as
+    /// the name should stay owned; dropping it releases the name.
+    bus_owner_id: Arc<Mutex<Option<gio::OwnerId>>>,
 }
 
 impl MiniEqDBusControl {
@@ -228,6 +239,7 @@ impl MiniEqDBusControl {
             handler,
             connection: Arc::new(Mutex::new(None)),
             registration_id: Arc::new(Mutex::new(None)),
+            bus_owner_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -269,7 +281,28 @@ impl MiniEqDBusControl {
 
         *self.connection.lock().unwrap() = Some(connection.clone());
         *self.registration_id.lock().unwrap() = Some(reg_id);
+
+        // Claim the well-known bus name. Registering the object is not
+        // enough: without owning the name, `gdbus call --dest <BUS_NAME>` and
+        // the GNOME Shell extension get ServiceUnknown. This used to live only
+        // in `acquire_bus_name()`, which nothing called, so the control
+        // interface was unreachable in practice.
+        let owner_id = gio::bus_own_name_on_connection(
+            &connection,
+            BUS_NAME,
+            gio::BusNameOwnerFlags::REPLACE,
+            |_conn, _name| {},
+            |_conn, _name| {},
+        );
+        *self.bus_owner_id.lock().unwrap() = Some(owner_id);
         Ok(())
+    }
+
+    /// Shared handle to the registered connection, so `AppState` (and through
+    /// it the window) can emit `StateChanged` / `AnalyzerLevelsChanged` when
+    /// the UI mutates state on its own.
+    pub fn connection_handle(&self) -> Arc<Mutex<Option<gio::DBusConnection>>> {
+        self.connection.clone()
     }
 
     pub fn unregister(&self) {
@@ -301,41 +334,49 @@ impl MiniEqDBusControl {
             }
             "ListPresets" => {
                 let presets = list_preset_names();
-                let strv: Vec<&str> = presets.iter().map(|s| s.as_str()).collect();
-                let array = glib::Variant::array_from_iter::<glib::Variant>(
-                    strv.iter().map(|s| glib::Variant::from(*s)),
+                // Element type pinned to `s` so the array is `as` — see the
+                // note on `emit_analyzer_levels_changed`.
+                let array = glib::Variant::array_from_iter_with_type(
+                    glib::VariantTy::STRING,
+                    presets.iter().cloned().map(glib::Variant::from),
                 );
                 let wrapped = glib::Variant::from((array,));
                 invocation.return_value(Some(&wrapped))
             }
-            "SetEqEnabled" => {
-                if let Some(enabled) = params.get::<bool>() {
+            // NOTE on argument extraction: `params` is the whole argument *tuple*, so a
+            // one-argument method arrives as `(b)` / `(s)`, never as a bare
+            // `b` / `s`. Reading it with `params.get::<bool>()` always failed
+            // the type assertion and every setter answered InvalidArguments —
+            // invisible until the bus name was actually owned, because nothing
+            // could reach the service before.
+            "SetEqEnabled" => match params.get::<(bool,)>() {
+                Some((enabled,)) => {
                     handler.set_eq_enabled(enabled);
                     if let Some(ref conn) = conn {
                         Self::emit_state_changed(conn, handler);
                     }
-                    return invocation.return_value(None);
+                    invocation.return_value(None)
                 }
-                invocation.return_dbus_error(
+                None => invocation.return_dbus_error(
                     &format!("{}.InvalidArguments", INTERFACE_NAME),
                     "Invalid arguments for SetEqEnabled",
-                )
-            }
-            "SetRoutingEnabled" => {
-                if let Some(enabled) = params.get::<bool>() {
+                ),
+            },
+            "SetRoutingEnabled" => match params.get::<(bool,)>() {
+                Some((enabled,)) => {
                     handler.route_system_audio(enabled);
                     if let Some(ref conn) = conn {
                         Self::emit_state_changed(conn, handler);
                     }
-                    return invocation.return_value(None);
+                    invocation.return_value(None)
                 }
-                invocation.return_dbus_error(
+                None => invocation.return_dbus_error(
                     &format!("{}.InvalidArguments", INTERFACE_NAME),
                     "Invalid arguments for SetRoutingEnabled",
-                )
-            }
-            "SetPreset" => {
-                if let Some(name) = params.get::<String>() {
+                ),
+            },
+            "SetPreset" => match params.get::<(String,)>() {
+                Some((name,)) => {
                     let preset_name = sanitize_preset_name(&name);
                     if preset_name.is_empty() {
                         return invocation.return_dbus_error(
@@ -347,21 +388,20 @@ impl MiniEqDBusControl {
                     if let Some(ref conn) = conn {
                         Self::emit_state_changed(conn, handler);
                     }
-                    return invocation.return_value(None);
+                    invocation.return_value(None)
                 }
-                invocation.return_dbus_error(
+                None => invocation.return_dbus_error(
                     &format!("{}.InvalidArguments", INTERFACE_NAME),
                     "Invalid arguments for SetPreset",
-                )
-            }
+                ),
+            },
             "PresentWindow" => {
                 handler.present_main_window(None);
                 invocation.return_value(None)
             }
             "PresentWindowWithStartupId" => {
-                if let Some(startup_id) = params.get::<String>() {
+                if let Some((startup_id,)) = params.get::<(String,)>() {
                     handler.present_main_window(Some(&startup_id));
-                    return invocation.return_value(None);
                 }
                 invocation.return_value(None)
             }
@@ -376,7 +416,13 @@ impl MiniEqDBusControl {
         }
     }
 
-    fn emit_state_changed(connection: &gio::DBusConnection, handler: &dyn MiniEqAppHandler) {
+    /// Emit `StateChanged`. Called both from the method handlers below and
+    /// from the window whenever it mutates state on its own, so remote clients
+    /// see UI-initiated changes too.
+    pub(crate) fn emit_state_changed(
+        connection: &gio::DBusConnection,
+        handler: &dyn MiniEqAppHandler,
+    ) {
         let state = build_state(handler);
         let variant = state_to_variant(&state);
         let wrapped = glib::Variant::from((variant,));
@@ -390,7 +436,7 @@ impl MiniEqDBusControl {
     }
 
     #[allow(dead_code)]
-    fn emit_analyzer_levels_changed(
+    pub(crate) fn emit_analyzer_levels_changed(
         connection: &gio::DBusConnection,
         handler: &dyn MiniEqAppHandler,
     ) {
@@ -398,8 +444,14 @@ impl MiniEqDBusControl {
             &handler.analyzer_levels(),
             handler.analyzer_display_gain_db(),
         );
-        let array = glib::Variant::array_from_iter::<glib::Variant>(
-            levels.iter().map(|l| glib::Variant::from(*l)),
+        // `array_from_iter_with_type::<f64>` is required: the element type has
+        // to be pinned to `d` so the array is `ad`. The obvious
+        // `array_from_iter::<Variant>(...map(Variant::from))` infers the
+        // element type from `Variant`'s own static type instead and trips an
+        // `is_type` assertion at runtime.
+        let array = glib::Variant::array_from_iter_with_type(
+            glib::VariantTy::DOUBLE,
+            levels.iter().copied().map(glib::Variant::from),
         );
         let wrapped = glib::Variant::from((array,));
         let _ = connection.emit_signal(
@@ -412,7 +464,7 @@ impl MiniEqDBusControl {
     }
 
     #[allow(dead_code)]
-    fn emit_presets_changed(connection: &gio::DBusConnection) {
+    pub(crate) fn emit_presets_changed(connection: &gio::DBusConnection) {
         let _ = connection.emit_signal(None, OBJECT_PATH, INTERFACE_NAME, "PresetsChanged", None);
     }
 }

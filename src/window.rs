@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 
@@ -97,6 +98,7 @@ impl MiniEqWindow {
         app: &adw::Application,
         backend: Rc<RefCell<Option<PipeWireBackend>>>,
         engine_sink: String,
+        app_state: Arc<crate::remote_control::AppState>,
     ) -> Self {
         let window = adw::ApplicationWindow::new(app);
         let (default_width, default_height) = window_state::initial_window_default_size();
@@ -479,6 +481,47 @@ impl MiniEqWindow {
                     glib::Propagation::Proceed
                 });
         }
+
+        // A/B compare switch. This switch had NO handler at all: the widget was
+        // built and added to the graph header but nothing read it, and
+        // `update_state_live_or_reload` hardcoded `eq_enabled = true`, so the
+        // bands were always pushed wet. The tick now folds the switch state
+        // into the push signature and passes it through as `eq_enabled`.
+        // `state-set` (not `notify::active`) so a programmatic `set_active`
+        // from the D-Bus drain does not re-enter — that path sets the flag
+        // itself.
+        {
+            let state_for_bypass = app_state.clone();
+            utility
+                .bypass_switch
+                .connect_state_set(move |_switch, bypassed| {
+                    let eq_enabled = !bypassed;
+                    // INFO, not DEBUG: "the A/B switch does nothing" was
+                    // reported repeatedly and the switch gave no feedback at
+                    // all. One line per toggle makes the state observable from
+                    // a log however the change was triggered (click or D-Bus).
+                    log::info!("A/B compare: bypassed={bypassed} (eq_enabled={eq_enabled})");
+                    if *state_for_bypass.eq_enabled.lock().unwrap() != eq_enabled {
+                        *state_for_bypass.eq_enabled.lock().unwrap() = eq_enabled;
+                        state_for_bypass.emit_state_changed();
+                    }
+                    glib::Propagation::Proceed
+                });
+        }
+        // `state-set` does not fire for the switch's initial state, so seed the
+        // A/B sensitivity from the routing switch's actual state here. Routing
+        // starts off unless something else enabled it, which is the default —
+        // and in that state the A/B switch must already look inert.
+        {
+            let routed = route_switch.is_active();
+            utility.bypass_switch.set_sensitive(routed);
+            utility.bypass_switch.set_tooltip_text(Some(if routed {
+                "Compare with/without the EQ. Works because app audio is routed through the EQ."
+            } else {
+                "Turn on the systemwide EQ switch first — audio has to be routed \
+                 through the EQ for this to have any effect."
+            }));
+        }
         // Reflect a restored Smooth state on the dropdown immediately.
         if utility.headroom.borrow().smooth.get() {
             utility
@@ -676,6 +719,9 @@ impl MiniEqWindow {
             // state actually changed and at most every 400 ms, so fader drags
             // do not thrash the module.
             let last_pushed_sig = Rc::new(RefCell::new(String::new()));
+            // Tracked separately from the payload signature so an A/B toggle can
+            // skip the 400 ms fader-drag debounce.
+            let last_pushed_eq_enabled = Rc::new(RefCell::new(true));
             let last_push = Rc::new(RefCell::new(
                 std::time::Instant::now() - std::time::Duration::from_millis(500),
             ));
@@ -685,6 +731,15 @@ impl MiniEqWindow {
             // rendered blank -- the analyzer looked "missing" even though
             // the whole pipeline existed except for this last hop.
             let analyzer_panel = utility.analyzer.clone();
+            // Handles the remote-control drain needs. `window` is used for
+            // PresentWindow/Quit; `route_switch` so a D-Bus SetRoutingEnabled
+            // moves the real widget (and the widget's own handler pushes the
+            // change back, keeping the two in sync).
+            let window_handle = window.clone();
+            let route_switch_handle = route_switch.clone();
+            let bypass_switch_handle = utility.bypass_switch.clone();
+            let presets_handle = utility.presets.clone();
+            let app_state_handle = app_state.clone();
 
             // Wire the analyzer panel controls to the backend. These sliders
             // existed but were decorative -- nothing read them.
@@ -746,6 +801,39 @@ impl MiniEqWindow {
             }
 
             glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+                // --- Remote control (D-Bus) -----------------------------
+                // The handlers cannot touch GTK objects directly (the vtable
+                // closure is Send, GTK is main-thread-only), so they queue
+                // commands here. Draining at the very top of the tick means a
+                // preset loaded over D-Bus is applied BEFORE `bands` is
+                // computed below, so the backend push at the end of this same
+                // tick already carries the new coefficients.
+                for cmd in app_state_handle.drain_pending() {
+                    apply_remote_command(
+                        &cmd,
+                        &app_state_handle,
+                        &backend,
+                        &route_switch_handle,
+                        &bypass_switch_handle,
+                        &presets_handle,
+                        &window_handle,
+                    );
+                }
+
+                // Mirror the loaded preset into the shared state so GetState
+                // agrees with the panel. Done here rather than inside the
+                // panel's apply callback because that callback runs while
+                // `presets` is already mutably borrowed by load_library_preset
+                // — re-borrowing it there panics. One sync point also covers
+                // both the UI row selection and the D-Bus command above.
+                {
+                    let loaded = presets_handle.borrow().current_preset_name();
+                    if *app_state_handle.preset_name.lock().unwrap() != loaded {
+                        *app_state_handle.preset_name.lock().unwrap() = loaded;
+                        app_state_handle.emit_state_changed();
+                    }
+                }
+
                 // Smooth override: the graph, the peak estimate and the
                 // backend push must all see the SAME effective bands, or the
                 // displayed curve would disagree with the audio.
@@ -800,6 +888,28 @@ impl MiniEqWindow {
                     .unwrap_or_default();
                 if !levels.is_empty() {
                     analyzer_panel.borrow().update(&levels);
+                }
+
+                // Publish what the D-Bus interface reports, reusing the levels
+                // already read above rather than asking the backend twice.
+                // `visible` is derived rather than tracked so it cannot drift.
+                app_state_handle.publish(
+                    levels.clone(),
+                    analyzer_panel.borrow().display_gain_scale.value(),
+                    window_handle.is_visible(),
+                    backend.borrow().is_some(),
+                    backend
+                        .borrow()
+                        .as_ref()
+                        .map(|be| be.monitor_enabled())
+                        .unwrap_or(false),
+                );
+                // Rate-limited inside AppState (upstream parity: 100 ms). Only
+                // while the monitor is running, matching upstream, which stops
+                // the preview source when the analyzer is off and the spectrum
+                // has decayed away.
+                if !levels.is_empty() {
+                    app_state_handle.maybe_emit_analyzer_levels_changed();
                 }
                 // Keep the panel's enable toggle reflecting reality.
                 {
@@ -885,13 +995,26 @@ impl MiniEqWindow {
                 };
                 headroom_warning.set(warn);
 
-                // Push UI state to the PipeWire engine (debounced).
-                let sig = crate::core::preset_payload_state_signature(
+                // Push UI state to the PipeWire engine.
+                //
+                // Two different cadences, deliberately:
+                //  - Band/preamp edits go through the 400 ms debounce. Those
+                //    arrive in bursts while dragging and each push is a full
+                //    control set; debouncing stops the drag thrashing the DSP.
+                //  - The A/B bypass bypasses that debounce entirely. It is a
+                //    single deliberate toggle and the whole point of A/B is
+                //    instant comparison, so making the user wait up to 400 ms
+                //    (and it can be missed entirely if they toggle back inside
+                //    the window) makes the switch feel broken.
+                let eq_enabled = !bypass_switch_handle.is_active();
+                let payload_sig = crate::core::preset_payload_state_signature(
                     &crate::core::preset_payload(&bands, preamp_db),
                 );
-                if sig != *last_pushed_sig.borrow()
-                    && last_push.borrow().elapsed() >= std::time::Duration::from_millis(400)
-                {
+                let payload_changed = payload_sig != *last_pushed_sig.borrow();
+                let bypass_changed = eq_enabled != *last_pushed_eq_enabled.borrow();
+                let debounced_payload = payload_changed
+                    && last_push.borrow().elapsed() >= std::time::Duration::from_millis(400);
+                if debounced_payload || bypass_changed {
                     // Startup grace: the live node proxy is captured
                     // asynchronously after the module load. Pushing before it
                     // exists used to fall through to a full module
@@ -908,16 +1031,19 @@ impl MiniEqWindow {
                             if !engine_sink.is_empty() {
                                 let _ = be.set_preamp(preamp_db);
                                 *be.get_bands_mut() = bands.clone();
-                                match be.update_state_live_or_reload(&engine_sink) {
+                                match be.update_state_live_or_reload(&engine_sink, eq_enabled) {
                                     Ok(()) => {
-                                        log::debug!("Backend state applied");
+                                        log::debug!(
+                                            "Backend state applied (eq_enabled={eq_enabled})"
+                                        );
                                     }
                                     Err(e) => log::warn!("Failed to apply backend state: {}", e),
                                 }
                             }
                             // Mark pushed either way so a failing state is not
                             // retried every tick; further edits change the sig.
-                            *last_pushed_sig.borrow_mut() = sig;
+                            *last_pushed_sig.borrow_mut() = payload_sig;
+                            *last_pushed_eq_enabled.borrow_mut() = eq_enabled;
                             *last_push.borrow_mut() = std::time::Instant::now();
                         }
                     }
@@ -1000,6 +1126,8 @@ impl MiniEqWindow {
         // (off).
         {
             let backend_for_switch = backend.clone();
+            let state_for_switch = app_state.clone();
+            let bypass_for_route = utility.bypass_switch.clone();
             route_switch.connect_state_set(move |_switch, on| {
                 if let Some(be) = backend_for_switch.borrow_mut().as_mut() {
                     if on {
@@ -1011,6 +1139,25 @@ impl MiniEqWindow {
                             log::warn!("System EQ off: unroute failed: {}", e);
                         }
                     }
+                }
+                // The A/B switch bypasses the EQ *inside* mini_eq_sink, so it
+                // can only be audible while app audio is actually routed
+                // through that sink. With systemwide routing off, playback
+                // streams go straight to the real output and every EQ control —
+                // including this one — is out of the signal path. Leaving the
+                // switch live and sensitive in that state made it look broken.
+                bypass_for_route.set_sensitive(on);
+                bypass_for_route.set_tooltip_text(Some(if on {
+                    "Compare with/without the EQ. Works because app audio is routed through the EQ."
+                } else {
+                    "Turn on the systemwide EQ switch first — audio has to be routed \
+                     through the EQ for this to have any effect."
+                }));
+                // Keep GetState / StateChanged honest when the change came
+                // from the UI rather than from D-Bus.
+                if *state_for_switch.routed.lock().unwrap() != on {
+                    *state_for_switch.routed.lock().unwrap() = on;
+                    state_for_switch.emit_state_changed();
                 }
                 glib::Propagation::Proceed
             });
@@ -1312,6 +1459,61 @@ impl MiniEqWindow {
                 })),
             );
             presets.borrow_mut().set_default_signature(default_sig);
+
+            // --- AutoEq import entry point.
+            //
+            // `window_autoeq.rs` builds a complete dialog (search, results,
+            // curve preview) but nothing constructed it, so the feature was
+            // unreachable despite README advertising it. The dialog is built
+            // once and re-presented on later clicks.
+            let autoeq_dialog: Rc<RefCell<Option<Rc<crate::window_autoeq::AutoEqDialog>>>> =
+                Rc::new(RefCell::new(None));
+            let autoeq_dialog_for_click = autoeq_dialog.clone();
+            let presets_for_autoeq = utility.presets.clone();
+            let window_for_autoeq = window.clone();
+            presets.borrow_mut().set_autoeq_callback(Box::new(move || {
+                let existing = autoeq_dialog_for_click.borrow().clone();
+                if let Some(dlg) = existing {
+                    dlg.show();
+                    return;
+                }
+
+                let dlg = Rc::new(crate::window_autoeq::AutoEqDialog::new(
+                    &window_for_autoeq,
+                    // `load_autoeq_entries` appends "autoeq/entries.json"
+                    // itself, so this must be the *app* config dir. Passing
+                    // `user_config_dir()` put the cache in `~/.config/autoeq/`
+                    // instead of `~/.config/mini-eq/autoeq/`.
+                    crate::core::app_config_dir(),
+                ));
+
+                // Import = save as a preset and load it, matching the APO
+                // file-import flow so both routes behave the same way.
+                let presets_for_import = presets_for_autoeq.clone();
+                dlg.set_import_callback(Box::new(move |bands, preamp, profile_name| {
+                    let list_box = presets_for_import.borrow().list_box.clone();
+                    // Never overwrite an existing preset: AutoEq names repeat
+                    // across measurement sources.
+                    let sanitized = crate::window_presets::unique_preset_name(&profile_name);
+                    let dest = crate::core::preset_path_for_name(&sanitized);
+                    match crate::core::save_preset_to_file(&dest, &bands, preamp) {
+                        Ok(()) => {
+                            crate::window_presets::refresh_preset_list(&list_box);
+                            if let Err(e) = presets_for_import
+                                .borrow_mut()
+                                .load_library_preset(&sanitized)
+                            {
+                                log::warn!("AutoEq import: could not load {sanitized}: {e}");
+                            } else {
+                                log::info!("AutoEq imported as preset {sanitized}");
+                            }
+                        }
+                        Err(e) => log::warn!("AutoEq import: could not save {sanitized}: {e}"),
+                    }
+                }));
+
+                *autoeq_dialog_for_click.borrow_mut() = Some(dlg);
+            }));
         }
 
         Self {
@@ -1326,6 +1528,71 @@ impl MiniEqWindow {
 
     pub fn present(&self) {
         self.window.present();
+    }
+}
+
+/// Apply one command queued by the D-Bus remote-control interface.
+///
+/// Called from the 33 ms tick, on the GTK main thread, so it can touch both
+/// widgets and the PipeWire backend directly.
+///
+/// Design note: for the two switches we set the widget rather than calling
+/// the backend ourselves. `set_active` does not emit `state-set`, so the
+/// existing `connect_state_set` handler is skipped — the routing is therefore
+/// performed here, and the widget's own notify handler pushes the resulting
+/// state back into `AppState`. That keeps one code path for "apply routing"
+/// regardless of whether the change came from the UI or from D-Bus.
+fn apply_remote_command(
+    cmd: &crate::remote_control::RemoteCommand,
+    app_state: &Arc<crate::remote_control::AppState>,
+    backend: &Rc<RefCell<Option<PipeWireBackend>>>,
+    route_switch: &gtk4::Switch,
+    bypass_switch: &gtk4::Switch,
+    presets: &Rc<RefCell<crate::window_presets::PresetPanel>>,
+    window: &adw::ApplicationWindow,
+) {
+    use crate::remote_control::RemoteCommand;
+    match cmd {
+        RemoteCommand::SetRouting(on) => {
+            if route_switch.is_active() != *on {
+                route_switch.set_active(*on);
+            }
+            if let Some(be) = backend.borrow_mut().as_mut() {
+                let result = if *on {
+                    be.auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE)
+                } else {
+                    be.unroute_all()
+                };
+                if let Err(e) = result {
+                    log::warn!("D-Bus SetRoutingEnabled({on}) failed: {e}");
+                }
+            }
+            app_state.emit_state_changed();
+        }
+        RemoteCommand::SetEqEnabled(on) => {
+            // `eq_enabled` means "EQ active", which is the inverse of the
+            // A/B compare (bypass) switch. The debounced tick reads the
+            // switch and pushes `eq_enabled` to the filter chain.
+            let bypass = !*on;
+            if bypass_switch.is_active() != bypass {
+                bypass_switch.set_active(bypass);
+            }
+            *app_state.eq_enabled.lock().unwrap() = *on;
+            app_state.emit_state_changed();
+        }
+        RemoteCommand::SetPreset(name) => match presets.borrow_mut().load_library_preset(name) {
+            Ok(()) => app_state.emit_presets_changed(),
+            Err(e) => log::warn!("D-Bus SetPreset({name}) failed: {e}"),
+        },
+        // `preset_name` itself is synced by the caller immediately after this
+        // returns, so the `presets` borrow is released first.
+        RemoteCommand::PresentWindow => {
+            window.present();
+        }
+        RemoteCommand::Quit => {
+            app_state.set_shutting_down(true);
+            window.close();
+        }
     }
 }
 

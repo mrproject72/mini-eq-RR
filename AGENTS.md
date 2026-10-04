@@ -75,50 +75,57 @@ Mini EQ is a compact system-wide parametric equalizer for PipeWire desktops. Thi
 | Original project | /var/lib/flatpak/app/io.github.bhack.mini-eq/ |
 | Original config | ~/.config/mini-eq/ |
 | Original presets | ~/.config/mini-eq/ |
-| AutoEq cache | ~/.cache/mini-eq/autoeq/ |
+| AutoEq profile index | ~/.config/mini-eq/autoeq/entries.json |
 
 ## Architecture
 
-### Core modules (from original Python, to be reimplemented in Rust)
+### Core modules (actual `src/` as of 2026-10-04)
+
+The original list below named files that were never created and omitted ones
+that exist. This is the real tree.
 
 ```
 src/
-├── main.rs                    # Entry point
+├── main.rs                    # Entry point, CLI (clap), backend bootstrap
+├── lib.rs                     # Library crate root (module list)
 ├── core.rs                    # EQ constants, biquad coefficients, band config
 ├── pipewire_backend.rs        # PipeWire connection, filter-chain management
-├── pipewire_routes.rs         # Output route detection and tracking
-├── pipewire_stream_router.rs  # Stream routing logic
 ├── filter_chain.rs            # PipeWire filter-chain DSP configuration
-├── band_fader.rs              # Individual EQ band control
+├── routing.rs                 # Routing logic (absorbs upstream pipewire_routes
+│                              #  + pipewire_stream_router)
+├── band_fader.rs              # Individual EQ band control widget
 ├── analyzer.rs                # FFT spectrum analysis
-├── ebur128.rs                 # LUFS loudness metering
-├── autoeq.rs                  # AutoEq preset search and import
-├── settings.rs                # User settings persistence
-├── dbus_control.rs            # D-Bus remote control
-├── background.rs              # Background mode daemon
-├── cli.rs                     # Command-line interface
-├── instance.rs                # Application instance management
+├── ebur128.rs                 # LUFS loudness metering (FFI)
+├── autoeq.rs                  # AutoEq search + APO preset parsing
+├── settings.rs                # User settings persistence (JSON, not GSettings)
+├── dbus_control.rs            # D-Bus interface XML, dispatch, signal emission
+├── remote_control.rs          # Shared AppState + D-Bus→window command queue
+├── background.rs              # Background mode / login items
+├── instance.rs                # Single-instance flock guard
 ├── appearance.rs              # GTK theme/appearance
-├── glib_utils.rs              # GLib utilities (if needed)
-├── desktop_integration.rs     # Desktop file, autostart
-├── diagnostics.rs             # Debug/diagnostic tools
-├── release_notes.rs           # Version changelog
-├── routing.rs                 # PipeWire routing logic
-├── screenshot.rs              # Screenshot/capture feature
-├── window.rs                  # Main GTK window
+├── desktop_integration.rs     # Desktop file, autostart, icons
+├── routing + window_*         # See below
+├── window.rs                  # Main GTK window (1460 lines — the big one)
 ├── window_analyzer.rs         # Analyzer panel
-├── window_autoeq.rs           # AutoEq panel
+├── window_autoeq.rs           # AutoEq import dialog (reachable since 2026-10-04)
+├── window_band_editor.rs      # Selected-band editor
+├── window_band_fader.rs       # Fader construction helpers
 ├── window_graph.rs            # Frequency graph
-├── window_headroom.rs         # Headroom display
+├── window_headroom.rs         # Headroom / Auto-Safe display
 ├── window_layout.rs           # Window layout management
 ├── window_preferences.rs      # Preferences dialog
 ├── window_presets.rs          # Preset management panel
-├── window_state.rs            # Window state persistence
-├── window_utility.rs          # Utility window functions
-├── window_utils.rs            # Window helper functions
-├── style.css                  # GTK CSS styling
-└── assets/                    # Application assets
+├── window_state.rs            # Window size persistence
+├── window_utility.rs          # Sidebar utility pane
+├── window_utils.rs            # Window helper functions (5 lines)
+└── style.rs                   # GTK CSS loading (CSS lives in style.rs, not style.css)
 ```
+
+**Not ported from upstream:** `cli.py` (folded into `main.rs` via clap),
+`deps.py` (3 hardcoded paths in `main.rs`), `diagnostics.py`,
+`release_notes.py`, `screenshot.py`, `glib_utils.py`, `gtk_utils.py`. No
+`src/assets/` and no GSettings schema — icons and settings are handled
+differently.
 
 ### PipeWire filter-chain architecture
 - Creates virtual sink: `mini_eq_sink` → the system default output node
@@ -207,7 +214,7 @@ cargo run -- --headless --background --duration 30
 - Background mode keeps EQ active after window closes
 - Auto-route routes all output streams to virtual sink
 - Presets stored under `~/.config/mini-eq/`
-- AutoEq data cached under `~/.cache/mini-eq/autoeq/`
+- AutoEq profile index cached under `~/.config/mini-eq/autoeq/entries.json`
 
 **Important:** The Rust rewrite must produce identical audio processing results to the Python original. Biquad filter coefficients must match exactly.
 
@@ -238,15 +245,49 @@ cargo run -- --headless --background --duration 30
 - **Phase 3**: ✅ Complete — Adaptive shell: `AdwOverlaySplitView` + `AdwClamp(max=1480)` + `AdwToastOverlay`, breakpoints at 1320sp/1080sp, F9 toggle, toolbar with output dropdown + route switch + inspector toggle.
 - **Phase 4**: ✅ Complete — Utility/sidebar: preset section + system section with headroom 3-segment meter + monitor strip.
 - **Phase 5**: ✅ Complete — Analyzer and headroom: FFT spectrum, LUFS metering, smoothing/display-gain/freeze controls, 3-segment headroom meter with Set Safe button.
-- **Phase 6**: ⏳ Partial — Presets: basic ListBox panel exists but no band-data serialization, revert/reapply, import/export, file monitoring, or output-preset linking. AutoEq: functional dialog with curve preview drawing area. Preferences: functional dialog wired to settings persistence.
+- **Phase 6**: ⏳ Partial — Presets: rename, name prompt, revert/reapply baseline, reset-to-neutral and file monitoring are implemented; **no save/save-as, delete, import/export, fallback presets, or output-preset linking**. AutoEq: **reachable** — dialog opened from the Presets panel, index fetched on open, import saves + loads a preset (2026-10-04). Preferences: functional dialog wired to settings persistence.
 - **Phase 7**: ✅ Complete — DSP/core math: biquad coefficients and constants match upstream for 9 selectable filter types; `total_response_db`, `format_frequency`, index maps, graph response helpers all implemented. Window state: monitor geometry fallback implemented.
 - **Phase 8**: ⏳ Pending — Testing (29 unit tests pass), Flatpak packaging, performance validation, GNOME Shell extension.
 
-### Current state (2026-09-19)
+### Current state (2026-10-04)
 - `cargo check --release` compiles with 0 warnings, 0 errors.
-- `cargo test --lib` passes: 36 tests, 0 failures.
-- ~7,200 lines of Rust across 32 modules.
-- Upstream reference fetched: `https://github.com/bhack/mini-eq.git` (tags v0.1.0–v0.8.8).
+- `cargo test --lib` passes: 108 tests, 0 failures.
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
+- ~15,300 lines of Rust across 31 modules.
+- Upstream reference fetched: `https://github.com/bhack/mini-eq.git`
+  (41 Python modules, 41 test files).
+
+**The binary is `mini-eq-rr`, not `mini-eq`.** `target/debug/mini-eq` is a
+stale pre-rename artifact — do not run it and do not trust a live check that
+used it. Use `./target/debug/mini-eq-rr`. This trap has already invalidated one
+verification round.
+
+**Live D-Bus verification** (the control interface is now wired and working):
+
+```bash
+D=io.github.mrproject72.mini_eq_rr
+O=/io/github/mrproject72/mini_eq_rr/Control
+M=io.github.mrproject72.MiniEqRR.Control
+gdbus call --session --dest $D --object-path $O --method $M.GetState
+gdbus call --session --dest $D --object-path $O --method $M.SetEqEnabled false
+gdbus monitor --session --dest $D     # StateChanged / AnalyzerLevelsChanged
+```
+
+### Verified gaps against upstream
+
+Full analysis and prioritised next steps:
+**`docs/PLAN/gap-closure-2026-10-04.md`**. Highest-value open items:
+
+- ~~**No single-instance guard.**~~ **FIXED 2026-10-04** — `flock` on
+  `$XDG_RUNTIME_DIR/mini-eq-rr.lock`; reaping not needed (daemon drops the module
+  on client disconnect).
+- **Preset lifecycle** — no save/save-as, delete, import/export, fallback
+  presets, or output-preset linking.
+- **Filter-chain output does not follow a default-sink change** (the monitor
+  does). Needs two-output hardware to validate.
+- **No Flatpak manifest, no GNOME Shell extension, no app icons.**
+- **Zero automated coverage** of `pipewire_backend.rs` (834 lines) and
+  `routing.rs` (758 lines) — only `pipewire_backend.rs` pod encoding is covered; both still lack behavioural tests.
 
 ### Build instructions
 
@@ -276,9 +317,26 @@ git ls-tree --name-only -r upstream/main | head -80
 
 ### Current blockers
 
-- Backend unverified on live PipeWire: `pipewire_backend.rs` and `routing.rs` need runtime validation.
-- Preset lifecycle incomplete: no revert/reapply, import/export/delete, file monitoring, fallback presets, or output-preset linking.
-- No Flatpak manifest, no GNOME Shell extension, no CI workflow.
+- ~~**P0 — the EQ cannot be edited at all.**~~ **RESOLVED 2026-10-04** — see `docs/BUGS.md`.
+  Cause was the EQ being out of the audio path with systemwide routing off; the
+  A/B switch is now insensitive in that state so it cannot look live while inert.
+- ~~**AutoEq is unreachable.**~~ **FIXED 2026-10-04** — dialog is now reachable from the
+  Presets panel, HTTP runs on a worker thread (it previously aborted the
+  process), and imports save + load a preset. See `docs/BUGS.md`.
+- ~~**No single-instance guard.**~~ **FIXED 2026-10-04** — real `flock` on
+  `$XDG_RUNTIME_DIR/mini-eq-rr.lock`; a second launch is refused and reports the
+  holder PID. Stale filter-chain reaping is not needed: the module lives in the
+  daemon and is dropped on client disconnect (verified with `kill -9`).
+- Preset lifecycle incomplete: no save/save-as, import/export/delete, fallback
+  presets, or output-preset linking.
+- Filter-chain output does not follow a default-sink change (the monitor does).
+  Needs two physical outputs to validate.
+- No app icons: `desktop_integration.rs` points at a nonexistent `assets/icons`,
+  so the `.desktop` file's `Icon=` resolves to nothing.
+- No Flatpak manifest, no GNOME Shell extension. (CI **does** exist at
+  `.github/workflows/ci.yml`.)
+- `pipewire_backend.rs` (834 lines) and `routing.rs` (758 lines) have **zero**
+  automated test coverage — verified on one machine only.
 
 ## CI Notes
 

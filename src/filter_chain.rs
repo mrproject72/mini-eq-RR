@@ -663,6 +663,86 @@ mod tests {
         );
     }
 
+    /// The A/B bypass must produce a genuinely different control set from the
+    /// active EQ, otherwise toggling the switch is inaudible.
+    ///
+    /// This was reported as "A/B switch does nothing". The mechanism turned out
+    /// to be correct (and matches upstream formula-for-formula) but the toggle
+    /// also went through the 400 ms fader-drag debounce in `window.rs`, so the
+    /// change could be missed entirely when toggling back quickly. That is
+    /// fixed there; this test pins the DSP side so a future refactor cannot
+    /// silently make bypass a no-op.
+    #[test]
+    fn test_eq_bypass_pushes_flat_response_not_the_active_curve() {
+        let bands = vec![
+            crate::core::EqBand {
+                index: 0,
+                frequency: 125.0,
+                gain_db: 18.0,
+                q: 1.0,
+                filter_type: crate::core::FilterType::Bell,
+                mute: false,
+                solo: false,
+                coefficients: crate::core::BiquadCoefficients::identity(),
+            },
+            crate::core::EqBand {
+                index: 1,
+                frequency: 1000.0,
+                gain_db: -12.0,
+                q: 2.0,
+                filter_type: crate::core::FilterType::Bell,
+                mute: false,
+                solo: false,
+                coefficients: crate::core::BiquadCoefficients::identity(),
+            },
+        ];
+
+        let active = bq_raw_control_values(&bands, 0.0, true, crate::core::SAMPLE_RATE);
+        let bypassed = bq_raw_control_values(&bands, 0.0, false, crate::core::SAMPLE_RATE);
+
+        assert_eq!(
+            active.len(),
+            bypassed.len(),
+            "bypass must keep the same control set, only different values"
+        );
+        assert_ne!(
+            active, bypassed,
+            "bypassing produced an identical control set — A/B would be inaudible"
+        );
+
+        // Every band node must collapse to unity gain (b0 == a0, no b1/b2/a1/a2),
+        // i.e. a true pass-through, not merely "some other curve".
+        for (key, value) in &bypassed {
+            if key.ends_with(":b0") {
+                let node = key.trim_end_matches(":b0");
+                let a0 = bypassed
+                    .iter()
+                    .find(|(k, _)| *k == format!("{node}:a0"))
+                    .unwrap()
+                    .1;
+                assert!(
+                    (value - a0).abs() < 1e-9,
+                    "{node} is not unity gain: b0={value} a0={a0}"
+                );
+            }
+            if key.ends_with(":b1")
+                || key.ends_with(":b2")
+                || key.ends_with(":a1")
+                || key.ends_with(":a2")
+            {
+                assert_eq!(*value, 0.0, "{key} should be 0 in bypass, was {value}");
+            }
+        }
+
+        // And the active set must genuinely be doing something at band 0.
+        let active_b0 = active.iter().find(|(k, _)| k == "band_l_0:b0").unwrap().1;
+        let active_a0 = active.iter().find(|(k, _)| k == "band_l_0:a0").unwrap().1;
+        assert!(
+            (active_b0 - active_a0).abs() > 1e-6,
+            "active band 0 is already unity — the test fixture is not testing anything"
+        );
+    }
+
     #[test]
     fn test_links_chain_preamp_through_all_bands() {
         let links = build_biquad_links(2, true);

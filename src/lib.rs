@@ -16,6 +16,7 @@ pub mod ebur128;
 pub mod filter_chain;
 pub mod instance;
 pub mod pipewire_backend;
+pub mod remote_control;
 pub mod routing;
 pub mod settings;
 pub mod style;

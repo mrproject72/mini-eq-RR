@@ -32,11 +32,15 @@ pub struct PresetPanel {
     pub rename_button: gtk4::Button,
     pub remove_button: gtk4::Button,
     pub import_button: gtk4::Button,
+    /// Open the AutoEq headphone-correction browser.
+    pub autoeq_button: gtk4::Button,
     pub export_button: gtk4::Button,
     pub state_chip: gtk4::Label,
     current_bands: Vec<crate::core::EqBand>,
     current_preamp_db: f64,
     apply_bands_callback: Option<Box<dyn Fn(Vec<crate::core::EqBand>, f64)>>,
+    /// Opens the AutoEq import dialog. Set by the window.
+    autoeq_callback: Option<Box<dyn Fn()>>,
     reset_callback: Option<Box<dyn Fn()>>,
     get_signature_callback: Option<Box<dyn Fn() -> String>>,
     current_preset_name: Option<String>,
@@ -46,6 +50,27 @@ pub struct PresetPanel {
     revert_baseline_payload: Option<serde_json::Value>,
     default_signature: Option<String>,
     file_monitor: Option<glib::SignalHandlerId>,
+}
+
+/// Pick a preset name that does not collide with an existing preset file.
+///
+/// AutoEq profile names frequently repeat across sources (the same headphone is
+/// measured by several rigs), so importing twice must not silently overwrite
+/// the first import. Returns `base` when free, otherwise `base (2)`, `base (3)`
+/// and so on.
+pub fn unique_preset_name(base: &str) -> String {
+    let sanitized = sanitize_preset_name(base);
+    if !preset_path_for_name(&sanitized).exists() {
+        return sanitized;
+    }
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{sanitized} ({suffix})");
+        if !preset_path_for_name(&candidate).exists() {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 impl PresetPanel {
@@ -58,6 +83,8 @@ impl PresetPanel {
         rename_button.set_tooltip_text(Some("Rename the selected custom preset"));
         let import_button = gtk4::Button::from_icon_name("document-open-symbolic");
         import_button.set_tooltip_text(Some("Import an APO (.apo/.txt) preset..."));
+        let autoeq_button = gtk4::Button::from_icon_name("edit-find-symbolic");
+        autoeq_button.set_tooltip_text(Some("Import a headphone correction curve from AutoEq"));
         let export_button = gtk4::Button::from_icon_name("document-save-as-symbolic");
         export_button.set_tooltip_text(Some("Export the selected preset to a file..."));
 
@@ -80,6 +107,7 @@ impl PresetPanel {
         header.append(&rename_button);
         header.append(&remove_button);
         header.append(&import_button);
+        header.append(&autoeq_button);
         header.append(&export_button);
 
         // --- Preset list (the sole selector).
@@ -109,11 +137,13 @@ impl PresetPanel {
             rename_button,
             remove_button,
             import_button,
+            autoeq_button,
             export_button,
             state_chip,
             current_bands: default_bands(),
             current_preamp_db: 0.0,
             apply_bands_callback: None,
+            autoeq_callback: None,
             reset_callback: None,
             get_signature_callback: None,
             current_preset_name: None,
@@ -200,6 +230,23 @@ impl PresetPanel {
 
         // --- Import: APO file -> new custom preset.
         let panel_clone = panel.clone();
+        panel.borrow().autoeq_button.connect_clicked({
+            let panel_clone = panel.clone();
+            move |_| {
+                // Move the callback out before calling it: the window's handler
+                // needs to borrow this same panel (to save the preset and
+                // refresh the list), so holding the borrow here would panic.
+                let callback = panel_clone.borrow_mut().autoeq_callback.take();
+                match callback {
+                    Some(cb) => {
+                        cb();
+                        panel_clone.borrow_mut().autoeq_callback = Some(cb);
+                    }
+                    None => log::warn!("AutoEq requested but no handler is registered"),
+                }
+            }
+        });
+
         panel.borrow().import_button.connect_clicked(move |_| {
             let dialog = gtk4::FileChooserDialog::new(
                 Some("Import APO Preset"),
@@ -366,6 +413,15 @@ impl PresetPanel {
 
     pub fn set_default_signature(&mut self, signature: String) {
         self.default_signature = Some(signature);
+    }
+
+    /// Register the handler that opens the AutoEq import dialog.
+    ///
+    /// This is what makes the feature reachable: `window_autoeq.rs` builds a
+    /// complete dialog (search, results, curve preview) but until something
+    /// constructs it, none of it can be used.
+    pub fn set_autoeq_callback(&mut self, cb: Box<dyn Fn()>) {
+        self.autoeq_callback = Some(cb);
     }
 
     /// The currently-loaded preset name, if any (used by the Output Controls
@@ -591,7 +647,9 @@ fn count_custom_children(list_box: &gtk4::ListBox) -> usize {
 
 /// Rebuild the preset ListBox: built-in presets first (marked), then custom
 /// presets. The row's label text IS the preset name (used by `row_name`).
-fn refresh_preset_list(list_box: &gtk4::ListBox) {
+/// Rebuild the preset rows. Public so the window can refresh the list after an
+/// AutoEq import adds a new preset.
+pub fn refresh_preset_list(list_box: &gtk4::ListBox) {
     let selected = list_box.selected_row().and_then(|r| row_name(&r));
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
