@@ -89,6 +89,47 @@ Verified live: second instance refused with the holder PID; restart after
 `kill -9` succeeds; restart after `SIGTERM` succeeds; `--check-deps` still works
 while running.
 
+### ~~**Output dropdown lists only hardcoded labels.**~~ **FIXED 2026-10-04**
+(selection is honest about being inert — see below)
+
+The Output dropdown in the Headroom panel was
+`StringList::new(&["System Output", "Virtual Sink"])`: two hardcoded labels
+naming no real device, with **no handler** and nothing reading the selection.
+It was a purely decorative widget.
+
+Underneath, two more layers were broken:
+
+- `RoutingEngine::detect_routes()` filtered on `node.name` containing
+  `"audio.sink" || "output" || "analog"`. That misses devices whose names
+  contain none of those (USB, bluetooth, network sinks) **and** matches inputs —
+  `alsa_input.pci-....analog-stereo` is a microphone.
+- `PipeWireBackend::detect_output_routes()` had **zero callers**.
+
+Now: `RoutingEngine::list_output_sinks()` selects `media.class == "Audio/Sink"`
+exactly, which is what PipeWire defines and what upstream does
+(`is_audio_sink` -> `media.class == AUDIO_SINK`), excluding the EQ's own virtual
+sink. The dropdown is index 0 = "Follow default output" (matching upstream's
+`[follow_default_label, *sinks]`) followed by each real sink by description,
+refreshed on the existing 500 ms device watcher, and the model is only touched
+when the list actually changes so it does not fight the user's selection.
+
+Verified on this machine: `pw-dump` reports 6 `Audio/Sink` nodes, of which
+`mini_eq_sink` is ours; the app now enumerates the other **5** —
+HDMI, onboard analog, Logitech USB, PUPGSIS USB and Multi-Output.
+
+### Not fixed: choosing a device does not re-target the EQ
+
+Selecting a specific device is accepted by the dropdown but **does not move the
+audio**, and logs a warning saying so. This is gap 5.
+
+Investigated: writing `target.object` on `mini_eq_sink_output` via `pw-metadata`
+is accepted (exit 0) but has **no effect** — the property is set by the module's
+load-time args, not by per-node metadata. (`target.node` reads `None` both
+before and after; it is derived and is not the property to write.) So the only
+remaining route is rebuilding the filter chain's output link, which is the
+risky operation the handover flags as needing validation against a real device
+switch. Shipping a dropdown that silently pretends to work was the alternative.
+
 ### P1 — user-visible, small fix
 
 - ~~**AutoEq is unreachable: the dialog is never constructed.**~~ **FIXED

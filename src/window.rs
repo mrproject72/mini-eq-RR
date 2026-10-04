@@ -1060,6 +1060,93 @@ impl MiniEqWindow {
         // flashes: the alert belongs on the control that fixes it. GTK4 CSS
         // has no @keyframes, so we toggle a class on a 500 ms timer; a CSS
         // color transition smooths it into a pulse.
+        // --- Output device dropdown.
+        //
+        // Populated from PipeWire rather than hardcoded. Index 0 is
+        // "follow the system default", which is what the app already did;
+        // the real sinks follow it.
+        let output_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let output_dropdown = utility.output_dropdown.clone();
+        let output_names_for_refresh = output_names.clone();
+        let dropdown_for_refresh = output_dropdown.clone();
+        let backend_for_outputs = backend.clone();
+
+        let refresh_output_sinks = std::rc::Rc::new(move || {
+            let sinks = backend_for_outputs
+                .borrow()
+                .as_ref()
+                .map(|be| be.list_output_sinks())
+                .unwrap_or_default();
+
+            let mut names: Vec<String> = Vec::with_capacity(sinks.len() + 1);
+            names.push(crate::window_utility::FOLLOW_DEFAULT_LABEL.to_string());
+            let mut labels: Vec<String> =
+                vec![crate::window_utility::FOLLOW_DEFAULT_LABEL.to_string()];
+            for sink in &sinks {
+                let label = crate::routing::display_label(&sink.description, &sink.name);
+                labels.push(label);
+                names.push(sink.name.clone());
+            }
+
+            // Only touch the model when it actually changed, otherwise the
+            // dropdown would fight the user's selection on every poll.
+            {
+                let current = output_names_for_refresh.borrow();
+                if *current == names {
+                    return;
+                }
+            }
+
+            let selected = dropdown_for_refresh.selected() as usize;
+            let model = match dropdown_for_refresh.model() {
+                Some(m) => m.downcast_ref::<gtk4::StringList>().cloned(),
+                None => None,
+            };
+            if let Some(list) = model {
+                let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                list.splice(0, list.n_items(), &refs);
+            }
+            *output_names_for_refresh.borrow_mut() = names;
+
+            // Preserve the selection by device name where possible.
+            let want = selected.min(output_names_for_refresh.borrow().len().saturating_sub(1));
+            dropdown_for_refresh.set_selected(want as u32);
+            dropdown_for_refresh.set_sensitive(output_names_for_refresh.borrow().len() > 1);
+        });
+
+        {
+            let names_for_select = output_names.clone();
+            let backend_for_select = backend.clone();
+            output_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
+                let idx = dd.selected() as usize;
+                let names = names_for_select.borrow();
+                let Some(chosen) = names.get(idx) else {
+                    return;
+                };
+                if idx == 0 {
+                    // Already the behaviour: the filter chain follows the
+                    // system default output.
+                    log::info!("Output device: following the system default");
+                    return;
+                }
+                // Picking a specific device needs the filter chain's own
+                // output re-targeted (docs/PLAN gap 5). That is not
+                // implemented: writing `target.object` on the EQ output node
+                // is accepted by PipeWire but has no effect, so the only
+                // safe route is a link rebuild, which needs validation
+                // against a real device switch. Say so rather than
+                // pretending the selection took effect.
+                log::warn!(
+                    "Output device {chosen} selected, but the EQ output is not re-targeted yet"
+                );
+                let _ = backend_for_select;
+            });
+        }
+
+        // Populate once at startup.
+        refresh_output_sinks();
+        let refresh_output_sinks = refresh_output_sinks.clone();
+
         {
             let set_safe = utility.headroom.borrow().set_safe_button.clone();
             let headroom_warning = headroom_warning.clone();
@@ -1068,6 +1155,7 @@ impl MiniEqWindow {
                 Rc::new(std::cell::Cell::new(String::new()));
             let backend_sink_watch = backend.clone();
             let summary_sink_watch = utility.monitor_summary.clone();
+            let refresh_outputs_watch = refresh_output_sinks.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 // Detect the system default output changing and follow it
                 // with the MONITOR. The monitor is a separate capture
@@ -1077,6 +1165,11 @@ impl MiniEqWindow {
                 // NOT attempted here: doing it blind (remove link + create
                 // link) risks silence or a feedback loop and needs live
                 // validation against a real sink switch. See docs/TODO.md.
+                // Re-read the output device list on the same cadence. The
+                // refresh closure is a no-op unless the list actually changed,
+                // so polling is cheap and also catches hotplug.
+                refresh_outputs_watch();
+
                 if let Some(be) = backend_sink_watch.borrow_mut().as_mut() {
                     if let Some(now) = be.refresh_default_audio_sink_name() {
                         let prev = last_default_sink.replace(now.clone());

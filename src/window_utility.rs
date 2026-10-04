@@ -8,6 +8,9 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 
+/// Dropdown index 0: follow whatever the system default output is.
+pub const FOLLOW_DEFAULT_LABEL: &str = "Follow default output";
+
 use crate::window_analyzer;
 use crate::window_graph;
 use crate::window_headroom;
@@ -155,10 +158,19 @@ impl UtilityPane {
         section.append(&header);
 
         // Output device dropdown.
-        let output_list = gtk4::StringList::new(&["System Output", "Virtual Sink"]);
+        //
+        // This was `StringList::new(&["System Output", "Virtual Sink"])` — two
+        // hardcoded labels that named no real device, with no handler and
+        // nothing reading the selection. It is now populated from PipeWire
+        // (`RoutingEngine::list_output_sinks`, which filters on
+        // `media.class == "Audio/Sink"`), with index 0 meaning "follow the
+        // system default", matching upstream. The window refills this model
+        // whenever the device list changes.
+        let output_list = gtk4::StringList::new(&[FOLLOW_DEFAULT_LABEL]);
         let output_dropdown = gtk4::DropDown::new(Some(output_list), None::<gtk4::Expression>);
         output_dropdown.set_hexpand(true);
         output_dropdown.set_tooltip_text(Some("EQ output device"));
+        output_dropdown.set_sensitive(false); // enabled once real devices are known
         let output_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let output_label = gtk4::Label::new(Some("Output"));
         output_label.set_css_classes(&["metric-title"]);

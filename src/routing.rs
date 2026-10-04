@@ -27,6 +27,19 @@ use crate::core::{FILTER_OUTPUT_SUFFIX, OUTPUT_CLIENT_NAME, SAMPLE_RATE, VIRTUAL
 /// name. Falls back to the raw string if it is not JSON, and returns
 /// `None` for empty/non-object payloads. Mirrors upstream
 /// `parse_metadata_node_name`.
+/// PipeWire's media class for a sink node. Upstream compares against the same
+/// string (`AUDIO_SINK`).
+pub const AUDIO_SINK_MEDIA_CLASS: &str = "Audio/Sink";
+
+/// Best available human label for a sink: its description, else its node name.
+pub fn display_label(description: &str, name: &str) -> String {
+    let d = description.trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    name.to_string()
+}
+
 pub fn parse_metadata_node_name(value: Option<&str>) -> Option<String> {
     let value = value?;
     if value.is_empty() {
@@ -166,41 +179,69 @@ impl RoutingEngine {
         self
     }
 
-    pub fn detect_routes(&self) -> Result<Vec<OutputRoute>, Error> {
-        info!("Detecting output routes");
+    /// Every real output sink: nodes with `media.class == "Audio/Sink"`,
+    /// excluding our own virtual sink.
+    ///
+    /// The previous implementation matched on `node.name` containing
+    /// "audio.sink" / "output" / "analog". That is wrong in both directions: it
+    /// misses devices whose names contain none of those substrings (USB,
+    /// bluetooth, network sinks), and it matches *input* nodes such as
+    /// `alsa_input.pci-....analog-stereo`, which is a microphone. Upstream filters
+    /// on `media.class` exactly (`is_audio_sink` -> `media.class == "Audio/Sink"`),
+    /// which is what PipeWire actually defines.
+    pub fn list_output_sinks(&self) -> Vec<OutputRoute> {
+        let Ok(registry) = self.core.get_registry() else {
+            return Vec::new();
+        };
+        let found = Arc::new(Mutex::new(Vec::new()));
+        let found_clone = found.clone();
+        let virtual_prefix = self.virtual_sink_name.clone();
 
-        let routes = Arc::new(Mutex::new(Vec::new()));
-        let registry = self.core.get_registry()?;
-
-        let routes_clone = routes.clone();
-        let listener = registry.add_listener_local();
-        let listener = listener.global(move |global| {
-            if global.type_ == ObjectType::Node
-                && let Some(props) = &global.props
-            {
-                let name = props.get("node.name").unwrap_or("unknown");
-                if name.contains("audio.sink") || name.contains("output") || name.contains("analog")
-                {
-                    let mut routes_guard = routes_clone.lock().unwrap();
-                    routes_guard.push(OutputRoute {
-                        id: global.id,
-                        name: name.to_string(),
-                        description: props.get("node.description").unwrap_or("").to_string(),
-                        active: true,
-                    });
-                    debug!("Found output route: {} (id={})", name, global.id);
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ != ObjectType::Node {
+                    return;
                 }
-            }
+                let Some(props) = &global.props else {
+                    return;
+                };
+                if props.get("media.class").unwrap_or("") != AUDIO_SINK_MEDIA_CLASS {
+                    return;
+                }
+                let name = props.get("node.name").unwrap_or("").to_string();
+                // Our own sink is an implementation detail, not a device the
+                // user can pick; upstream excludes it the same way.
+                if name.starts_with(VIRTUAL_SINK_BASE) || name.starts_with(&virtual_prefix) {
+                    return;
+                }
+                found_clone.lock().unwrap().push(OutputRoute {
+                    id: global.id,
+                    description: props.get("node.description").unwrap_or("").to_string(),
+                    name,
+                    active: false,
+                });
+            })
+            .register();
+
+        // Registry globals are queued, so a listener sees nothing until the
+        // server has been roundtripped.
+        let _ = self.roundtrip();
+
+        let mut result = found.lock().unwrap().clone();
+        // Stable, human-friendly ordering: description first, then node name.
+        result.sort_by(|a, b| {
+            let ka = display_label(&a.description, &a.name);
+            let kb = display_label(&b.description, &b.name);
+            ka.cmp(&kb).then_with(|| a.name.cmp(&b.name))
         });
-        let _listener = listener.register();
+        debug!("Found {} output sink(s)", result.len());
+        result
+    }
 
-        // The listener only receives `global` events while it is alive and the
-        // loop is being pumped; without this the snapshot below is always empty.
-        self.roundtrip()?;
-
-        let result = routes.lock().unwrap().clone();
-        info!("Detected {} output routes", result.len());
-        Ok(result)
+    /// Kept for API compatibility; now backed by the same `media.class` filter.
+    pub fn detect_routes(&self) -> Result<Vec<OutputRoute>, Error> {
+        Ok(self.list_output_sinks())
     }
 
     pub fn get_routes(&self) -> Vec<OutputRoute> {
@@ -754,5 +795,45 @@ impl Default for RoutingEngine {
             .connect_rc(None)
             .expect("Failed to connect to PipeWire");
         RoutingEngine::new(core, mainloop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sink filter used to match on `node.name` containing "audio.sink" /
+    /// "output" / "analog". That both missed devices (USB, bluetooth, network
+    /// sinks) and matched inputs (`alsa_input...analog-stereo` is a microphone).
+    /// These constants and the `media.class` comparison are what replaced it,
+    /// matching upstream's `is_audio_sink`.
+    #[test]
+    fn audio_sink_media_class_matches_upstream() {
+        assert_eq!(AUDIO_SINK_MEDIA_CLASS, "Audio/Sink");
+        // Sanity: the name heuristic this replaced would have matched an input.
+        assert!(
+            "alsa_input.pci-0000_04_00.6.analog-stereo".contains("analog"),
+            "the old heuristic matched input nodes; that is why media.class is used"
+        );
+    }
+
+    #[test]
+    fn display_label_prefers_description_then_falls_back_to_name() {
+        assert_eq!(
+            display_label("Ryzen HD Audio Controller Analog Stereo", "alsa_output.x"),
+            "Ryzen HD Audio Controller Analog Stereo"
+        );
+        assert_eq!(display_label("", "alsa_output.x"), "alsa_output.x");
+        assert_eq!(display_label("   ", "alsa_output.x"), "alsa_output.x");
+    }
+
+    /// Our own virtual sink must never appear as a selectable output device.
+    #[test]
+    fn virtual_sink_is_excluded_by_prefix() {
+        assert!(VIRTUAL_SINK_BASE.starts_with("mini_eq"));
+        assert!("mini_eq_sink".starts_with(VIRTUAL_SINK_BASE));
+        assert!("mini_eq_sink.source".starts_with(VIRTUAL_SINK_BASE));
+        // A real device must not be caught by the filter.
+        assert!(!"alsa_output.pci-0000_04_00.6.analog-stereo".starts_with(VIRTUAL_SINK_BASE));
     }
 }

@@ -552,6 +552,18 @@ impl PipeWireBackend {
         self.routing.detect_routes()
     }
 
+    /// Every real output sink (`media.class == "Audio/Sink"`), excluding the
+    /// EQ's own virtual sink. Used to populate the Output dropdown, which
+    /// previously listed two hardcoded labels and nothing else.
+    pub fn list_output_sinks(&self) -> Vec<OutputRoute> {
+        self.routing.list_output_sinks()
+    }
+
+    /// Node name of the system default output sink, if known.
+    pub fn default_output_sink_name(&self) -> Option<String> {
+        self.routing.get_current_sink().map(|s| s.to_string())
+    }
+
     /// Pump pending PipeWire events without blocking.
     ///
     /// The PipeWire `MainLoop` is not run via `run()` in GUI mode; instead the
