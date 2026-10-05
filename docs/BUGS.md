@@ -604,3 +604,19 @@ the row is one line at the minimum width. `narrow_bp` (the 1320sp fader-height
 breakpoint) is still dead -- libadwaita applies only one breakpoint per window
 and `compact_bp` claims it -- so the narrow fader compaction has never run.
 That is untouched here and still worth fixing.
+
+### Changed 2026-10-05 — Fix and Auto are the same button shape, coloured by state
+
+User request: both controls plain buttons with fixed labels, differing only in
+colour — red Fix when a fix is required, green Auto while it is on.
+
+- `Auto-Safe` became a `ToggleButton` (was a `Switch`), so the pair in the
+  clipping cell is two buttons of the same width (56px) rather than a button and
+  a switch. The separate "Auto" text label that had been added next to the switch
+  is removed — the button carries the word.
+- CSS: `clip-fix-needed` (red, actionable) and `clip-auto-on` (green, on),
+  replacing `clip-safe-ok`, which painted Fix green at rest. Green now means one
+  thing in this pair: Auto is on.
+- The 500 ms clipping blink on Fix would have been invisible against a
+  permanently red button, since both classes set the same fill. It now drops the
+  fill to an outline, alternating outlined/solid red.

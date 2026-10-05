@@ -202,32 +202,47 @@ const STYLE_CSS: &str = r#"
     color: var(--text-muted);
 }
 
-/* Blinking clipping alert on the Set Safe button while the EQ curve peak
-   exceeds the -1 dBFS target. Toggled by a 500 ms timer (GTK4 CSS has no
-   @keyframes); the color transition smooths each toggle into a pulse.
-   Deliberately on the button that FIXES the problem, not the header icon. */
+/* Blinking clipping alert on the Fix button while the EQ curve peak exceeds the
+   -1 dBFS target. Toggled by a 500 ms timer (GTK4 CSS has no @keyframes); the
+   colour transition smooths each toggle into a pulse. Deliberately on the button
+   that FIXES the problem, not the header icon.
+
+   The blink used to be visible because the button rested GREEN, so red-on-green
+   was an unmistakable change. Fix is now red the whole time it is actionable
+   (see clip-fix-needed below), so the pulse has to come from something else: it
+   drops the fill and leaves an outline, alternating outlined/solid red. */
 button.headroom-warning,
 button.headroom-warning image {
     color: var(--danger-color);
+    background-color: transparent;
 }
 
 button.headroom-warning {
     transition: color 250ms ease-in-out, background-color 250ms ease-in-out;
+}
+
+/* The clipping pair: [Fix] [Auto]. Both are buttons with a fixed label, so
+   colour is the ONLY thing that carries their state:
+     - Fix: red when the curve peak is over the target and the button is live,
+       plain grey otherwise.
+     - Auto: green while it is on, plain grey while it is off.
+   The explicit opacity override matters for Fix: it is insensitive when there
+   is nothing to do, and GTK dims insensitive controls so hard that without
+   this the button reads as missing rather than as "nothing to do". */
+button.clip-fix-needed,
+button.clip-fix-needed:disabled {
+    opacity: 1.0;
+    color: var(--danger-color);
     background-color: color-mix(in srgb, var(--danger-color) 22%, transparent);
     border-color: var(--danger-color);
 }
 
-/* Clip-Safe resting state. The button is ALWAYS visible; when there is
-   nothing to do it rests light green and insensitive. The explicit
-   opacity override is the important part: GTK dims insensitive controls
-   hard, which made the button read as missing rather than as
-   "nothing to do". */
-button.clip-safe-ok,
-button.clip-safe-ok:disabled {
+button.clip-auto-on,
+button.clip-auto-on:disabled {
     opacity: 1.0;
     color: var(--success-color);
-    background-color: color-mix(in srgb, var(--success-color) 18%, transparent);
-    border-color: color-mix(in srgb, var(--success-color) 55%, transparent);
+    background-color: color-mix(in srgb, var(--success-color) 22%, transparent);
+    border-color: var(--success-color);
 }
 
 /* Smooth engaged: the dropdown lights up the same green so the active mode

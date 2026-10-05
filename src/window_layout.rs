@@ -210,16 +210,8 @@ fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk
     labels.push(clip_label);
     headroom.set_safe_button.set_valign(gtk4::Align::Center);
     clip_cell.append(&headroom.set_safe_button);
-    let auto_label = gtk4::Label::new(Some("Auto"));
-    auto_label.set_valign(gtk4::Align::Center);
-    auto_label.set_css_classes(&["metric-title"]);
-    auto_label.set_tooltip_text(Some(
-        "Let the output preamp follow the estimated peak automatically",
-    ));
-    clip_cell.append(&auto_label);
-    labels.push(auto_label);
-    headroom.auto_safe_switch.set_valign(gtk4::Align::Center);
-    clip_cell.append(&headroom.auto_safe_switch);
+    headroom.auto_safe_button.set_valign(gtk4::Align::Center);
+    clip_cell.append(&headroom.auto_safe_button);
     row.insert(&clip_cell, -1);
 
     // The preamp stays exactly where it is while Auto-Safe owns it and is
@@ -228,9 +220,8 @@ fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk
     // remaining items re-flowed. Disabling keeps every pixel put.
     {
         let preamp = headroom.preamp_spin.clone();
-        headroom.auto_safe_switch.connect_state_set(move |_sw, on| {
-            preamp.set_sensitive(!on);
-            glib::Propagation::Proceed
+        headroom.auto_safe_button.connect_toggled(move |btn| {
+            preamp.set_sensitive(!btn.is_active());
         });
     }
     headroom

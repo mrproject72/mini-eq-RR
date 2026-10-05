@@ -17,8 +17,13 @@ pub const HEADROOM_RISK_LIMIT_DB: f64 = 0.0;
 pub const AUTO_SAFE_TARGET_DBFS: f64 = -1.0;
 
 /// Fixed width of the Set Safe button so label changes never reflow the row.
-/// "Fix" plus theme padding. Was 96px for the old "Clip-Safe"/"Set Safe" label.
-const SET_SAFE_BUTTON_WIDTH_PX: i32 = 56;
+/// Both clipping buttons are the same width so the pair reads as one shape.
+/// Was 96px when Fix still said "Clip-Safe"/"Set Safe".
+const CLIP_BUTTON_WIDTH_PX: i32 = 56;
+/// CSS class marking Fix as actionable (red).
+pub const CLIP_FIX_NEEDED: &str = "clip-fix-needed";
+/// CSS class marking Auto as on (green).
+pub const CLIP_AUTO_ON: &str = "clip-auto-on";
 /// Char width of the numeric peak readout, sized for the widest
 /// string it can render so text changes never resize the row.
 const PEAK_LABEL_WIDTH_CHARS: i32 = 11;
@@ -95,7 +100,10 @@ pub struct HeadroomPanel {
     led_state: Rc<std::cell::Cell<HeadroomState>>,
     pub detail_label: gtk4::Label,
     pub set_safe_button: gtk4::Button,
-    pub auto_safe_switch: gtk4::Switch,
+    /// Auto-Safe as a toggle BUTTON, not a switch: it sits next to the manual
+    /// Fix button in the same cell and the two have to read as one pair. Same
+    /// fixed label either way -- only the colour says whether Auto is on.
+    pub auto_safe_button: gtk4::ToggleButton,
     pub auto_safe: Rc<std::cell::Cell<bool>>,
     /// Smooth (coupled) band editing: dragging one band drags its
     /// neighbours by a decaying fraction so the curve stays smooth across
@@ -178,24 +186,30 @@ impl HeadroomPanel {
         // even though the label, CSS class and layout cell were all correct.
         set_safe_button.set_visible(true);
         set_safe_button.set_sensitive(false);
-        set_safe_button.set_size_request(SET_SAFE_BUTTON_WIDTH_PX, -1);
+        set_safe_button.set_size_request(CLIP_BUTTON_WIDTH_PX, -1);
         set_safe_button.set_halign(gtk4::Align::Start);
 
-        let auto_safe_switch = gtk4::Switch::new();
-        auto_safe_switch.set_valign(gtk4::Align::Center);
-        auto_safe_switch.set_tooltip_text(Some(
+        let auto_safe_button = gtk4::ToggleButton::with_label("Auto");
+        auto_safe_button.set_valign(gtk4::Align::Center);
+        auto_safe_button.set_size_request(CLIP_BUTTON_WIDTH_PX, -1);
+        auto_safe_button.set_tooltip_text(Some(
             "Automatically keep the output peak under -1 dBFS as you adjust the EQ",
         ));
         let auto_safe = Rc::new(std::cell::Cell::new(false));
         {
             let auto_safe = auto_safe.clone();
             let preamp_ctl = preamp_spin.clone();
-            auto_safe_switch.connect_state_set(move |_sw, on| {
+            auto_safe_button.connect_toggled(move |btn| {
+                let on = btn.is_active();
                 auto_safe.set(on);
                 // The auto algorithm owns the preamp while enabled, so the
                 // manual control is disabled to avoid fighting it.
                 preamp_ctl.set_sensitive(!on);
-                glib::Propagation::Proceed
+                if on {
+                    btn.add_css_class(CLIP_AUTO_ON);
+                } else {
+                    btn.remove_css_class(CLIP_AUTO_ON);
+                }
             });
         }
 
@@ -315,7 +329,7 @@ impl HeadroomPanel {
             led_state,
             detail_label,
             set_safe_button,
-            auto_safe_switch,
+            auto_safe_button,
             auto_safe,
             smooth_switch,
             smooth,
@@ -395,10 +409,13 @@ impl HeadroomPanel {
         // disappearing slid every other control sideways.
         self.set_safe_button.set_visible(true);
         self.set_safe_button.set_sensitive(needs_fix);
+        // Red when a fix is required, plain grey otherwise. No resting green:
+        // the green in this pair means "Auto is on", and reusing it for "nothing
+        // to do here" made two different things look like the same state.
         if needs_fix {
-            self.set_safe_button.remove_css_class("clip-safe-ok");
+            self.set_safe_button.add_css_class(CLIP_FIX_NEEDED);
         } else {
-            self.set_safe_button.add_css_class("clip-safe-ok");
+            self.set_safe_button.remove_css_class(CLIP_FIX_NEEDED);
         }
     }
 
