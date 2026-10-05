@@ -811,3 +811,37 @@ were taken. Routing off restores both to their own recorded targets and reports
 `nothing is pointed at the EQ` for the duplicate call.
 
 `MINI_EQ_DEBUG_ROUTING=1` prints the filter's inputs and verdicts per stream.
+
+### FIXED 2026-10-05 — per-output presets were written but never read
+
+The Output page has "Set Fallback" and "Link to Output", and `core.rs` has
+`set_output_preset_link` / `set_output_preset_fallback_name`, so per-output
+settings could be recorded. Two things were missing:
+
+- **Nothing read the config.** There was no lookup at all, so a linked preset
+  was never applied no matter which output you selected.
+- **The Link button wrote the wrong key**: the literal string `"default"`, so
+  however many outputs existed there was one undifferentiated entry. The live
+  config was `{"links": {"default": "preset_1"}}`.
+
+Now:
+
+- `output_preset_key_for_sink` keys a link by the sink's PipeWire node name.
+  Upstream derives a richer identity from its route table
+  (`output_preset_target_identity`), but the node name is what distinguishes one
+  output from another on this machine and it is stable across restarts.
+- `output_preset_for_sink` is the reader: the sink's own link wins, the fallback
+  covers everything else. Pinned by `per_sink_preset_lookup_prefers_the_sink_then_the_fallback`,
+  including that the legacy `"default"` entry is not mistaken for a sink name.
+- `apply_output_preset_for_sink` runs after a successful output switch in the
+  dropdown, mirroring upstream's `output_preset_target_transition`: the previous
+  identity is remembered, so only a real change loads a preset and unrelated
+  output events cannot clobber what the user is editing.
+- The 500 ms default-sink watcher deliberately does **not** take part: the
+  filter chain does not follow the system default (its output re-link needs live
+  validation), so the sink the EQ feeds has not changed. Documented in the
+  helper, with a note to add the call there if that ever changes.
+
+Not done: D-Bus still exposes only `preset_name` and `output_sink` in `GetState`,
+which is enough for a client to observe the switching, but the advertised
+`output-presets` capability has no dedicated fields of its own.

@@ -1399,6 +1399,53 @@ pub fn output_preset_links_path() -> std::path::PathBuf {
     app_config_file_path(OUTPUT_PRESET_LINKS_FILE)
 }
 
+/// Identity a link is stored under: the sink's PipeWire node name.
+///
+/// Upstream derives a richer identity from the route table
+/// (`output_preset_target_identity`: route key, else an encoded route-device
+/// identity, else the target's first key). The node name is the part that
+/// actually distinguishes one output from another on this machine, and it is
+/// stable across restarts -- which is all a per-output preset needs.
+pub fn output_preset_key_for_sink(sink_name: &str) -> String {
+    sink_name.trim().to_string()
+}
+
+/// The preset that belongs to an output sink: its own link if there is one, else
+/// the fallback preset.
+///
+/// This is the reader the port never had. `set_output_preset_link` and
+/// `set_output_preset_fallback_name` wrote the config, and nothing ever looked
+/// it up, so per-output settings could be recorded but never applied.
+pub fn output_preset_for_sink(sink_name: &str) -> Option<String> {
+    output_preset_for_sink_at(&output_preset_links_path(), sink_name)
+}
+
+/// Path-injectable variant of [`output_preset_for_sink`].
+pub fn output_preset_for_sink_at(path: &Path, sink_name: &str) -> Option<String> {
+    let (links, fallback) = load_output_preset_config_at(path).ok()?;
+    let key = output_preset_key_for_sink(sink_name);
+    if let Some(name) = links.get(&key) {
+        return Some(name.clone());
+    }
+    fallback
+}
+
+/// Every output sink that has its own preset linked, as `(sink, preset)`.
+///
+/// For the D-Bus `output-presets` capability, which is advertised but has
+/// nothing behind it.
+pub fn output_preset_links() -> Vec<(String, String)> {
+    let (links, _) = load_output_preset_config().unwrap_or_default();
+    let mut out: Vec<(String, String)> = links.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// The fallback preset name, if one is set.
+pub fn output_preset_fallback() -> Option<String> {
+    load_output_preset_config().ok()?.1
+}
+
 pub fn load_output_preset_config()
 -> anyhow::Result<(std::collections::HashMap<String, String>, Option<String>)> {
     load_output_preset_config_at(&output_preset_links_path())
@@ -2438,6 +2485,68 @@ mod tests {
         assert!(load_preset_from_file(&newer).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reader the port never had: a sink's own link wins, the fallback
+    /// covers everything else, and the legacy `"default"` entry is not mistaken
+    /// for a sink name.
+    #[test]
+    fn per_sink_preset_lookup_prefers_the_sink_then_the_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "mini-eq-output-preset-lookup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("output-presets.json");
+
+        std::fs::write(
+            &path,
+            r#"{"links":{"alsa_output.pci-0000_04_00.6.analog-stereo":"desk"},
+                 "default":"flat","version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output_preset_for_sink_at(&path, "alsa_output.pci-0000_04_00.6.analog-stereo")
+                .as_deref(),
+            Some("desk")
+        );
+        assert_eq!(
+            output_preset_for_sink_at(&path, "alsa_output.pci-0000_04_00.1.hdmi-stereo").as_deref(),
+            Some("flat"),
+            "a sink with no link of its own falls back"
+        );
+
+        std::fs::write(&path, r#"{"links":{},"version":1}"#).unwrap();
+        assert_eq!(
+            output_preset_for_sink_at(&path, "alsa_output.pci-0000_04_00.1.hdmi-stereo"),
+            None,
+            "no link and no fallback means nothing to apply"
+        );
+
+        // The entry the old Link button wrote: keyed "default", not by sink.
+        std::fs::write(
+            &path,
+            r#"{"links":{"default":"preset_1"},"default":"preset_1","version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output_preset_for_sink_at(&path, "default").as_deref(),
+            Some("preset_1")
+        );
+        assert_eq!(
+            output_preset_for_sink_at(&path, "alsa_output.pci-0000_04_00.6.analog-stereo")
+                .as_deref(),
+            Some("preset_1"),
+            "with no per-sink link the fallback still applies"
+        );
+    }
+
+    #[test]
+    fn output_preset_key_is_the_sink_name() {
+        assert_eq!(
+            output_preset_key_for_sink("  alsa_output.usb-Generic_USB_Audio-00.analog-stereo  "),
+            "alsa_output.usb-Generic_USB_Audio-00.analog-stereo"
+        );
     }
 
     #[test]

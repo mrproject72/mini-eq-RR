@@ -83,6 +83,43 @@ fn recompute_solo_active(faders: &[Rc<RefCell<crate::band_fader::EqBandFader>>])
     }
 }
 
+/// Load the preset linked to an output sink, if the sink actually changed.
+///
+/// Mirrors upstream's `output_preset_target_transition`: the previous target's
+/// identity is remembered, and only a real change loads a preset. Without that
+/// guard every unrelated output event would re-apply a preset and throw away
+/// whatever the user had been editing.
+///
+/// The fallback preset covers sinks with no link of their own, so a device
+/// nobody configured still gets a sensible curve.
+///
+/// Called from the Output dropdown only. The 500 ms default-sink watcher does
+/// not take part: the filter chain deliberately does not follow the system
+/// default (its output re-link needs live validation), so the sink the EQ is
+/// feeding has not changed and there is nothing to switch. If the chain ever
+/// starts following the default, this call belongs there too.
+fn apply_output_preset_for_sink(
+    sink_name: &str,
+    last_identity: &RefCell<Option<String>>,
+    presets: &Rc<RefCell<crate::window_presets::PresetPanel>>,
+) {
+    let identity = crate::core::output_preset_key_for_sink(sink_name);
+    if identity.is_empty() {
+        return;
+    }
+    if matches!(&*last_identity.borrow(), Some(seen) if seen == &identity) {
+        return;
+    }
+    *last_identity.borrow_mut() = Some(identity.clone());
+    match crate::core::output_preset_for_sink(&identity) {
+        Some(preset) => match presets.borrow_mut().load_library_preset(&preset) {
+            Ok(()) => log::info!("Output {identity}: loaded its preset '{preset}'"),
+            Err(e) => log::warn!("Output {identity}: preset '{preset}' failed to load: {e}"),
+        },
+        None => log::debug!("Output {identity}: no preset linked, leaving the curve alone"),
+    }
+}
+
 /// The sink the output monitor must tap: the one the filter chain actually
 /// plays out to.
 ///
@@ -1071,6 +1108,10 @@ impl MiniEqWindow {
         let output_names_for_refresh = output_names.clone();
         let dropdown_for_refresh = output_dropdown.clone();
         let backend_for_outputs = backend.clone();
+        // Identity of the output whose preset was last applied. Shared by the
+        // dropdown and the default-sink watcher so neither of them re-applies a
+        // preset for the sink the other already handled.
+        let output_preset_identity: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         // True while index 0 ("Default Output") is selected. The default-sink
         // watcher below must not fight an explicitly chosen device.
         let output_follows_default = Rc::new(std::cell::Cell::new(true));
@@ -1123,6 +1164,8 @@ impl MiniEqWindow {
             let backend_for_select = backend.clone();
             let engine_sink_for_select = engine_sink.clone();
             let follow_default_for_select = output_follows_default.clone();
+            let output_preset_identity = output_preset_identity.clone();
+            let presets_for_output = utility.presets.clone();
             let state_for_select = app_state.clone();
             let summary_for_select = utility.monitor.summary.clone();
             output_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
@@ -1175,6 +1218,7 @@ impl MiniEqWindow {
                     return;
                 }
                 *engine_sink_for_select.borrow_mut() = chosen.clone();
+                apply_output_preset_for_sink(&chosen, &output_preset_identity, &presets_for_output);
                 if state_for_select.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str())
                 {
                     *state_for_select.output_sink.lock().unwrap() = Some(chosen.clone());
@@ -1456,7 +1500,16 @@ impl MiniEqWindow {
             utility.link_button.connect_clicked(move |_| {
                 match presets.borrow().current_preset_name() {
                     Some(name) => {
-                        if let Err(e) = crate::core::set_output_preset_link("default", &name) {
+                        // Key by the sink the EQ is actually feeding. The old
+                        // code wrote the literal "default", so there was one
+                        // undifferentiated entry no matter how many outputs
+                        // existed -- and nothing read it anyway.
+                        let key = crate::core::output_preset_key_for_sink(&engine_sink.borrow());
+                        if key.is_empty() {
+                            log::info!("Link preset: no output device known yet");
+                            return;
+                        }
+                        if let Err(e) = crate::core::set_output_preset_link(&key, &name) {
                             log::warn!("Link preset to output failed: {e}");
                         } else {
                             link_label.set_text(&name);
