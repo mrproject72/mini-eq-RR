@@ -354,20 +354,38 @@ impl RoutingEngine {
         };
 
         let streams = self.list_playback_streams();
-        let mut moved = 0usize;
-        for (node_id, name) in &streams {
-            if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
-                continue;
-            }
-            match self.set_stream_target(*node_id, target.0, &target.1) {
-                Ok(()) => {
-                    info!("Restored '{name}' ({node_id}) -> {sink_name}");
-                    moved += 1;
+
+        // One batch, ONE roundtrip.
+        //
+        // `set_stream_target` roundtrips per stream, which is right while
+        // routing interactively -- each write is confirmed before the next
+        // starts. On the way out it is pure latency in front of the hand-off:
+        // with five players that is five serialised PipeWire syncs before the
+        // first stream is even told where to go, and the audible gap while the
+        // EQ is torn down grows with it. Every write is queued first, then
+        // synced once, so all the streams start moving together.
+        let mut batched = 0usize;
+        {
+            self.ensure_default_metadata()?;
+            let md = self.default_metadata.as_ref().unwrap();
+            for (node_id, name) in &streams {
+                if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
+                    continue;
                 }
-                Err(e) => warn!("Failed to restore '{name}' ({node_id}): {e}"),
+                md.set_property(
+                    *node_id,
+                    "target.node",
+                    Some("Spa:Id"),
+                    Some(&target.0.to_string()),
+                );
+                md.set_property(*node_id, "target.object", Some("Spa:Id"), Some(&target.1));
+                batched += 1;
             }
         }
-        info!("Restore complete: {moved} stream(s) -> {sink_name}");
+        if batched > 0 {
+            self.roundtrip()?;
+        }
+        info!("Restore complete: {batched} stream(s) -> {sink_name}");
         Ok(())
     }
 

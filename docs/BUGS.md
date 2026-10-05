@@ -676,3 +676,24 @@ speech-dispatcher, playing through `Mini-EQ-Sink`):
 
 SIGKILL still cannot be caught; there WirePlumber's own "target node vanished"
 fallback is all that is left.
+
+### Reduced 2026-10-05 — the hand-off gap when closing the window
+
+Reported as acceptable: closing the window interrupts the output for a few
+milliseconds.
+
+The interruption itself is not removable. On exit the streams are moved off the
+EQ's virtual sink onto the real one, and WirePlumber has to re-link every one of
+them; any device change costs that, and staying on the EQ is not an option once
+the node is gone with the process. What *was* removable is how long the app
+takes to start the move.
+
+`set_stream_target` roundtrips per stream, which is right while routing
+interactively — each write is confirmed before the next begins. On the way out it
+was pure latency in front of the hand-off: five players meant five serialised
+PipeWire syncs before the first stream was even told where to go, and the gap
+grew with the number of streams. `unroute_all_to` now queues every stream's
+`target.node`/`target.object` and syncs once, so they all start moving together.
+
+Not measurable from here: there is no audio capture path in this environment, so
+whether the remaining gap is noticeably shorter is the user's call to make.
