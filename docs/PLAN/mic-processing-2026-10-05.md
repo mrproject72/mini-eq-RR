@@ -85,6 +85,14 @@ out of that:
   machine is not something to ship by default, and the output side's blocklist
   discipline exists precisely because that went wrong before.
 
+## Also relevant
+
+- `docs/PLAN/output-modes-2026-10-05.md` designs the output-side mode split
+  (Selected vs All outputs), per-device curves and monitor selection. Its
+  "explicitly out of scope" section explains why multiple simultaneous chains are
+  a much larger problem — the same one this plan runs into on the capture side:
+  one chain equalises one signal path at a time.
+
 ## Related
 
 - Per-output preset switching (the prerequisite this plan leans on) is
