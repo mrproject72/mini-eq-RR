@@ -87,7 +87,13 @@ pub fn build_band_faders(
 /// header icon — carries the clipping alert.
 /// Below this row width the captions are dropped and each control falls
 /// back to its tooltip, so the row stays compact instead of being cut.
-const OUTPUT_ROW_COMPACT_WIDTH: i32 = 1000;
+pub const OUTPUT_ROW_COMPACT_WIDTH: i32 = 1000;
+
+/// Below this row width the peak readout is dropped as well, keeping only the
+/// LED: the row's natural width is ~675px, which does not fit the 640px
+/// minimum window width. Chosen so the row keeps its single line with room to
+/// spare once the peak number is gone.
+pub const OUTPUT_ROW_TIGHT_WIDTH: i32 = 720;
 
 /// Fixed cell widths for the output row (see `fixed_cell`).
 // These are MINIMUM cell widths (set_size_request is a floor, not a cap),
@@ -97,14 +103,19 @@ const OUTPUT_ROW_COMPACT_WIDTH: i32 = 1000;
 // second line at the minimum window width. When captions are shown
 // (window >= OUTPUT_ROW_COMPACT_WIDTH) the cells grow to fit, which is
 // fine because there is room at that width.
-const CELL_W_MONITOR: i32 = 40;
 const CELL_W_SMOOTH: i32 = 96;
 const CELL_W_AUTO_SAFE: i32 = 72;
 const CELL_W_PREAMP: i32 = 96;
 const CELL_W_STATUS: i32 = 108;
 const CELL_W_SET_SAFE: i32 = 96;
 
-fn build_output_control_row(utility: &UtilityPane) -> gtk4::FlowBox {
+/// Returns the row and its caption labels.
+///
+/// The labels are handed back to `window.rs` because the show/hide rule is
+/// driven from the window's own tick: GTK4 exposes no size-change signal on a
+/// FlowBox (`notify::width` does not fire) and libadwaita applies only ONE
+/// breakpoint per window, which the fader-height breakpoints already claim.
+fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk4::Label>>) {
     // FlowBox rather than adw::WrapBox. WrapBox needs libadwaita >= 1.7,
     // but Ubuntu 24.04 LTS -- a perfectly reasonable target for a desktop
     // EQ, supported until 2029 -- ships 1.5.0. Requiring 1.7 would make
@@ -142,21 +153,25 @@ fn build_output_control_row(utility: &UtilityPane) -> gtk4::FlowBox {
         &headroom.auto_safe_switch,
         &mut labels,
     );
-    // Monitor settings first: the gear button that opens Smoothing / Display
-    // Gain / Freeze. It leads the row, immediately before the Smooth dropdown,
-    // so the two controls that shape how editing feels sit together.
-    row.insert(
-        &fixed_cell(
-            CELL_W_MONITOR,
-            None,
-            &utility.monitor.settings_button,
-            &mut labels,
-        ),
-        -1,
-    );
-    // One cell for Smooth: the switch and its width spin live inside the
-    // menu popover, so the row spends a single cell on them.
-    let smooth_item = fixed_cell(CELL_W_SMOOTH, None, &headroom.smooth_menu, &mut labels);
+    // One cell for the monitor settings gear and the Smooth dropdown, with the
+    // switch and its width spin inside the menu popover.
+    //
+    // They share a cell on purpose. The gear used to sit in its own fixed
+    // 40 px cell, which cost a whole extra FlowBox gap on top of the icon: at
+    // the minimum window width that was enough to push the Set Safe button onto
+    // a second line. Two controls that are both small and both about how
+    // editing behaves belong in one cell with a 2 px gap.
+    let smooth_item = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+    smooth_item.set_size_request(CELL_W_SMOOTH, -1);
+    smooth_item.set_halign(gtk4::Align::Start);
+    smooth_item.set_valign(gtk4::Align::Center);
+    smooth_item.set_tooltip_text(Some("Smooth: couple overlapping bands while dragging"));
+    utility
+        .monitor
+        .settings_button
+        .set_halign(gtk4::Align::Start);
+    smooth_item.append(&utility.monitor.settings_button);
+    smooth_item.append(&headroom.smooth_menu);
     let preamp_item = fixed_cell(
         CELL_W_PREAMP,
         Some(("Preamp", "Output preamp trim (dB)")),
@@ -203,24 +218,7 @@ fn build_output_control_row(utility: &UtilityPane) -> gtk4::FlowBox {
         .preamp_spin
         .set_sensitive(!headroom.auto_safe.get());
 
-    // Drop the captions when the row gets tight. Every control carries its
-    // own tooltip, so the names are still reachable.
-    {
-        let labels: Rc<Vec<gtk4::Label>> = Rc::new(labels);
-        let current = Rc::new(std::cell::Cell::new(false));
-        row.connect_notify_local(Some("width"), move |r, _| {
-            let compact = r.width() > 0 && r.width() < OUTPUT_ROW_COMPACT_WIDTH;
-            if current.get() == compact {
-                return;
-            }
-            current.set(compact);
-            for label in labels.iter() {
-                label.set_visible(!compact);
-            }
-        });
-    }
-
-    row
+    (row, Rc::new(labels))
 }
 
 /// A fixed-width cell in the output row. The width is reserved whether or
@@ -259,6 +257,7 @@ pub fn build_main_layout(
     adw::OverlaySplitView,
     gtk4::ScrolledWindow,
     Vec<Rc<RefCell<crate::band_fader::EqBandFader>>>,
+    (gtk4::FlowBox, Rc<Vec<gtk4::Label>>),
 ) {
     let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
 
@@ -268,7 +267,7 @@ pub fn build_main_layout(
     // constantly, on ONE row between the spectrum and the faders. These
     // widgets stay owned by HeadroomPanel/UtilityPane and are reparented
     // here, which frees the sidebar to be a pure Output (device) panel.
-    let control_row = build_output_control_row(utility);
+    let (control_row, control_row_labels) = build_output_control_row(utility);
     main_box.append(&control_row);
 
     let (band_scrolled, faders) =
@@ -295,5 +294,10 @@ pub fn build_main_layout(
     split_view.set_min_sidebar_width(300.0);
     split_view.set_max_sidebar_width(440.0);
 
-    (split_view, band_scrolled, faders)
+    (
+        split_view,
+        band_scrolled,
+        faders,
+        (control_row, control_row_labels),
+    )
 }

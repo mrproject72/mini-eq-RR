@@ -533,3 +533,47 @@ through the UI-side accessor and reads it back for the smoothing alpha.
 Display gain never had this bug, which is why only one of the two sliders looked
 broken: it is applied in `display_levels()` on the way to the UI, not inside the
 realtime callback.
+
+### FIXED 2026-10-05 — Set Safe wrapped to a second row at the minimum window width
+
+User report: *"when the window size is minimal allowed, the controls row become
+2 rows (Clip-Safe button go to a new line)."*
+
+The gear button added a cell, which tipped the row over. Measuring it turned up
+something older: **the row's caption-hiding rule never ran at all.**
+
+`build_output_control_row` hung the "drop the captions when the row gets tight"
+logic on `connect_notify_local(Some("width"))` of the FlowBox. A FlowBox does
+not emit `notify::width` when its allocation changes, so the handler never ran
+once. The captions were visible at every width — which is why the cell floors
+had been shrunk to their "compact" sizes to compensate for a rule that was never
+going to fire.
+
+Measured at a 628px row: the cells were allocated at their natural widths —
+gear+Smooth 127, Auto-Safe 108, preamp 165, status 114, Set Safe 102, i.e.
+~675px of content plus gaps, against 628px available. A FlowBox lays every child
+out at its **natural** width, so a control that is merely "not too big" still
+wraps the row.
+
+Fixed with two changes:
+
+- The gear button and the Smooth dropdown now share **one cell** with a 2px gap
+  instead of a fixed 40px cell plus a FlowBox gap. That is what was asked for,
+  and it is what the gear needs to cost.
+- Compaction is now driven from the window's own tick (`window.rs`), because
+  both mechanisms that were tried do not work: GTK4 emits no `notify::width` on
+  a FlowBox, and libadwaita applies only **one** breakpoint per window — the
+  fader-height breakpoints already claim it, so a caption breakpoint never
+  fires. Tier 1 (< 1000px) hides the captions; tier 2 (< 720px, new
+  `OUTPUT_ROW_TIGHT_WIDTH`) also hides the peak *number*, keeping the LED that
+  carries the clipping warning. The preamp and peak values stay in their
+  tooltips.
+
+Verified by measurement at the minimum size: the row is 40px tall (one line)
+instead of 90px (two). The tier state is logged on change
+(`output row 819px: captions hidden, peak number shown`).
+
+Also removed from this area: `GraphMode::Roomy` had already gone; the build-time
+"row needs Npx" log is gone too, because measuring an unallocated FlowBox
+reported 800px against a real requirement of ~675px and the number was actively
+misleading.

@@ -456,14 +456,26 @@ impl MiniEqWindow {
         }));
         *editor_cell.borrow_mut() = Some(band_editor.clone());
 
-        let (split_view, band_scrolled, band_faders) = window_layout::build_main_layout(
-            &utility,
-            &band_editor,
-            crate::core::DEFAULT_ACTIVE_BANDS,
-            gain_request.clone(),
-            selection_callback,
-        );
+        let (split_view, band_scrolled, band_faders, (output_row, output_row_labels)) =
+            window_layout::build_main_layout(
+                &utility,
+                &band_editor,
+                crate::core::DEFAULT_ACTIVE_BANDS,
+                gain_request.clone(),
+                selection_callback,
+            );
         *fader_registry.borrow_mut() = band_faders.clone();
+
+        // Drop the output row's captions when the row gets narrow. Driven from
+        // the tick because there is no usable size-change signal: GTK4 does not
+        // emit `notify::width` on a FlowBox, and libadwaita applies only one
+        // breakpoint per window, which the fader-height breakpoints already
+        // claim. Two attempts hung off those and neither ever fired, which is
+        // why the cells were sized down to their compact widths to compensate
+        // for captions that were never going to be hidden -- and why Set Safe
+        // ended up alone on a second row at the minimum window width.
+        let output_row_compact = Rc::new(std::cell::Cell::new(false));
+        let output_row_tight = Rc::new(std::cell::Cell::new(false));
 
         // Smooth override wiring. The switch already drives the shared
         // `smooth` cell (read by the DSP snapshot + gain path); this handler
@@ -725,6 +737,11 @@ impl MiniEqWindow {
             let monitor_frozen = utility.monitor.frozen.clone();
             let monitor_display_gain = utility.monitor.display_gain_scale.clone();
             let headroom_warning = headroom_warning.clone();
+            let output_row_for_captions = output_row.clone();
+            let output_row_labels = output_row_labels.clone();
+            let output_row_compact = output_row_compact.clone();
+            let output_row_tight = output_row_tight.clone();
+            let peak_label_for_width = headroom.borrow().peak_label.clone();
             // Debounce state: only reload the filter-chain when the effective
             // state actually changed and at most every 400 ms, so fader drags
             // do not thrash the module.
@@ -903,6 +920,41 @@ impl MiniEqWindow {
                 // has decayed away.
                 if !levels.is_empty() {
                     app_state_handle.maybe_emit_analyzer_levels_changed();
+                }
+                // Output row compaction, in two tiers.
+                //
+                // Tier 1 (below OUTPUT_ROW_COMPACT_WIDTH) drops the captions.
+                // Tier 2 (below OUTPUT_ROW_TIGHT_WIDTH) also drops the peak
+                // NUMBER, keeping only the LED.
+                //
+                // A FlowBox lays every child out at its NATURAL width, so the
+                // row's real width is ~675px -- the preamp spin alone is ~165px
+                // and the eleven-character peak readout ~114px. That is over the
+                // 640px minimum window width, so Set Safe wrapped onto a second
+                // line. The numbers are what had to go: the preamp and peak
+                // both keep their values in their tooltips, and the LED still
+                // carries the clipping warning.
+                //
+                // Only acts on a change, so the comparisons cost nothing.
+                {
+                    let width = output_row_for_captions.width();
+                    if width > 0 {
+                        let compact = width < window_layout::OUTPUT_ROW_COMPACT_WIDTH;
+                        let tight = width < window_layout::OUTPUT_ROW_TIGHT_WIDTH;
+                        if output_row_compact.get() != compact || output_row_tight.get() != tight {
+                            output_row_compact.set(compact);
+                            output_row_tight.set(tight);
+                            for label in output_row_labels.iter() {
+                                label.set_visible(!compact);
+                            }
+                            peak_label_for_width.set_visible(!tight);
+                            log::info!(
+                                "output row {width}px: captions {}, peak number {}",
+                                if compact { "hidden" } else { "shown" },
+                                if tight { "hidden" } else { "shown" }
+                            );
+                        }
+                    }
                 }
                 if headroom.borrow().auto_safe_enabled() {
                     let raw_peak = crate::core::estimate_response_peak_db(
