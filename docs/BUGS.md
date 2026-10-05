@@ -620,3 +620,22 @@ colour — red Fix when a fix is required, green Auto while it is on.
 - The 500 ms clipping blink on Fix would have been invisible against a
   permanently red button, since both classes set the same fill. It now drops the
   fill to an outline, alternating outlined/solid red.
+
+### FIXED 2026-10-05 — labels hidden, peak number hidden, blink could disagree with colour
+
+Three reports from one piece of work, all caused by the caption-hiding
+compaction added to solve the output-row wrap:
+
+1. **Every caption disappeared below 1000px.** `Preamp`, `Clip` and the peak
+   number all went, leaving tooltips and unlabelled controls at ordinary window
+   sizes. The compaction is deleted: grouping the clipping pair into one cell
+   and shrinking Fix to 56px freed the width the rule had been borrowing.
+2. **The peak readout was dropped at minimum size**, which is when it is most
+   relevant. The rule is gone with the rest, and the label is now 12 characters
+   so "-100.0 dBFS" fits — it ellipsised exactly when the peak was loudest.
+3. **The blink could run while the button was grey, or not run while red.** It
+   was driven by a level condition computed in `window.rs` (live peak over the
+   -1 dBFS target) while the red came from `HeadroomPanel`'s own `needs_fix`
+   (curve peak over 0.5 dB with Auto-Safe off). Two different questions, so the
+   button could be red and still, or blink while grey. The blink now reads the
+   button's own red class: red means red-and-blinking.

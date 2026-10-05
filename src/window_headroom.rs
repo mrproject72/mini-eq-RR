@@ -26,7 +26,10 @@ pub const CLIP_FIX_NEEDED: &str = "clip-fix-needed";
 pub const CLIP_AUTO_ON: &str = "clip-auto-on";
 /// Char width of the numeric peak readout, sized for the widest
 /// string it can render so text changes never resize the row.
-const PEAK_LABEL_WIDTH_CHARS: i32 = 11;
+/// Wide enough for the longest value the label ever shows: "-100.0 dBFS" is 12
+/// characters. At 11 the readout ellipsised exactly when the peak was loud --
+/// the moment the number matters most.
+const PEAK_LABEL_WIDTH_CHARS: i32 = 12;
 /// Width of the smooth spread slide bar inside the popover.
 const SMOOTH_WIDTH_SCALE_W_PX: i32 = 150;
 

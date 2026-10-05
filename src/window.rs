@@ -456,14 +456,13 @@ impl MiniEqWindow {
         }));
         *editor_cell.borrow_mut() = Some(band_editor.clone());
 
-        let (split_view, band_scrolled, band_faders, (output_row, output_row_labels)) =
-            window_layout::build_main_layout(
-                &utility,
-                &band_editor,
-                crate::core::DEFAULT_ACTIVE_BANDS,
-                gain_request.clone(),
-                selection_callback,
-            );
+        let (split_view, band_scrolled, band_faders) = window_layout::build_main_layout(
+            &utility,
+            &band_editor,
+            crate::core::DEFAULT_ACTIVE_BANDS,
+            gain_request.clone(),
+            selection_callback,
+        );
         *fader_registry.borrow_mut() = band_faders.clone();
 
         // Drop the output row's captions when the row gets narrow. Driven from
@@ -474,8 +473,6 @@ impl MiniEqWindow {
         // why the cells were sized down to their compact widths to compensate
         // for captions that were never going to be hidden -- and why Set Safe
         // ended up alone on a second row at the minimum window width.
-        let output_row_compact = Rc::new(std::cell::Cell::new(false));
-        let output_row_tight = Rc::new(std::cell::Cell::new(false));
 
         // Smooth override wiring. The switch already drives the shared
         // `smooth` cell (read by the DSP snapshot + gain path); this handler
@@ -719,9 +716,6 @@ impl MiniEqWindow {
         window.add_controller(key_controller);
 
         // Start real-time update loop for graph + headroom + backend push
-        // Shared flag: true when the EQ curve peak exceeds the -1 dBFS
-        // target. Drives the blinking alert on the Set Safe button.
-        let headroom_warning = Rc::new(std::cell::Cell::new(false));
         {
             let graph = utility.graph.clone();
             let headroom = utility.headroom.clone();
@@ -736,12 +730,6 @@ impl MiniEqWindow {
             // does to `on_analyzer_levels` / `on_analyzer_loudness`.
             let monitor_frozen = utility.monitor.frozen.clone();
             let monitor_display_gain = utility.monitor.display_gain_scale.clone();
-            let headroom_warning = headroom_warning.clone();
-            let output_row_for_captions = output_row.clone();
-            let output_row_labels = output_row_labels.clone();
-            let output_row_compact = output_row_compact.clone();
-            let output_row_tight = output_row_tight.clone();
-            let peak_label_for_width = headroom.borrow().peak_label.clone();
             // Debounce state: only reload the filter-chain when the effective
             // state actually changed and at most every 400 ms, so fader drags
             // do not thrash the module.
@@ -921,41 +909,6 @@ impl MiniEqWindow {
                 if !levels.is_empty() {
                     app_state_handle.maybe_emit_analyzer_levels_changed();
                 }
-                // Output row compaction, in two tiers.
-                //
-                // Tier 1 (below OUTPUT_ROW_COMPACT_WIDTH) drops the captions.
-                // Tier 2 (below OUTPUT_ROW_TIGHT_WIDTH) also drops the peak
-                // NUMBER, keeping only the LED.
-                //
-                // A FlowBox lays every child out at its NATURAL width, so the
-                // row's real width is ~675px -- the preamp spin alone is ~165px
-                // and the eleven-character peak readout ~114px. That is over the
-                // 640px minimum window width, so Set Safe wrapped onto a second
-                // line. The numbers are what had to go: the preamp and peak
-                // both keep their values in their tooltips, and the LED still
-                // carries the clipping warning.
-                //
-                // Only acts on a change, so the comparisons cost nothing.
-                {
-                    let width = output_row_for_captions.width();
-                    if width > 0 {
-                        let compact = width < window_layout::OUTPUT_ROW_COMPACT_WIDTH;
-                        let tight = width < window_layout::OUTPUT_ROW_TIGHT_WIDTH;
-                        if output_row_compact.get() != compact || output_row_tight.get() != tight {
-                            output_row_compact.set(compact);
-                            output_row_tight.set(tight);
-                            for label in output_row_labels.iter() {
-                                label.set_visible(!compact);
-                            }
-                            peak_label_for_width.set_visible(!tight);
-                            log::info!(
-                                "output row {width}px: captions {}, peak number {}",
-                                if compact { "hidden" } else { "shown" },
-                                if tight { "hidden" } else { "shown" }
-                            );
-                        }
-                    }
-                }
                 if headroom.borrow().auto_safe_enabled() {
                     let raw_peak = crate::core::estimate_response_peak_db(
                         &bands,
@@ -1014,24 +967,18 @@ impl MiniEqWindow {
                 }
                 headroom.borrow_mut().update_curve_peak(&bands, preamp_db);
 
-                // Warn (blink the Headroom icon) when the output rides over
-                // the -1 dBFS target. Prefer the LIVE monitor peak (actual
-                // output level). When the monitor is off, fall back to the
-                // estimated curve peak but only warn on an actual boost
-                // (peak > 0 dB), so a flat/neutral EQ never false-triggers.
-                // The curve peak above is a property of the EQ settings,
-                // not a measurement, so it must not be presented as a
-                // level. Show the real output peak whenever the monitor is
-                // delivering one; otherwise label the estimate explicitly.
+                // The peak readout prefers the LIVE monitor peak (actual output
+                // level). When the monitor is off it falls back to the estimated
+                // curve peak but only shows it as a boost, not a level, so a
+                // flat/neutral EQ never looks like clipping. The curve peak is a
+                // property of the EQ settings, not a measurement.
+                //
+                // Whether the clipping alert applies is NOT decided here: Fix
+                // decides that itself (it knows whether Auto-Safe already owns
+                // the preamp) and paints its own red class, and the blink follows
+                // that class. An earlier version recomputed the condition from
+                // the level here, which disagreed with the button's own state.
                 headroom.borrow_mut().apply_live_peak(live_peak);
-                let warn = match live_peak {
-                    Some(db) => db > crate::window_headroom::AUTO_SAFE_TARGET_DBFS,
-                    None => {
-                        let est = *headroom.borrow().peak_value.borrow();
-                        est > 0.0
-                    }
-                };
-                headroom_warning.set(warn);
 
                 // Push UI state to the PipeWire engine.
                 //
@@ -1243,7 +1190,6 @@ impl MiniEqWindow {
 
         {
             let set_safe = utility.headroom.borrow().set_safe_button.clone();
-            let headroom_warning = headroom_warning.clone();
             let blink_on = Rc::new(std::cell::Cell::new(false));
             let last_default_sink: Rc<std::cell::Cell<String>> =
                 Rc::new(std::cell::Cell::new(String::new()));
@@ -1289,7 +1235,15 @@ impl MiniEqWindow {
                         }
                     }
                 }
-                if headroom_warning.get() {
+                // Blink exactly while the Fix button is RED. The trigger is the
+                // button's own red class, not the separate `headroom_warning`
+                // level condition: those two are computed from different things
+                // (live peak over the target vs the curve peak needing a
+                // manual fix) and used to disagree, so the button could sit red
+                // and still, or blink while grey. Red now means red-and-blinking
+                // with no second opinion.
+                let fix_is_red = set_safe.has_css_class(crate::window_headroom::CLIP_FIX_NEEDED);
+                if fix_is_red {
                     blink_on.set(!blink_on.get());
                     if blink_on.get() {
                         set_safe.add_css_class("headroom-warning");
