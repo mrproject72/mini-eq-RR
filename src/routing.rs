@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -112,6 +112,45 @@ pub struct RoutingEngine {
     /// Keeps the metadata `property` listeners alive (a dropped listener
     /// unregisters itself, so these must outlive the bind callback).
     metadata_listeners: Rc<RefCell<Vec<pipewire::metadata::MetadataListener>>>,
+    /// Every `target.*` property we see, as `(subject, key) -> (type, value)`.
+    /// The server replays current properties when our listener binds, so this
+    /// holds each stream's existing routing target before we touch it. The only
+    /// way to get at that is upstream's `metadata.dup_value(subject, key)`; the
+    /// Rust `Metadata` wrapper has no getter, so the listener is the reader.
+    target_cache: Arc<Mutex<HashMap<(u32, String), (Option<String>, Option<String>)>>>,
+    /// What each stream pointed at before we routed it into the EQ, captured at
+    /// route time. Upstream keeps this in `PipeWireStreamRouter`
+    /// (`routed_stream_targets`) and restores it verbatim on disable; clearing
+    /// the properties instead leaves the destination to WirePlumber's policy,
+    /// which re-resolves from scratch and takes a visible moment of silence.
+    routed_targets: Arc<Mutex<HashMap<u32, StreamTarget>>>,
+    /// `(node id, object serial)` the EQ was last routed to. Lets `unroute_all`
+    /// tell "nothing is on the EQ any more" from "streams are still there" by
+    /// reading their targets, so a repeated call is a no-op instead of another
+    /// round of writes.
+    last_route_target: Arc<Mutex<Option<(u32, String)>>>,
+}
+
+/// A stream's routing target as stored in the `default` metadata: the node id
+/// and the object serial, each with its own metadata type.
+///
+/// The types are part of the value. Restoring `target.node` without the
+/// `Spa:Id` type it was written with makes WirePlumber read the restored target
+/// as something else, so a "faithful" restore still ends up re-resolving.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreamTarget {
+    pub target_node: Option<String>,
+    pub target_node_type: Option<String>,
+    pub target_object: Option<String>,
+    pub target_object_type: Option<String>,
+}
+
+impl StreamTarget {
+    /// True when nothing was recorded, i.e. the stream had no explicit target
+    /// and may be sent back to the default.
+    pub fn is_empty(&self) -> bool {
+        self.target_node.is_none() && self.target_object.is_none()
+    }
 }
 
 impl RoutingEngine {
@@ -132,6 +171,9 @@ impl RoutingEngine {
             default_audio_sink: Rc::new(RefCell::new(None)),
             configured_audio_sink: Rc::new(RefCell::new(None)),
             metadata_listeners: Rc::new(RefCell::new(Vec::new())),
+            target_cache: Arc::new(Mutex::new(HashMap::new())),
+            routed_targets: Arc::new(Mutex::new(HashMap::new())),
+            last_route_target: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -286,6 +328,18 @@ impl RoutingEngine {
             if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
                 continue;
             }
+            // Remember where this stream pointed BEFORE we move it, exactly as
+            // upstream's `PipeWireStreamRouter` does. This is what makes the
+            // way back faithful: a stream that was deliberately pointed at
+            // another device, or one with no explicit target at all, goes back
+            // to that, not to whatever WirePlumber picks for "no target".
+            {
+                let mut recorded = self.routed_targets.lock().unwrap();
+                if !recorded.contains_key(node_id) {
+                    recorded.insert(*node_id, self.stream_target(*node_id));
+                }
+            }
+            *self.last_route_target.lock().unwrap() = Some((sink_id, sink_serial.clone()));
             match self.set_stream_target(*node_id, sink_id, &sink_serial) {
                 Ok(()) => {
                     info!(
@@ -311,88 +365,122 @@ impl RoutingEngine {
     /// Clear the `target.node`/`target.object` metadata for all playback
     /// streams so WirePlumber returns them to the default sink (System EQ
     /// off). Mirrors upstream's unroute path.
-    pub fn unroute_all(&mut self) -> Result<(), Error> {
-        info!("Unrouting all playback streams from the EQ");
+    /// Hand the playback streams back to where they were before the EQ took
+    /// them.
+    ///
+    /// Every stream routed by `auto_route_to_sink` had its previous target
+    /// recorded, so it is put back verbatim -- node id, object serial and their
+    /// metadata types, exactly as upstream's
+    /// `PipeWireStreamRouter.restore_output_streams` does. Anything not in that
+    /// record (the EQ was enabled before this process started, or a stream
+    /// appeared mid-session) falls back to `fallback_sink`, or to clearing the
+    /// target when there is nothing better.
+    ///
+    /// The difference from just clearing the properties is the whole point:
+    /// clearing hands the choice of destination back to WirePlumber, which then
+    /// re-resolves the stream's target from scratch, and the silence while it
+    /// does is what made toggling the switch audibly disruptive.
+    pub fn unroute_all(&mut self, fallback_sink: Option<&str>) -> Result<(), Error> {
         let streams = self.list_playback_streams();
-        let mut cleared = 0usize;
-        for (node_id, name) in &streams {
-            if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
-                continue;
-            }
-            if let Err(e) = self.clear_stream_target(*node_id) {
-                warn!("Failed to unroute '{}' ({}): {}", name, node_id, e);
-            } else {
-                cleared += 1;
-            }
+
+        // Is anything still pointed at the EQ? Read it from the streams'
+        // targets rather than assuming, so a second call -- the UI switch and
+        // D-Bus both route through here, and a toggle fires both -- is a cheap
+        // no-op instead of a second round of writes on the way out.
+        let route_target = self.last_route_target.lock().unwrap().clone();
+        let still_on_eq = route_target.as_ref().is_some_and(|(_, serial)| {
+            streams.iter().any(|(id, _)| {
+                self.stream_target(*id).target_object.as_deref() == Some(serial.as_str())
+            })
+        });
+        let recorded_empty = self.routed_targets.lock().unwrap().is_empty();
+        if !still_on_eq && recorded_empty {
+            info!("Unroute: nothing is pointed at the EQ; nothing to restore");
+            return Ok(());
         }
-        info!("Unroute complete: {} stream(s) cleared", cleared);
-        Ok(())
-    }
 
-    /// Hand every playback stream back to a NAMED sink, explicitly.
-    ///
-    /// `unroute_all` only clears `target.node`/`target.object` and relies on
-    /// WirePlumber to pick the default. That works while the stream is
-    /// actively playing, but it leaves the decision to session-manager policy:
-    /// a stream that is idle at shutdown, or one whose player has not yet
-    /// opened its output, can come back with nothing to play through once the
-    /// virtual sink is gone -- "the output stops when I close the app".
-    ///
-    /// Naming the destination makes it deterministic: the metadata says exactly
-    /// where to go, so nothing has to notice that a node disappeared. Falls
-    /// back to clearing when the sink cannot be found, which is what
-    /// `unroute_all` already does.
-    pub fn unroute_all_to(&mut self, sink_name: &str) -> Result<(), Error> {
-        info!("Restoring playback streams to {sink_name}");
-
-        let target = match self.find_node_target(sink_name) {
-            Some(t) => t,
-            None => {
-                warn!("Restore sink {sink_name} not found; falling back to clearing targets");
-                return self.unroute_all();
-            }
-        };
-
-        let streams = self.list_playback_streams();
-
-        // One batch, ONE roundtrip.
-        //
-        // `set_stream_target` roundtrips per stream, which is right while
-        // routing interactively -- each write is confirmed before the next
-        // starts. On the way out it is pure latency in front of the hand-off:
-        // with five players that is five serialised PipeWire syncs before the
-        // first stream is even told where to go, and the audible gap while the
-        // EQ is torn down grows with it. Every write is queued first, then
-        // synced once, so all the streams start moving together.
-        let mut batched = 0usize;
+        // One batch, one sync: the streams must all start moving together, or
+        // the hand-off is serialised and the gap grows with the stream count.
+        let recorded = self.routed_targets.lock().unwrap().clone();
+        let mut restored_ids: HashSet<u32> = HashSet::new();
+        let mut restored = 0usize;
         {
             self.ensure_default_metadata()?;
-            let md = self.default_metadata.as_ref().unwrap();
             for (node_id, name) in &streams {
                 if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
                     continue;
                 }
-                md.set_property(
-                    *node_id,
-                    "target.node",
-                    Some("Spa:Id"),
-                    Some(&target.0.to_string()),
-                );
-                md.set_property(*node_id, "target.object", Some("Spa:Id"), Some(&target.1));
-                batched += 1;
+                if let Some(target) = recorded.get(node_id) {
+                    self.restore_stream_target(*node_id, target)?;
+                    restored_ids.insert(*node_id);
+                    info!("Restored '{name}' ({node_id}) to its own target");
+                    restored += 1;
+                }
             }
         }
-        if batched > 0 {
+        if restored > 0 {
             self.roundtrip()?;
         }
-        info!("Restore complete: {batched} stream(s) -> {sink_name}");
+
+        // Everything else: nothing was recorded, so we do not know where it
+        // came from. Fall back to the sink the EQ was feeding, then to
+        // clearing the target.
+        let leftovers: Vec<(u32, String)> = streams
+            .iter()
+            .filter(|(node_id, name)| {
+                !name.contains(VIRTUAL_SINK_BASE)
+                    && !name.contains(OUTPUT_CLIENT_NAME)
+                    && !restored_ids.contains(node_id)
+            })
+            .cloned()
+            .collect();
+        let mut moved = 0usize;
+        if !leftovers.is_empty() {
+            // Same batching as the recorded pass: write everything, sync once.
+            let fallback = fallback_sink.and_then(|name| self.find_node_target(name));
+            let mut wrote = false;
+            {
+                self.ensure_default_metadata()?;
+                let md = self.default_metadata.as_ref().unwrap();
+                for (stream_id, name) in &leftovers {
+                    match &fallback {
+                        Some((node_id, serial)) => {
+                            md.set_property(
+                                *stream_id,
+                                "target.node",
+                                Some("Spa:Id"),
+                                Some(&node_id.to_string()),
+                            );
+                            md.set_property(
+                                *stream_id,
+                                "target.object",
+                                Some("Spa:Id"),
+                                Some(serial),
+                            );
+                        }
+                        None => {
+                            md.set_property(*stream_id, "target.node", None, None);
+                            md.set_property(*stream_id, "target.object", None, None);
+                        }
+                    }
+                    info!("No recorded target for '{name}' ({stream_id}); sent to the fallback");
+                    wrote = true;
+                    moved += 1;
+                }
+            }
+            if wrote {
+                self.roundtrip()?;
+            }
+        }
+
+        self.routed_targets.lock().unwrap().clear();
+        *self.last_route_target.lock().unwrap() = None;
+        info!(
+            "Unroute complete: {restored} stream(s) restored to their own target, {moved} to the fallback"
+        );
         Ok(())
     }
 
-    /// Set a stream's routing target via the `default` metadata so
-    /// WirePlumber moves it. Mirrors upstream `set_stream_target`:
-    /// `target.node` = sink bound_id, `target.object` = sink object.serial,
-    /// both typed `Spa:Id`.
     pub fn set_stream_target(
         &mut self,
         stream_id: u32,
@@ -414,6 +502,55 @@ impl RoutingEngine {
             Some(sink_serial),
         );
         self.roundtrip()
+    }
+
+    /// A stream's routing target as it currently stands in the `default`
+    /// metadata, read from the property cache.
+    ///
+    /// Upstream: `PipeWireBackend.stream_target`. Returns an empty
+    /// `StreamTarget` for a stream that had no explicit target, which is the
+    /// normal case -- WirePlumber picks the default for those.
+    pub fn stream_target(&self, stream_id: u32) -> StreamTarget {
+        let cache = self.target_cache.lock().unwrap();
+        let get = |key: &str| {
+            cache
+                .get(&(stream_id, key.to_string()))
+                .cloned()
+                .unwrap_or((None, None))
+        };
+        let (target_node, target_node_type) = get("target.node");
+        let (target_object, target_object_type) = get("target.object");
+        StreamTarget {
+            target_node,
+            target_node_type,
+            target_object,
+            target_object_type,
+        }
+    }
+
+    /// Write a stream's recorded target back, types included.
+    ///
+    /// Upstream: `PipeWireBackend.restore_stream_target`.
+    fn restore_stream_target(
+        &mut self,
+        stream_id: u32,
+        target: &StreamTarget,
+    ) -> Result<(), Error> {
+        self.ensure_default_metadata()?;
+        let md = self.default_metadata.as_ref().unwrap();
+        md.set_property(
+            stream_id,
+            "target.node",
+            target.target_node_type.as_deref(),
+            target.target_node.as_deref(),
+        );
+        md.set_property(
+            stream_id,
+            "target.object",
+            target.target_object_type.as_deref(),
+            target.target_object.as_deref(),
+        );
+        Ok(())
     }
 
     /// Look up a sink's node id and `object.serial`, both of which
@@ -503,6 +640,7 @@ impl RoutingEngine {
         let sink_c = self.default_audio_sink.clone();
         let cfg_c = self.configured_audio_sink.clone();
         let listeners_c = self.metadata_listeners.clone();
+        let cache_c = self.target_cache.clone();
         let _listener = registry
             .add_listener_local()
             .global(move |g| {
@@ -519,9 +657,29 @@ impl RoutingEngine {
                         // `remember_default_metadata_change`.
                         let sink_l = sink_c.clone();
                         let cfg_l = cfg_c.clone();
+                        let cache_l = cache_c.clone();
                         let _pl = md
                             .add_listener_local()
-                            .property(move |_subject, key, _type, value| {
+                            .property(move |subject, key, type_, value| {
+                                // Record per-stream targets on the way past.
+                                // This is the only reader available: the Rust
+                                // `Metadata` wrapper has no getter, and upstream
+                                // reads the same values with
+                                // `metadata.dup_value(subject, key)`. The server
+                                // replays current properties when this listener
+                                // binds, so a stream's existing target is here
+                                // before we touch it.
+                                if let Some(k) = key
+                                    && matches!(k, "target.node" | "target.object")
+                                {
+                                    cache_l.lock().unwrap().insert(
+                                        (subject, k.to_string()),
+                                        (
+                                            type_.map(|t| t.to_string()),
+                                            value.map(|v| v.to_string()),
+                                        ),
+                                    );
+                                }
                                 match key {
                                     Some("default.audio.sink") => {
                                         let parsed = parse_metadata_node_name(value);

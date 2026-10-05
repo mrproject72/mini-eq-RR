@@ -719,3 +719,53 @@ in the Add handler. The panel's copy of "current" is also refreshed from what
 was written, so the state chip reads *saved* rather than *modified* immediately
 after saving, and `save_preset_to_file` failures are logged instead of
 discarded — previously a failed save looked exactly like a successful one.
+
+### FIXED 2026-10-05 — turning the System EQ switch off dropped the audio for ~1s
+
+User report, after establishing that closing the app is fine: *"only when I
+disable it is stopping the audio output for a second."*
+
+Checked against upstream (`pipewire_stream_router.py`,
+`PipeWireStreamRouter.restore_output_streams`) and the port was doing something
+materially different.
+
+**Upstream remembers where each stream was pointing before it routed it, and
+puts it back verbatim.** `_stream_target_before_route` reads `target.node` and
+`target.object` — values *and their metadata types* — from the `default`
+metadata before `move_stream_to_target`, keeps them in `routed_stream_targets`,
+and on disable writes exactly those values back through `restore_stream_target`.
+
+**The port cleared the properties instead.** `unroute_all` set
+`target.node`/`target.object` to nothing, which hands the choice of destination
+back to WirePlumber: it has to re-resolve the stream's target from scratch, and
+the silence while it does is the second the user heard.
+
+The Rust `Metadata` wrapper has no getter (upstream uses
+`metadata.dup_value(subject, key)`), so the values are now read from the
+metadata `property` listener that was already bound for `default.audio.sink`,
+into a per-subject cache. That is the same source, and the server replays
+current properties when the listener binds, so a stream's existing target is
+known before it is touched.
+
+Also fixed in the same path:
+
+- **One batch, one sync.** The restore wrote and synced per stream. With the
+  recorded targets now in hand they are all written first and synced once, so
+  every stream starts moving together instead of in series.
+- **`unroute_all` is idempotent.** The UI switch and D-Bus both route through
+  it, so one toggle ran it twice; the second pass re-wrote targets that were
+  already correct. It now checks whether anything still points at the EQ
+  (read from the streams' own targets, not assumed) and returns early:
+  "nothing is pointed at the EQ; nothing to restore".
+- `unroute_all` takes the EQ's output sink as an explicit fallback, used only
+  for streams this process never routed. The exit path shares the same code.
+
+Verified: routing 3 streams on and off now logs
+"3 stream(s) restored to their own target, 0 to the fallback" followed by the
+no-op second call, and `wpctl` shows them back on the ALC897 hardware.
+
+Still a divergence, deliberately not changed: upstream refuses to route a stream
+that already has a *foreign* target (`_has_foreign_target_object`), so it never
+hijacks an app the user deliberately pointed at another device. The port routes
+everything and now restores it faithfully afterwards, so the end state is
+correct, but such a stream does pass through the EQ in between.

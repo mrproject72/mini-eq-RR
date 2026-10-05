@@ -805,6 +805,7 @@ impl MiniEqWindow {
                         &cmd,
                         &app_state_handle,
                         &backend,
+                        &engine_sink,
                         &route_switch_handle,
                         &bypass_switch_handle,
                         &presets_handle,
@@ -1290,6 +1291,7 @@ impl MiniEqWindow {
         // (off).
         {
             let backend_for_switch = backend.clone();
+            let engine_sink_for_switch = engine_sink.clone();
             let state_for_switch = app_state.clone();
             let bypass_for_route = utility.bypass_switch.clone();
             route_switch.connect_state_set(move |_switch, on| {
@@ -1299,7 +1301,11 @@ impl MiniEqWindow {
                             log::warn!("System EQ: auto-route failed: {}", e);
                         }
                     } else {
-                        if let Err(e) = be.unroute_all() {
+                        // Recorded targets are restored verbatim; the EQ's own
+                        // output sink is only the fallback for streams this
+                        // process never routed.
+                        let chain_output = engine_sink_for_switch.borrow().clone();
+                        if let Err(e) = be.unroute_all(Some(&chain_output)) {
                             log::warn!("System EQ off: unroute failed: {}", e);
                         }
                     }
@@ -1731,6 +1737,7 @@ fn apply_remote_command(
     cmd: &crate::remote_control::RemoteCommand,
     app_state: &Arc<crate::remote_control::AppState>,
     backend: &Rc<RefCell<Option<PipeWireBackend>>>,
+    engine_sink: &Rc<RefCell<String>>,
     route_switch: &gtk4::Switch,
     bypass_switch: &gtk4::Switch,
     presets: &Rc<RefCell<crate::window_presets::PresetPanel>>,
@@ -1746,7 +1753,7 @@ fn apply_remote_command(
                 let result = if *on {
                     be.auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE)
                 } else {
-                    be.unroute_all()
+                    be.unroute_all(Some(&engine_sink.borrow()))
                 };
                 if let Err(e) = result {
                     log::warn!("D-Bus SetRoutingEnabled({on}) failed: {e}");

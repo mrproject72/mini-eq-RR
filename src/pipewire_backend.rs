@@ -664,9 +664,14 @@ impl PipeWireBackend {
         self.routing.auto_route_to_sink(sink_name)
     }
 
-    /// Clear routing targets for all playback streams (System EQ off).
-    pub fn unroute_all(&mut self) -> Result<(), Error> {
-        self.routing.unroute_all()
+    /// Hand playback streams back where they were before the EQ took them
+    /// (System EQ off).
+    ///
+    /// `fallback_sink` is only consulted for streams this process never routed
+    /// -- there is no record of where they came from, so the sink the EQ was
+    /// feeding is the best available answer.
+    pub fn unroute_all(&mut self, fallback_sink: Option<&str>) -> Result<(), Error> {
+        self.routing.unroute_all(fallback_sink)
     }
 
     /// Hand playback streams back to a real output, on the way out.
@@ -690,11 +695,12 @@ impl PipeWireBackend {
             if sink.is_empty() || sink.contains(crate::core::VIRTUAL_SINK_BASE) {
                 continue;
             }
-            info!("exit: restoring playback streams to {sink}");
-            return self.routing.unroute_all_to(&sink);
+            info!("exit: restoring playback streams (fallback {sink})");
+            // Recorded targets win; `sink` is only the fallback.
+            return self.routing.unroute_all(Some(&sink));
         }
-        warn!("exit: no real output sink to restore to; clearing routing targets");
-        self.routing.unroute_all()
+        warn!("exit: no real output sink to fall back to; restoring recorded targets only");
+        self.routing.unroute_all(None)
     }
 
     /// Update the DSP graph for a new set of bands.
