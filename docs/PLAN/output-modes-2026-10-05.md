@@ -5,8 +5,9 @@ switch with an explicit mode choice, and rebuilds the Output page around it.
 
 Decisions taken with the user (2026-10-05):
 
-- **Selected** output mode is the default. **All outputs** (global) is an
-  explicit opt-in.
+- The mode buttons are **Selected** and **Reroute**, named for what they do to
+  the streams rather than for a scope. **Selected** is the default; **Reroute**
+  is an explicit opt-in.
 - Write the plan first, implement after review.
 
 This diverges from upstream on purpose. Upstream has one mode
@@ -37,13 +38,14 @@ has to say so rather than let it be discovered.
 
 ### Selected (default)
 
-Only streams whose current target is the chosen device are routed into the EQ.
+Nothing is moved. Only the streams already playing to the chosen device are
+routed into the EQ, so the device you picked is the only thing being processed.
 
-- Nothing moves that was not already going to that device. No surprise, and the
+- No surprise: nothing moves that was not already going to that device, and the
   upstream rule that a stream deliberately pointed elsewhere is never touched
   stays absolute.
-- The device is the scope of the EQ, which makes the per-device curve
-  (below) obviously correct rather than a convenience.
+- The device is the scope of the EQ, which makes the per-device curve (below)
+  obviously correct rather than a convenience.
 - Cost: apps the user has pointed at that device elsewhere are not covered. That
   is deliberate, and it is the user's mixer that decides.
 
@@ -53,15 +55,18 @@ choosing the default for it). Both forms are already readable from the target
 cache (`RoutingEngine::stream_target`), so this is a filter on data we already
 have, not new machinery.
 
-### All outputs (opt-in)
+### Reroute (opt-in)
 
-Every eligible stream is routed in, exactly as today: upstream's routability
-filter (internal/blocklisted/foreign/dont-move) and nothing else.
+Every eligible stream is moved into the EQ, whatever device it was playing to:
+upstream's routability filter (internal/blocklisted/foreign/dont-move) and
+nothing else. This is today's behaviour, under a name that says what it does.
 
 - **This mode is an explicit opt-out from the foreign-target rule.** Say so in
-  the tooltip and in the status line, because with it on, a stream the user
-  pointed at device B will be pulled to device A. That is the single most
-  surprising thing this app can do, and it must never be the default.
+  the tooltip and in the status line, because with it on a stream the user
+  pointed at device B gets pulled to device A. Moving audio between devices
+  behind the user's back is the single most surprising thing this app can do,
+  which is exactly why the button is named for the reroute and is never the
+  default.
 
 ## Output dropdown
 
@@ -152,7 +157,7 @@ Today the monitor follows the chain's output (`resolve_monitor_target` →
 ## Output page layout
 
 ```
-Output mode      [ Selected output ] [ All outputs ]
+Output mode      [ Selected ]  [ Reroute ]
 Device           [ Default Output (follow system) ▾ ]
 Curve            [ <preset> ▾ ]   [unlink]     chip: Saved / Modified
 Monitor          [ Follow EQ output ▾ ]
@@ -164,11 +169,12 @@ caused the confusion.
 
 ## D-Bus
 
-- `GetState`: add `output_mode` (`selected` | `all`), `monitor_sink`, and
+- `GetState`: add `output_mode` (`selected` | `reroute`), `monitor_sink`, and
   `output_preset` (the preset for the current device) next to the existing
   `preset_name` and `output_sink`.
 - `SetRoutingEnabled` keeps its meaning ("are streams routed through the EQ at
-  all") and is orthogonal to the mode; a new `SetOutputMode` carries the mode.
+  all") and is orthogonal to the mode; a new `SetOutputMode` carries the mode,
+  with the same `selected` / `reroute` values as the buttons.
 - `capabilities`: keep `output-presets`, add `output-mode` and `monitor-sink`.
 
 ## Persistence
@@ -189,8 +195,9 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
    immediately.
 2. **Working follow-default.** Watcher retargets the chain live. Removes the
    "the dropdown does nothing" impression even before the mode is chosen.
-3. **Mode split.** `RoutingEngine` gains a mode and the scope predicate;
-   `auto_route_to_sink` takes the scope. Replace the switch with the two buttons.
+3. **Mode split.** `RoutingEngine` gains a mode (`Selected` / `Reroute`) and the
+   scope predicate; `auto_route_to_sink` takes the scope. Replace the switch with
+   the two buttons.
 4. **Curves.** Preset picker + unlink in place of "Link to Output", and debounced
    auto-write-back into a singly-linked preset.
 5. **Monitor device.**
@@ -215,7 +222,7 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
 - Scope predicate: stream with no target → in scope for the default device; with
   the chosen serial → in scope; with another serial → out; blocklisted/internal →
   out regardless of mode.
-- Mode round trip: All outputs routes a stream that Selected leaves alone.
+- Mode round trip: Reroute moves a stream that Selected leaves alone.
 - Follow-default: a default-sink change moves the chain without a rebuild (assert
   the live path, not the log line).
 - Update overwrites the selected preset and the chip returns to `Saved`.
@@ -230,7 +237,7 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
   the next device change? Re-routing on the spot is more predictable; leaving it
   until the next change is less churn. Default: re-route immediately, since the
   user just told us what they want.
-- Should "All outputs" remember itself across restarts? Recommend yes (it is in
+- Should "Reroute" remember itself across restarts? Recommend yes (it is in
   the config), with the status line making it obvious.
 - Does the monitor device need to survive a chain rebuild? Recommend yes, with
   `Follow EQ output` re-resolving after it.
