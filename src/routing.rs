@@ -109,6 +109,13 @@ pub struct RoutingEngine {
     streams: Arc<Mutex<HashMap<u32, StreamInfo>>>,
     routing_table: Arc<Mutex<HashMap<u32, u32>>>,
     auto_route: bool,
+    /// Whether the playback streams are currently routed through the EQ.
+    ///
+    /// Distinct from `current_sink`, which is where the *chain* points. Upstream
+    /// keeps the same distinction (`RoutingEngine.routed` vs `output_sink`) and
+    /// uses it to gate the re-route after an engine restart
+    /// (`restart_engine` only re-routes `if self.routed`).
+    routed: bool,
     current_sink: Option<String>,
     virtual_sink_name: String,
     /// Handle to the PipeWire `default` metadata object, bound from the
@@ -182,6 +189,7 @@ impl RoutingEngine {
             streams: Arc::new(Mutex::new(HashMap::new())),
             routing_table: Arc::new(Mutex::new(HashMap::new())),
             auto_route: false,
+            routed: false,
             current_sink: None,
             virtual_sink_name: format!("{}.source", VIRTUAL_SINK_BASE),
             default_metadata: None,
@@ -323,6 +331,11 @@ impl RoutingEngine {
 
     pub fn get_current_sink(&self) -> Option<&str> {
         self.current_sink.as_deref()
+    }
+
+    /// True while the playback streams are routed through the EQ.
+    pub fn is_routed(&self) -> bool {
+        self.routed
     }
 
     /// True when the stream is ours or must never be touched.
@@ -490,6 +503,58 @@ impl RoutingEngine {
             .collect()
     }
 
+    /// Put the routed streams back on their own targets WITHOUT forgetting that
+    /// they are routed.
+    ///
+    /// This is the "before" half of upstream's `restart_engine`: it restores
+    /// the streams, stops the engine, and re-routes once the new engine is
+    /// ready. The record and the routed flag are deliberately kept, so the
+    /// re-route that follows the rebuild still knows these streams are ours and
+    /// still knows where each one came from.
+    ///
+    /// Needed because a filter-chain reload destroys `mini_eq_sink`: streams
+    /// left pointed at it are pointed at nothing, and WirePlumber's recovery
+    /// from that is both slower and less predictable than a deliberate
+    /// live-to-live move.
+    pub fn suspend_routing(&mut self) -> Result<(), Error> {
+        if !self.routed {
+            return Ok(());
+        }
+        let streams = self.routable_output_streams();
+        let recorded = self.routed_targets.lock().unwrap().clone();
+        if recorded.is_empty() {
+            return Ok(());
+        }
+        let mut moved = 0usize;
+        {
+            self.ensure_default_metadata()?;
+            let md = self.default_metadata.as_ref().unwrap();
+            for node in &streams {
+                let Some(target) = recorded.get(&node.id) else {
+                    continue;
+                };
+                md.set_property(
+                    node.id,
+                    "target.node",
+                    target.target_node_type.as_deref(),
+                    target.target_node.as_deref(),
+                );
+                md.set_property(
+                    node.id,
+                    "target.object",
+                    target.target_object_type.as_deref(),
+                    target.target_object.as_deref(),
+                );
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.roundtrip()?;
+            info!("Suspended routing for {moved} stream(s) across the engine rebuild");
+        }
+        Ok(())
+    }
+
     pub fn auto_route_to_sink(&mut self, sink_name: &str) -> Result<(), Error> {
         info!("Auto-routing all playback streams to sink: {}", sink_name);
 
@@ -543,6 +608,7 @@ impl RoutingEngine {
 
         self.set_current_sink(sink_name);
         self.auto_route = true;
+        self.routed = true;
 
         if skipped_dont_move > 0 {
             info!("Left {} stream(s) alone: node.dont-move", skipped_dont_move);
@@ -667,6 +733,7 @@ impl RoutingEngine {
 
         self.routed_targets.lock().unwrap().clear();
         *self.last_route_target.lock().unwrap() = None;
+        self.routed = false;
         info!(
             "Unroute complete: {restored} stream(s) restored to their own target, {moved} to the fallback"
         );

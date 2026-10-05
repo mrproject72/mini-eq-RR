@@ -577,6 +577,15 @@ impl PipeWireBackend {
             return false;
         }
 
+        // Hand the streams back BEFORE the rebuild, while `mini_eq_sink` is
+        // still alive. Upstream's `restart_engine` does exactly this: restore,
+        // stop the engine, re-route once the new one is ready. Leaving them
+        // pointed at the sink that is about to be destroyed is what turned an
+        // output switch into silence.
+        if let Err(e) = self.routing.suspend_routing() {
+            log::warn!("retarget_output: could not suspend routing before the reload: {e}");
+        }
+
         // The filter chain's destination is fixed at module load
         // (`playback.props.target.object`), and the output client is
         // `node.passive`, so PipeWire ignores a later metadata write — verified:
@@ -591,8 +600,20 @@ impl PipeWireBackend {
 
         // The reload destroys and recreates `mini_eq_sink`, so its
         // `object.serial` changes and every stream we routed to the old one now
-        // points at nothing. Re-route them, exactly as System EQ on does.
+        // points at nothing. Re-route them -- but ONLY if they were routed.
         //
+        // This used to re-route unconditionally, which meant changing the
+        // output device with the System EQ switch OFF dragged the user's
+        // streams into the EQ: something they had explicitly not asked for, on
+        // a chain that had just been torn down and rebuilt. Upstream gates the
+        // same step on `self.routed` (`restart_engine`: `stream_router` is only
+        // kept `if self.routed`).
+        if !self.routing.is_routed() {
+            self.routing.set_current_sink(sink_name);
+            log::info!("EQ output now on {sink_name} (streams not routed; left alone)");
+            return true;
+        }
+
         // The new node appears asynchronously: `pw_context_load_module` returns
         // before the registry carries the new node, so an immediate re-route
         // looks the sink up, finds nothing, and fails with "Creation failed".
@@ -613,7 +634,7 @@ impl PipeWireBackend {
         {
             Ok(_) => {
                 self.routing.set_current_sink(sink_name);
-                log::info!("EQ output now on {sink_name}");
+                log::info!("EQ output now on {sink_name}, streams re-routed");
                 true
             }
             Err(e) => {

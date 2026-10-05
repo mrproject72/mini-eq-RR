@@ -845,3 +845,40 @@ Now:
 Not done: D-Bus still exposes only `preset_name` and `output_sink` in `GetState`,
 which is enough for a client to observe the switching, but the advertised
 `output-presets` capability has no dedicated fields of its own.
+
+### FIXED 2026-10-05 — changing the output device stopped the stream
+
+User report: *"Changing the output device from Output control is stopping the
+stream."*
+
+`retarget_output` rebuilt the filter chain (the only way to move its output, see
+the `node.passive` comment there) and then **re-routed the playback streams
+unconditionally**. Two consequences:
+
+1. **With the System EQ switch OFF it still dragged the streams in.** Switching
+   output with routing off took every stream the user had and pointed it at the
+   EQ — on a chain that had just been destroyed and rebuilt. That is not what
+   "off" means, and it is what stopped their audio.
+   Upstream gates this on `self.routed` (`restart_engine` only keeps a
+   `stream_router` `if self.routed`); the port had no such flag, only
+   `current_sink`, which is where the *chain* points.
+2. **With routing ON the streams were pointed at a node that no longer existed.**
+   The reload destroys `mini_eq_sink` and gives it a new `object.serial`, so
+   every routed stream was aimed at nothing while the code waited (up to 2 s) for
+   the new node to appear. WirePlumber's recovery from that is slower and less
+   predictable than a deliberate move.
+
+Fixed, in upstream's order:
+
+- `RoutingEngine::routed` records whether the streams are actually routed through
+  the EQ, as distinct from `current_sink`. `retarget_output` re-routes only when
+  it is set; otherwise the switch touches no stream at all and says so in the log.
+- `suspend_routing()` puts the routed streams back on their own targets *before*
+  the rebuild, keeping the record and the routed flag so the re-route afterwards
+  still knows where each stream came from. This is upstream's `restart_engine`:
+  restore, stop the engine, re-route when the new one is ready.
+
+Not verified here: the Output dropdown cannot be driven from the shell (no
+`xdotool`/`wmctrl` on this Wayland session), so the switch itself needs a click
+from the user. The log distinguishes the two paths: "streams not routed; left
+alone" versus "Suspended routing for N stream(s)".
