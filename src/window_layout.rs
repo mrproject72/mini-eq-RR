@@ -104,10 +104,10 @@ pub const OUTPUT_ROW_TIGHT_WIDTH: i32 = 720;
 // (window >= OUTPUT_ROW_COMPACT_WIDTH) the cells grow to fit, which is
 // fine because there is room at that width.
 const CELL_W_SMOOTH: i32 = 96;
-const CELL_W_AUTO_SAFE: i32 = 72;
 const CELL_W_PREAMP: i32 = 96;
 const CELL_W_STATUS: i32 = 108;
-const CELL_W_SET_SAFE: i32 = 96;
+/// One cell for the whole clipping group: [Clip] [Fix] [Auto].
+const CELL_W_CLIP: i32 = 148;
 
 /// Returns the row and its caption labels.
 ///
@@ -144,15 +144,6 @@ fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk
     // content, so hiding the preamp or the width control slid everything
     // else sideways. Fixed cells mean a control appearing or vanishing never
     // moves its neighbours, and the wrap points are deterministic too.
-    let auto_safe_item = fixed_cell(
-        CELL_W_AUTO_SAFE,
-        Some((
-            "Auto-Safe",
-            "Let the output preamp follow the peak automatically",
-        )),
-        &headroom.auto_safe_switch,
-        &mut labels,
-    );
     // One cell for the monitor settings gear and the Smooth dropdown, with the
     // switch and its width spin inside the menu popover.
     //
@@ -179,10 +170,9 @@ fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk
         &mut labels,
     );
 
-    // Smooth first, then Auto-Safe: the dropdown is the control that
-    // changes how dragging behaves, so it leads the row.
+    // Monitor settings, then Smooth: both change how editing feels, and the
+    // dropdown leads them.
     row.insert(&smooth_item, -1);
-    row.insert(&auto_safe_item, -1);
     row.insert(&preamp_item, -1);
 
     // Status cell: LED + numeric peak, grouped so they never separate on wrap.
@@ -195,13 +185,42 @@ fn build_output_control_row(utility: &UtilityPane) -> (gtk4::FlowBox, Rc<Vec<gtk
     status_cell.append(&headroom.peak_label);
     row.insert(&status_cell, -1);
 
+    // The clipping group: [Clip] [Fix] [Auto], one cell at the end of the row.
+    //
+    // `Fix` and `Auto` are two answers to the same question -- what to do about
+    // a peak over the target -- so they belong together rather than at opposite
+    // ends of the row, and the single caption replaces the two the cells used to
+    // carry. It is also narrower than the two cells it replaces, which is what
+    // the row needs at the minimum window width.
+    //
+    // "Auto" keeps a label of its own because a bare switch says nothing; it
+    // carries the same metric-title class as the captions, so the compaction
+    // tiers drop it exactly like them and leave the switch with its tooltip.
+    let clip_cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    clip_cell.set_size_request(CELL_W_CLIP, -1);
+    clip_cell.set_halign(gtk4::Align::Start);
+    clip_cell.set_valign(gtk4::Align::Center);
+    clip_cell.set_tooltip_text(Some(
+        "Fix trims the preamp by hand; Auto lets it follow the peak",
+    ));
+    let clip_label = gtk4::Label::new(Some("Clip"));
+    clip_label.set_valign(gtk4::Align::Center);
+    clip_label.set_css_classes(&["metric-title"]);
+    clip_cell.append(&clip_label);
+    labels.push(clip_label);
     headroom.set_safe_button.set_valign(gtk4::Align::Center);
-    let set_safe_cell = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    set_safe_cell.set_size_request(CELL_W_SET_SAFE, -1);
-    set_safe_cell.set_halign(gtk4::Align::Start);
-    set_safe_cell.set_valign(gtk4::Align::Center);
-    set_safe_cell.append(&headroom.set_safe_button);
-    row.insert(&set_safe_cell, -1);
+    clip_cell.append(&headroom.set_safe_button);
+    let auto_label = gtk4::Label::new(Some("Auto"));
+    auto_label.set_valign(gtk4::Align::Center);
+    auto_label.set_css_classes(&["metric-title"]);
+    auto_label.set_tooltip_text(Some(
+        "Let the output preamp follow the estimated peak automatically",
+    ));
+    clip_cell.append(&auto_label);
+    labels.push(auto_label);
+    headroom.auto_safe_switch.set_valign(gtk4::Align::Center);
+    clip_cell.append(&headroom.auto_safe_switch);
+    row.insert(&clip_cell, -1);
 
     // The preamp stays exactly where it is while Auto-Safe owns it and is
     // merely insensitive. Hiding it removed its content from the cell, and

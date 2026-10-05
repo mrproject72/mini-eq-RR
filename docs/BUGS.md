@@ -577,3 +577,30 @@ Also removed from this area: `GraphMode::Roomy` had already gone; the build-time
 "row needs Npx" log is gone too, because measuring an unallocated FlowBox
 reported 800px against a real requirement of ~675px and the number was actively
 misleading.
+
+### Changed 2026-10-05 — the output row's clipping controls are one cell
+
+User request: group Auto-Safe with the manual fix, so the row reads
+
+    [gear] [Smooth] [Preamp] [LED + peak] [Clip] [Fix] [Auto]
+
+- `Auto-Safe` had its own cell between Smooth and the preamp; it now shares a
+  single cell at the end of the row with the manual trim button, under one
+  caption. Two answers to the same question -- what to do about a peak over the
+  target -- belong together, and one cell with one caption is also narrower than
+  two cells with two.
+- The manual button is now labelled **Fix**, was 96px wide, is 56px, and no
+  longer alternates between "Clip-Safe" at rest and "Set Safe" when the curve is
+  over the target. That alternation was a persistent state readout rather than
+  an action, and the LED beside it already carries the safe/risk state. It stays
+  insensitive when there is nothing to fix: the row is centred, so a control
+  appearing and disappearing slid every other control sideways.
+- "Auto" keeps a label of its own, because a bare switch says nothing. Both it
+  and the "Clip" caption carry the metric-title class, so the compaction tiers
+  drop them exactly like the other captions.
+
+Also recorded while measuring this: the two compaction tiers are working, and
+the row is one line at the minimum width. `narrow_bp` (the 1320sp fader-height
+breakpoint) is still dead -- libadwaita applies only one breakpoint per window
+and `compact_bp` claims it -- so the narrow fader compaction has never run.
+That is untouched here and still worth fixing.

@@ -17,7 +17,8 @@ pub const HEADROOM_RISK_LIMIT_DB: f64 = 0.0;
 pub const AUTO_SAFE_TARGET_DBFS: f64 = -1.0;
 
 /// Fixed width of the Set Safe button so label changes never reflow the row.
-const SET_SAFE_BUTTON_WIDTH_PX: i32 = 96;
+/// "Fix" plus theme padding. Was 96px for the old "Clip-Safe"/"Set Safe" label.
+const SET_SAFE_BUTTON_WIDTH_PX: i32 = 56;
 /// Char width of the numeric peak readout, sized for the widest
 /// string it can render so text changes never resize the row.
 const PEAK_LABEL_WIDTH_CHARS: i32 = 11;
@@ -166,7 +167,11 @@ impl HeadroomPanel {
         // and is merely insensitive when there is nothing to do. The width
         // is fixed to the widest label so swapping the text cannot move the
         // neighbours either.
-        let set_safe_button = gtk4::Button::with_label("Safe");
+        // Labelled "Fix" only. It used to alternate between "Clip-Safe" at rest
+        // and "Set Safe" when the curve was over the target, which is a
+        // persistent state readout rather than an action, and it cost ~96px of
+        // row width. The LED beside it already says whether the peak is safe.
+        let set_safe_button = gtk4::Button::with_label("Fix");
         // GTK4 widgets do NOT inherit visibility from their parent, and a
         // freshly built Button starts with visible == false. Nothing else in
         // this codebase ever showed it, which is why the button was absent
@@ -383,11 +388,11 @@ impl HeadroomPanel {
         // is already where Auto-Safe (or its floor) puts it, so the button
         // would be a no-op that re-opens the same Risk state.
         let needs_fix = peak_db > 0.5 && !self.auto_safe_enabled();
-        // Always visible. At rest it reads "Clip-Safe" in light green and
-        // is insensitive; in alert mode it becomes an actionable
-        // "Set Safe" and the blink timer adds `headroom-warning`.
-        self.set_safe_button
-            .set_label(if needs_fix { "Set Safe" } else { "Clip-Safe" });
+        // A transient action, not a state readout: insensitive (and green)
+        // unless there is something to fix, at which point the blink timer adds
+        // `headroom-warning`. Kept in the row rather than hidden when there is
+        // nothing to do, because the row is centred: a control appearing and
+        // disappearing slid every other control sideways.
         self.set_safe_button.set_visible(true);
         self.set_safe_button.set_sensitive(needs_fix);
         if needs_fix {
