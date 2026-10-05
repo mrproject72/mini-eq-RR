@@ -697,3 +697,25 @@ grew with the number of streams. `unroute_all_to` now queues every stream's
 
 Not measurable from here: there is no audio capture path in this environment, so
 whether the remaining gap is noticeably shorter is the user's call to make.
+
+### FIXED 2026-10-05 — "Save preset" wrote a flat line
+
+User report: *"preset are not saving the current EQ configuration. just a flat
+line."*
+
+`PresetPanel::current_bands` is only written when a preset is **loaded** (the
+row-selected handler, `revert_to_baseline`, `load_library_preset`). It is never
+updated from the edits the user makes afterwards, so it describes the last
+*loaded* preset — and with nothing loaded it still holds the `default_bands()`
+it was constructed with.
+
+The Add/Save button read exactly that field, so it wrote ten flat 0 dB bands.
+The save worked; the content was empty. Export and the APO/AutoEq imports were
+unaffected: they carry their own `bands`.
+
+Fixed by giving the panel a `current_state_callback`, wired in `window.rs` to
+the same fader + preamp source the state signature already reads, and using it
+in the Add handler. The panel's copy of "current" is also refreshed from what
+was written, so the state chip reads *saved* rather than *modified* immediately
+after saving, and `save_preset_to_file` failures are logged instead of
+discarded — previously a failed save looked exactly like a successful one.

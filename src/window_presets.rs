@@ -43,6 +43,13 @@ pub struct PresetPanel {
     autoeq_callback: Option<Box<dyn Fn()>>,
     reset_callback: Option<Box<dyn Fn()>>,
     get_signature_callback: Option<Box<dyn Fn() -> String>>,
+    /// Reports the EQ as it stands right now: `(bands, preamp_db)`.
+    ///
+    /// `current_bands` is only updated when a preset is LOADED, so it describes
+    /// the last loaded preset, not what the user has since edited. Saving used
+    /// it, which meant "Save preset" wrote the default flat curve whenever no
+    /// preset had been loaded yet -- the preset saved, and it was empty.
+    current_state_callback: Option<Box<dyn Fn() -> (Vec<crate::core::EqBand>, f64)>>,
     current_preset_name: Option<String>,
     saved_signature: Option<String>,
     revert_baseline_label: Option<String>,
@@ -146,6 +153,7 @@ impl PresetPanel {
             autoeq_callback: None,
             reset_callback: None,
             get_signature_callback: None,
+            current_state_callback: None,
             current_preset_name: None,
             saved_signature: None,
             revert_baseline_label: None,
@@ -160,21 +168,33 @@ impl PresetPanel {
         // --- Add: create a new custom preset from the current EQ state.
         let panel_clone = panel.clone();
         panel.borrow().add_button.connect_clicked(move |_| {
+            // Read the curve as it is NOW, not the last loaded preset: the
+            // whole point of this button is to capture the current EQ.
             let (bands, preamp, list_box) = {
                 let p = panel_clone.borrow();
-                (
-                    p.current_bands.clone(),
-                    p.current_preamp_db,
-                    p.list_box.clone(),
-                )
+                let (bands, preamp) = p.live_state();
+                (bands, preamp, p.list_box.clone())
             };
             // Suggest the old auto-numbered name as a starting point, but
             // let the user actually name the preset.
+            let panel_for_state = panel_clone.clone();
             let suggested = format!("preset_{}", count_custom_children(&list_box) + 1);
             prompt_preset_name("Save Preset", "Save", &suggested, move |name| {
                 let sanitized = sanitize_preset_name(&name);
                 let path = preset_path_for_name(&sanitized);
-                let _ = save_preset_to_file(&path, &bands, preamp);
+                if let Err(e) = save_preset_to_file(&path, &bands, preamp) {
+                    log::warn!("Save preset {sanitized}: {e}");
+                    return;
+                }
+                // What was just written is now the current state, so the state
+                // chip reads "saved" instead of "modified".
+                {
+                    let mut p = panel_for_state.borrow_mut();
+                    p.current_bands = bands.clone();
+                    p.current_preamp_db = preamp;
+                    p.current_preset_name = Some(sanitized.clone());
+                    p.saved_signature = Some(p.signature_of_current());
+                }
                 refresh_preset_list(&list_box);
             });
         });
@@ -405,10 +425,21 @@ impl PresetPanel {
         apply_bands: Option<Box<dyn Fn(Vec<crate::core::EqBand>, f64)>>,
         reset: Option<Box<dyn Fn()>>,
         get_signature: Option<Box<dyn Fn() -> String>>,
+        current_state: Option<Box<dyn Fn() -> (Vec<crate::core::EqBand>, f64)>>,
     ) {
         self.apply_bands_callback = apply_bands;
         self.reset_callback = reset;
         self.get_signature_callback = get_signature;
+        self.current_state_callback = current_state;
+    }
+
+    /// The live EQ state, falling back to the last loaded preset when the
+    /// window has not wired a reader (headless callers, tests).
+    fn live_state(&self) -> (Vec<crate::core::EqBand>, f64) {
+        match self.current_state_callback.as_ref() {
+            Some(f) => f(),
+            None => (self.current_bands.clone(), self.current_preamp_db),
+        }
     }
 
     pub fn set_default_signature(&mut self, signature: String) {
@@ -446,6 +477,14 @@ impl PresetPanel {
 
     pub fn refresh_list(&self) {
         refresh_preset_list(&self.list_box);
+    }
+
+    /// Signature of the curve as it stands, via the window's reader.
+    fn signature_of_current(&self) -> String {
+        self.get_signature_callback
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default()
     }
 
     pub fn update_state_chip(&mut self) {

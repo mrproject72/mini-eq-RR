@@ -1514,6 +1514,8 @@ impl MiniEqWindow {
             let reset_refresh = refresh_editor.clone();
             let sig_band_faders = band_faders.clone();
             let sig_headroom = utility.headroom.clone();
+            let state_band_faders = band_faders.clone();
+            let state_headroom = utility.headroom.clone();
             presets.borrow_mut().set_callbacks(
                 Some(Box::new(move |bands, preamp| {
                     // Upstream re-syncs every fader from the loaded bands
@@ -1617,6 +1619,28 @@ impl MiniEqWindow {
                         &bands,
                         sig_headroom.borrow().preamp_value(),
                     ))
+                })),
+                // Live EQ state, for "Save preset". Same source as the
+                // signature above -- the faders, not the loaded preset -- so
+                // what gets written is the curve on screen.
+                Some(Box::new(move || {
+                    let bands: Vec<crate::core::EqBand> = state_band_faders
+                        .iter()
+                        .map(|f| {
+                            let fader = f.borrow();
+                            crate::core::EqBand {
+                                index: fader.index,
+                                frequency: fader.frequency,
+                                gain_db: fader.gain_db,
+                                q: fader.q_value,
+                                filter_type: fader.filter_type,
+                                mute: fader.muted,
+                                solo: fader.soloed,
+                                coefficients: crate::core::BiquadCoefficients::identity(),
+                            }
+                        })
+                        .collect();
+                    (bands, state_headroom.borrow().preamp_value())
                 })),
             );
             presets.borrow_mut().set_default_signature(default_sig);
