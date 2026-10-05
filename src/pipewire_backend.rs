@@ -577,20 +577,53 @@ impl PipeWireBackend {
             return false;
         }
 
-        // Hand the streams back BEFORE the rebuild, while `mini_eq_sink` is
-        // still alive. Upstream's `restart_engine` does exactly this: restore,
-        // stop the engine, re-route once the new one is ready. Leaving them
-        // pointed at the sink that is about to be destroyed is what turned an
-        // output switch into silence.
+        // Live move FIRST, and only rebuild if it did not take.
+        //
+        // The chain's output is an ordinary stream node named
+        // `mini_eq_sink_output`; its destination is metadata like any other
+        // stream's, so it can simply be pointed at the new sink. That leaves the
+        // virtual sink node alive, which means the playback streams never have
+        // to be moved at all and the switch is inaudible.
+        //
+        // Upstream's order exactly: `retarget_filter_output()` first, and
+        // `restart_engine()` only if that raises. The port skipped the live path
+        // and always rebuilt, on the belief -- recorded in the comment below and
+        // verified wrong -- that a `node.passive` client cannot be retargeted.
+        // `node.passive` is a property of the node, not of the stream the
+        // adapter exposes; the stream is movable.
+        let filter_output = format!("{}{}", crate::core::VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX);
+        if let (Some(stream_id), Some((sink_id, serial))) = (
+            self.routing.output_stream_id_by_name(&filter_output),
+            self.routing.find_node_target(sink_name),
+        ) {
+            if self
+                .routing
+                .move_stream_to_target_checked(stream_id, sink_id, &serial)
+            {
+                self.routing.set_current_sink(sink_name);
+                log::info!("EQ output moved live to {sink_name} (no rebuild)");
+                return true;
+            }
+            log::info!("retarget_output: live move of {filter_output} did not take; rebuilding");
+        } else {
+            log::warn!(
+                "retarget_output: {filter_output} stream or {sink_name} sink not found; rebuilding"
+            );
+        }
+
+        // Rebuild path. Hand the streams back BEFORE the module goes away,
+        // while `mini_eq_sink` is still alive. Upstream's `restart_engine` does
+        // exactly this: restore, stop the engine, re-route once the new one is
+        // ready. Leaving them pointed at the sink that is about to be destroyed
+        // is what turned an output switch into silence.
         if let Err(e) = self.routing.suspend_routing() {
             log::warn!("retarget_output: could not suspend routing before the reload: {e}");
         }
 
-        // The filter chain's destination is fixed at module load
-        // (`playback.props.target.object`), and the output client is
-        // `node.passive`, so PipeWire ignores a later metadata write — verified:
-        // the write reports success and `target.object` does not move. The only
-        // way is to rebuild the module with the new destination.
+        // Rebuild the module with the new destination. This is the fallback for
+        // when the live move above did not take, not the only way: it destroys
+        // and recreates `mini_eq_sink`, so every routed stream has to be moved
+        // off it and back on again.
         let bands = self.bands.clone();
         log::info!("Reloading filter chain to output on {sink_name}");
         if let Err(e) = self.update_band_coefficients(&bands, sink_name) {

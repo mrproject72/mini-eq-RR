@@ -415,6 +415,55 @@ impl RoutingEngine {
     /// pointed at a device the user chose.
     ///
     /// Upstream `iter_routable_output_streams`.
+    /// The id of our own filter-chain output stream, `mini_eq_sink_output`.
+    ///
+    /// Upstream `output_stream_by_name(filter_output_name)`. This is the stream
+    /// whose target decides where the EQ chain plays out, and moving it is the
+    /// live alternative to rebuilding the module.
+    pub fn output_stream_id_by_name(&self, node_name: &str) -> Option<u32> {
+        self.list_stream_nodes()
+            .into_iter()
+            .find(|s| s.node_name == node_name)
+            .map(|s| s.id)
+    }
+
+    /// Move a stream and report where it actually ended up.
+    ///
+    /// The write is not the outcome: the earlier assumption that a metadata
+    /// write to a `node.passive` client cannot move it was wrong, and it cost an
+    /// engine rebuild -- and the interruption that comes with one -- on every
+    /// output switch. Upstream moves this stream live and only falls back to
+    /// `restart_engine` when the move raises. Reading the value back is what
+    /// makes the choice between the two paths evidence-based rather than a
+    /// guess in a comment.
+    pub fn move_stream_to_target_checked(
+        &mut self,
+        stream_id: u32,
+        sink_id: u32,
+        sink_serial: &str,
+    ) -> bool {
+        if self
+            .set_stream_target(stream_id, sink_id, sink_serial)
+            .is_err()
+        {
+            return false;
+        }
+        // The metadata property event arrives during the roundtrip above; allow
+        // a bounded moment for the cache to reflect it before calling the move a
+        // failure and rebuilding the engine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        loop {
+            if self.stream_target(stream_id).target_object.as_deref() == Some(sink_serial) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.roundtrip();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Serials of every live output sink, by `object.serial`.
     ///
     /// `target.object` is a serial, so a serial that no longer belongs to a

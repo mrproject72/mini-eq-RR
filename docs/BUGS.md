@@ -882,3 +882,43 @@ Not verified here: the Output dropdown cannot be driven from the shell (no
 `xdotool`/`wmctrl` on this Wayland session), so the switch itself needs a click
 from the user. The log distinguishes the two paths: "streams not routed; left
 alone" versus "Suspended routing for N stream(s)".
+
+### FIXED 2026-10-05 — the output switch never reached the new device
+
+Follow-up. The user confirmed upstream also hands the stream over to the new
+output on a switch, and that the difference is that in this port **the audio
+stopped entirely** rather than moving across.
+
+The cause was the belief recorded in `retarget_output`:
+
+> The filter chain's destination is fixed at module load
+> (`playback.props.target.object`), and the output client is `node.passive`, so
+> PipeWire ignores a later metadata write — verified: the write reports success
+> and `target.object` does not move. The only way is to rebuild the module.
+
+That is wrong, and the "verified" in it was not: the write *is* honoured.
+`node.passive` is a property of the adapter's node, not of the stream the
+adapter exposes, and the chain's output is an ordinary stream node named
+`mini_eq_sink_output` whose target is ordinary metadata. Upstream moves it live
+(`move_named_output_stream_to_target`) and only falls back to `restart_engine`
+when that raises.
+
+Proven on this machine with a throwaway probe (since removed), which moved the
+stream to the sink it was already on and read the value back:
+
+    PROBE live move mini_eq_sink_output -> alsa_output.pci-0000_04_00.6.analog-stereo:
+    verified=true (target.object Some("69") -> Some("69)", expected "69")
+
+`retarget_output` now follows upstream's order:
+
+1. **Move the chain's output stream live**, and *verify* the move by reading the
+   value back (`move_stream_to_target_checked`, bounded at 300 ms). On success
+   the virtual sink node is never destroyed, the user's streams keep the links
+   they already have — they stay pointed at `mini_eq_sink`, only the chain's
+   destination moves — and no stream is touched at all. That is the whole point
+   of the feature: control a different output device without changing the link.
+2. **Only if that fails**, rebuild the module as before, with the suspend /
+   re-restore / re-route sequence from the previous fix.
+
+The log says which path ran: `EQ output moved live to <sink> (no rebuild)` versus
+`live move ... did not take; rebuilding`.
