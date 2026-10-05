@@ -28,6 +28,10 @@ pub struct PresetPanel {
     pub container: gtk4::Box,
     pub list_box: gtk4::ListBox,
     pub add_button: gtk4::Button,
+    /// Overwrite the selected custom preset with the current EQ. This is the
+    /// action the "add a preset and give it the same name" dance was doing by
+    /// hand.
+    pub update_button: gtk4::Button,
     /// Rename the selected custom preset.
     pub rename_button: gtk4::Button,
     pub remove_button: gtk4::Button,
@@ -84,6 +88,8 @@ impl PresetPanel {
     pub fn new() -> Rc<RefCell<Self>> {
         let add_button = gtk4::Button::from_icon_name("list-add-symbolic");
         add_button.set_tooltip_text(Some("Add a new preset from the current EQ"));
+        let update_button = gtk4::Button::from_icon_name("document-save-symbolic");
+        update_button.set_tooltip_text(Some("Overwrite the selected preset with the current EQ"));
         let remove_button = gtk4::Button::from_icon_name("list-remove-symbolic");
         remove_button.set_tooltip_text(Some("Remove the selected custom preset"));
         let rename_button = gtk4::Button::from_icon_name("document-edit-symbolic");
@@ -111,6 +117,7 @@ impl PresetPanel {
         header.append(&spacer);
 
         header.append(&add_button);
+        header.append(&update_button);
         header.append(&rename_button);
         header.append(&remove_button);
         header.append(&import_button);
@@ -141,6 +148,7 @@ impl PresetPanel {
             container,
             list_box,
             add_button,
+            update_button,
             rename_button,
             remove_button,
             import_button,
@@ -197,6 +205,43 @@ impl PresetPanel {
                 }
                 refresh_preset_list(&list_box);
             });
+        });
+
+        // --- Update: overwrite the selected CUSTOM preset with the live curve.
+        //
+        // Until this existed, changing a filter meant pressing `+` and renaming
+        // the new preset to the existing name -- a rename collision race, and it
+        // left the panel's idea of the saved signature stale. Overwriting in
+        // place is the operation that was actually wanted, and it works whatever
+        // the curve came from: a linked device, a loaded preset, an AutoEq
+        // import.
+        let panel_clone = panel.clone();
+        panel.borrow().update_button.connect_clicked(move |_| {
+            let (name, is_builtin) = {
+                let p = panel_clone.borrow();
+                let Some(row) = p.list_box.selected_row() else {
+                    return;
+                };
+                let Some(name) = row_name(&row) else { return };
+                let is_builtin = is_builtin_preset(&name);
+                (name, is_builtin)
+            };
+            if is_builtin {
+                log::info!("Update preset: '{name}' is a built-in and is not editable");
+                return;
+            }
+            let (bands, preamp) = panel_clone.borrow().live_state();
+            let path = preset_path_for_name(&name);
+            if let Err(e) = save_preset_to_file(&path, &bands, preamp) {
+                log::warn!("Update preset '{name}' failed: {e}");
+                return;
+            }
+            let mut p = panel_clone.borrow_mut();
+            p.current_bands = bands;
+            p.current_preamp_db = preamp;
+            p.saved_signature = Some(p.signature_of_current());
+            p.update_state_chip();
+            log::info!("Updated preset '{name}' from the current EQ");
         });
 
         // --- Rename the selected CUSTOM preset (built-ins are safe).
@@ -495,6 +540,24 @@ impl PresetPanel {
             .unwrap_or_default();
         let current_name = self.current_preset_name.as_deref();
         let saved_sig = self.saved_signature.as_deref();
+
+        // Update is only meaningful when there is a preset to overwrite and the
+        // curve has actually moved away from it. Built-ins stay read-only, as
+        // they do for rename and remove.
+        let can_update = match self.list_box.selected_row() {
+            Some(row) => row_name(&row).is_some_and(|name| {
+                !is_builtin_preset(&name) && saved_sig != Some(signature.as_str())
+            }),
+            None => false,
+        };
+        self.update_button.set_sensitive(can_update);
+        self.update_button.set_tooltip_text(Some(if can_update {
+            "Overwrite the selected preset with the current EQ"
+        } else if self.list_box.selected_row().is_some() {
+            "Nothing to update: the preset already matches the current EQ"
+        } else {
+            "Select a preset to update"
+        }));
 
         if current_name.is_some() && saved_sig == Some(signature.as_str()) {
             self.state_chip.set_text("Saved");

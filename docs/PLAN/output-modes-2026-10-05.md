@@ -192,7 +192,11 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
 
 1. **Update preset** (overwrite) in the preset panel, enabled when the chip says
    `Modified`. Small, independent, and it retires the "+ and rename" workaround
-   immediately.
+   immediately. **Done 2026-10-05** (`update_button` in the preset panel), along
+   with the fix it exposed: the state chip was only refreshed when a preset was
+   loaded or selected, so it kept reading `Saved` while the curve moved away
+   from the preset and anything gated on it would never wake up. The chip is now
+   recomputed from the live signature in the update loop, only when it changes.
 2. **Working follow-default.** Watcher retargets the chain live. Removes the
    "the dropdown does nothing" impression even before the mode is chosen.
 3. **Mode split.** `RoutingEngine` gains a mode (`Selected` / `Reroute`) and the

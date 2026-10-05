@@ -766,6 +766,8 @@ impl MiniEqWindow {
             // gate both -- which is exactly what upstream's `analyzer_frozen`
             // does to `on_analyzer_levels` / `on_analyzer_loudness`.
             let app_for_exit = app.clone();
+            let last_state_signature: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            let presets_for_chip = utility.presets.clone();
             let monitor_frozen = utility.monitor.frozen.clone();
             let monitor_display_gain = utility.monitor.display_gain_scale.clone();
             // Debounce state: only reload the filter-chain when the effective
@@ -984,6 +986,24 @@ impl MiniEqWindow {
                     }
                 }
                 let preamp_db = headroom.borrow().preamp_value();
+
+                // Keep the preset panel's state chip honest while editing.
+                //
+                // It was only refreshed when a preset was loaded or selected, so
+                // it kept reading "Saved" while the curve moved away from the
+                // preset -- and anything gated on that chip (the Update action)
+                // would never wake up. Recomputed only when the signature
+                // actually changes, so the cost is one payload hash per edit.
+                {
+                    let signature = crate::core::preset_payload_state_signature(
+                        &crate::core::preset_payload(&bands, preamp_db),
+                    );
+                    if *last_state_signature.borrow() != signature {
+                        *last_state_signature.borrow_mut() = signature;
+                        presets_for_chip.borrow_mut().update_state_chip();
+                    }
+                }
+
                 {
                     let mut g = graph.borrow_mut();
                     // Feed the live spectrum from the output monitor (empty when
