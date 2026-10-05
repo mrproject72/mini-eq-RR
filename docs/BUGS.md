@@ -639,3 +639,40 @@ compaction added to solve the output-row wrap:
    (curve peak over 0.5 dB with Auto-Safe off). Two different questions, so the
    button could be red and still, or blink while grey. The blink now reads the
    button's own red class: red means red-and-blinking.
+
+### FIXED 2026-10-05 — the output stopped when the app exited
+
+User report: *"when the app exit it stops the output."*
+
+Two defects, both on the way out:
+
+1. **`kill` skipped the cleanup entirely.** The restore lived only on
+   `Application::shutdown` and the window's `close-request`, so a clean quit
+   worked. But `kill`, `pkill` and the session manager stopping a user unit all
+   send SIGTERM, whose default action is to terminate the process on the spot —
+   no shutdown signal, no restore. The stream targets then outlive the virtual
+   sink they name. `src/exit_guard.rs` catches SIGTERM/SIGINT and records the
+   request in an atomic; the 33 ms update loop, the only place that can leave
+   GTK properly, turns it into an ordinary quit so the existing restore runs.
+   The handler does nothing but the atomic store, which is all a signal handler
+   may do here: the backend is `Rc`-based and main-thread-only.
+2. **The restore only cleared the targets.** `unroute_all` set
+   `target.node`/`target.object` to nothing and left the choice of destination
+   to WirePlumber. That works for a stream that is playing, but it leaves the
+   decision to session-manager policy: a stream idle at shutdown, or one whose
+   player has not opened its output yet, can come back with nothing to play
+   through once the sink is gone. `unroute_all_to` names the destination — the
+   sink the EQ was feeding, falling back to the system default — so the metadata
+   says exactly where to go and nothing has to notice that a node disappeared.
+
+Verified on both paths with a real routed stream (Waterfox and
+speech-dispatcher, playing through `Mini-EQ-Sink`):
+
+- `kill -TERM` — before: process gone, no restore, recovery left to
+  WirePlumber. After: "termination signal received: shutting down cleanly",
+  both streams restored to `alsa_output.pci-0000_04_00.6.analog-stereo`.
+- D-Bus `Quit` — same explicit restore, both streams back on the ALC897
+  hardware.
+
+SIGKILL still cannot be caught; there WirePlumber's own "target node vanished"
+fallback is all that is left.

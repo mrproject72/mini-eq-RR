@@ -1489,6 +1489,7 @@ dependencies = [
  "glib 0.22.9",
  "gtk4",
  "libadwaita",
+ "libc",
  "log",
  "nix",
  "num-complex",

@@ -669,6 +669,34 @@ impl PipeWireBackend {
         self.routing.unroute_all()
     }
 
+    /// Hand playback streams back to a real output, on the way out.
+    ///
+    /// The destination is the sink this filter chain was feeding, so the audio
+    /// lands where it did before the EQ was routed. If that sink is gone, fall
+    /// back to whatever the system default is at this instant, and only then to
+    /// clearing the targets.
+    ///
+    /// This runs on every exit path, including SIGTERM, because the symptom it
+    /// prevents is the worst one this app can cause: silence after the user
+    /// closes it.
+    pub fn restore_routing_on_exit(&mut self, chain_output: Option<&str>) -> Result<(), Error> {
+        let candidates: Vec<String> = chain_output
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default()
+            .into_iter()
+            .chain(self.default_output_sink())
+            .collect();
+        for sink in candidates {
+            if sink.is_empty() || sink.contains(crate::core::VIRTUAL_SINK_BASE) {
+                continue;
+            }
+            info!("exit: restoring playback streams to {sink}");
+            return self.routing.unroute_all_to(&sink);
+        }
+        warn!("exit: no real output sink to restore to; clearing routing targets");
+        self.routing.unroute_all()
+    }
+
     /// Update the DSP graph for a new set of bands.
     ///
     /// The native filter-chain computes coefficients at the DSP clock rate, so

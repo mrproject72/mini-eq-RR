@@ -234,6 +234,10 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
     if !engine_sink.is_empty() {
         *app_state.output_sink.lock().unwrap() = Some(engine_sink.clone());
     }
+    // Catch SIGTERM/SIGINT so a `kill` or a session-manager stop still runs the
+    // routing restore. The update loop turns the flag into a clean quit.
+    mini_eq_rr::exit_guard::install_signal_handlers();
+
     let dbus_control = MiniEqDBusControl::new(app_state.clone());
     if let Err(e) = dbus_control.register() {
         log::warn!("Failed to register D-Bus control: {}", e);
@@ -275,16 +279,23 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
     // Idempotent with the window handler, so running both is harmless.
     {
         let backend_shutdown = shared_backend.clone();
-        app.connect_shutdown(move |_app| {
+        let sink_shutdown = engine_sink.clone();
+        let restore = move |why: &str| {
+            let sink = sink_shutdown.clone();
             if let Some(be) = backend_shutdown.borrow_mut().as_mut() {
-                log::info!("app shutdown: releasing playback streams from the EQ");
-                if let Err(e) = be.unroute_all() {
-                    log::warn!("app shutdown: unroute failed: {}", e);
+                log::info!("{why}: handing playback streams back to the real output");
+                if let Err(e) = be.restore_routing_on_exit(Some(&sink)) {
+                    log::warn!("{why}: routing restore failed: {e}");
                 }
                 if be.monitor_enabled() {
                     be.stop_monitor();
                 }
             }
+        };
+
+        app.connect_shutdown({
+            let restore = restore.clone();
+            move |_app| restore("app shutdown")
         });
     }
 

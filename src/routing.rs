@@ -329,6 +329,48 @@ impl RoutingEngine {
         Ok(())
     }
 
+    /// Hand every playback stream back to a NAMED sink, explicitly.
+    ///
+    /// `unroute_all` only clears `target.node`/`target.object` and relies on
+    /// WirePlumber to pick the default. That works while the stream is
+    /// actively playing, but it leaves the decision to session-manager policy:
+    /// a stream that is idle at shutdown, or one whose player has not yet
+    /// opened its output, can come back with nothing to play through once the
+    /// virtual sink is gone -- "the output stops when I close the app".
+    ///
+    /// Naming the destination makes it deterministic: the metadata says exactly
+    /// where to go, so nothing has to notice that a node disappeared. Falls
+    /// back to clearing when the sink cannot be found, which is what
+    /// `unroute_all` already does.
+    pub fn unroute_all_to(&mut self, sink_name: &str) -> Result<(), Error> {
+        info!("Restoring playback streams to {sink_name}");
+
+        let target = match self.find_node_target(sink_name) {
+            Some(t) => t,
+            None => {
+                warn!("Restore sink {sink_name} not found; falling back to clearing targets");
+                return self.unroute_all();
+            }
+        };
+
+        let streams = self.list_playback_streams();
+        let mut moved = 0usize;
+        for (node_id, name) in &streams {
+            if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
+                continue;
+            }
+            match self.set_stream_target(*node_id, target.0, &target.1) {
+                Ok(()) => {
+                    info!("Restored '{name}' ({node_id}) -> {sink_name}");
+                    moved += 1;
+                }
+                Err(e) => warn!("Failed to restore '{name}' ({node_id}): {e}"),
+            }
+        }
+        info!("Restore complete: {moved} stream(s) -> {sink_name}");
+        Ok(())
+    }
+
     /// Set a stream's routing target via the `default` metadata so
     /// WirePlumber moves it. Mirrors upstream `set_stream_target`:
     /// `target.node` = sink bound_id, `target.object` = sink object.serial,

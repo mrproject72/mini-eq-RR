@@ -728,6 +728,7 @@ impl MiniEqWindow {
             // loudness readout lives in the monitor strip, so freezing has to
             // gate both -- which is exactly what upstream's `analyzer_frozen`
             // does to `on_analyzer_levels` / `on_analyzer_loudness`.
+            let app_for_exit = app.clone();
             let monitor_frozen = utility.monitor.frozen.clone();
             let monitor_display_gain = utility.monitor.display_gain_scale.clone();
             // Debounce state: only reload the filter-chain when the effective
@@ -881,6 +882,17 @@ impl MiniEqWindow {
                 // the graph spectrum stands still. Upstream gates the same way
                 // (`analyzer_frozen` in `on_analyzer_levels_idle`).
                 let frozen = monitor_frozen_tick.get();
+                // A caught SIGTERM/SIGINT becomes a clean quit here, because
+                // this is the only place that can leave GTK properly -- and the
+                // clean quit is what runs the routing restore. Without it a
+                // `kill` takes the virtual sink down with the app still holding
+                // the streams, and every player goes silent.
+                if crate::exit_guard::take_terminate_request() {
+                    log::warn!("termination signal received: shutting down cleanly");
+                    app_for_exit.quit();
+                    return ControlFlow::Break;
+                }
+
                 let levels = if frozen {
                     held_levels.borrow().clone()
                 } else {
@@ -1323,14 +1335,19 @@ impl MiniEqWindow {
         // "audio stops when I close the app" bug.
         {
             let backend_close = backend.clone();
+            let engine_sink_close = engine_sink.clone();
             window.connect_close_request(move |_win| {
                 log::info!("shutdown: close-request received, unrouting before teardown");
                 if let Some(be) = backend_close.borrow_mut().as_mut() {
-                    // Unroute first so streams are handed back to the real
-                    // default output while the metadata object is still
-                    // alive, then drop the monitor.
-                    if let Err(e) = be.unroute_all() {
-                        log::warn!("shutdown: unroute failed: {}", e);
+                    // Hand the streams back to the sink the EQ was feeding while
+                    // the metadata object is still alive, then drop the monitor.
+                    // Naming the destination rather than only clearing the
+                    // target: clearing leaves it to session-manager policy, and a
+                    // stream that is idle at shutdown can come back with nothing
+                    // to play through once the virtual sink is gone.
+                    let chain_output = engine_sink_close.borrow().clone();
+                    if let Err(e) = be.restore_routing_on_exit(Some(&chain_output)) {
+                        log::warn!("shutdown: routing restore failed: {}", e);
                     }
                     if be.monitor_enabled() {
                         be.stop_monitor();

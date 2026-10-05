@@ -13,6 +13,7 @@ pub mod core;
 pub mod dbus_control;
 pub mod desktop_integration;
 pub mod ebur128;
+pub mod exit_guard;
 pub mod filter_chain;
 pub mod instance;
 pub mod pipewire_backend;

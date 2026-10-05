@@ -11,6 +11,7 @@ readme = "README.md"
 repository = "https://github.com/mrproject72/mini-eq-RR"
 
 [dependencies]
+libc = "0.2"
 # PipeWire
 pipewire = "0.10.1"
 pipewire-sys = "0.10.1"
