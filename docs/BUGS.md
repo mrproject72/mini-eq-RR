@@ -769,3 +769,45 @@ that already has a *foreign* target (`_has_foreign_target_object`), so it never
 hijacks an app the user deliberately pointed at another device. The port routes
 everything and now restores it faithfully afterwards, so the end state is
 correct, but such a stream does pass through the EQ in between.
+
+### FIXED 2026-10-05 — the EQ hijacked every stream, including the user's deliberate choices
+
+Follow-up to the restore fidelity work. Upstream's router filters the streams
+it is allowed to touch; the port filtered almost nothing, so "turn on the system
+EQ" reached into streams it had no business touching.
+
+Now ported verbatim from `pipewire_stream_router.py`:
+
+| Upstream | Port |
+|---|---|
+| `_is_internal_stream`: our client, the chain's own output, `media.role` in `{event, Notification}`, and `BLOCKLIST_STREAM_NAMES` (`GNOME Shell`, `Mutter`, `gsd-media-keys`, `libcanberra`, `speech-dispatcher*`) by `node.name`/`application.name` | same, from `core.rs` |
+| `_has_foreign_target_object`: skip a stream already pointed at another device | same |
+| `move_stream_to_target` raises on `node.dont-move` | counted, logged and skipped |
+| reads `node.name`, `application.name`, `media.role`, `node.dont-move` per stream | `list_stream_nodes` now collects all four (`StreamNode`) |
+
+The restore path uses the same filter, so a stream we refuse to route is not
+written to on the way out either — sending it to the fallback sink would be the
+same disruption.
+
+Two defects found while verifying this, both of which had been silently breaking
+routing:
+
+- **`stream_target` had its value and type swapped.** The cache stores
+  `(type, value)` and the accessor unpacked it the other way round, so every
+  stream's target read back as the literal string `"Spa:Id"`. That made all
+  streams look foreign-target, so after adding the filter *nothing* was routed —
+  and the "faithful restore" added earlier had been writing the type into the
+  value slot. Caught by the new `MINI_EQ_DEBUG_ROUTING` dump, which prints each
+  stream's properties and the verdict.
+- **A stale `target.object` from a previous instance blocked routing forever.**
+  The serial named a sink that no longer exists. Upstream has the same hole (it
+  compares against the live virtual sink only), but upstream never leaves stale
+  values behind because its restore is faithful. Treated as "no explicit
+  target" here, since a serial with no live sink cannot be a deliberate choice.
+
+Verified end to end: routing on moves Waterfox and fooyin through the EQ and
+leaves `speech-dispatcher-dummy` on the ALC897 hardware — previously all three
+were taken. Routing off restores both to their own recorded targets and reports
+`nothing is pointed at the EQ` for the duplicate call.
+
+`MINI_EQ_DEBUG_ROUTING=1` prints the filter's inputs and verdicts per stream.

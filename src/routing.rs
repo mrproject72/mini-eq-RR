@@ -84,6 +84,23 @@ pub struct StreamInfo {
     pub active: bool,
 }
 
+/// One playback stream, with the properties upstream's router filter on.
+///
+/// Upstream reads `node.name`, `application.name`, `media.role` and
+/// `node.dont-move` for every stream (`PipeWireNode` +
+/// `iter_routable_output_streams`). The port used to collect only `node.name`,
+/// which is why it could not tell a desktop sound from programme material.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreamNode {
+    pub id: u32,
+    pub node_name: String,
+    pub app_name: String,
+    pub media_role: String,
+    /// `node.dont-move`: upstream refuses to route these
+    /// (`move_stream_to_target` raises on it).
+    pub dont_move: bool,
+}
+
 pub struct RoutingEngine {
     core: CoreRc,
     mainloop: MainLoopRc,
@@ -308,6 +325,171 @@ impl RoutingEngine {
         self.current_sink.as_deref()
     }
 
+    /// True when the stream is ours or must never be touched.
+    ///
+    /// Upstream `_is_internal_stream`: our own client, the filter chain's own
+    /// output, UI/event sounds by `media.role`, and the desktop/speech
+    /// applications it blocklists by name.
+    fn is_internal_stream(&self, stream: &StreamNode) -> bool {
+        if stream.app_name == OUTPUT_CLIENT_NAME {
+            return true;
+        }
+        if crate::core::BLOCKLIST_MEDIA_ROLES.contains(&stream.media_role.as_str()) {
+            return true;
+        }
+        if crate::core::BLOCKLIST_STREAM_NAMES.contains(&stream.node_name.as_str())
+            || crate::core::BLOCKLIST_STREAM_NAMES.contains(&stream.app_name.as_str())
+        {
+            return true;
+        }
+        let internal_output = format!("{}{}", VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX);
+        if stream.node_name == internal_output {
+            return true;
+        }
+        stream.node_name.starts_with(VIRTUAL_SINK_BASE)
+            || stream
+                .node_name
+                .starts_with(&format!("{}.", self.virtual_sink_name))
+    }
+
+    /// The `target.object` values that belong to our own signal path: the
+    /// virtual sink, the chain's output, and the real output sink we feed.
+    ///
+    /// Upstream `_target_object_matches_processing_path`. A stream whose
+    /// `target.object` is anything else was deliberately pointed at another
+    /// device -- by the user in pavucontrol, or by the app itself -- and
+    /// hijacking it is exactly the "disrupt the user's audio" case.
+    fn processing_path_targets(&self) -> Vec<String> {
+        // What a stream may legitimately be pointed at while it is under our
+        // control: our virtual sink, the chain's own output node, the real sink
+        // the EQ feeds -- and, crucially, whatever we last routed to, since
+        // that is the serial actually sitting in the streams' `target.object`.
+        //
+        // The last-routed serial is not optional bookkeeping. Resolving the
+        // virtual sink by name is not enough: if that lookup fails for any
+        // reason, every stream we routed looks like it has a "foreign" target,
+        // and then the restore skips them and they are left pointing at a sink
+        // that is about to disappear. That is the silent-app bug again.
+        let mut allowed: Vec<String> = self
+            .last_route_target
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, serial)| serial.clone())
+            .into_iter()
+            .collect();
+
+        let mut names = vec![
+            VIRTUAL_SINK_BASE.to_string(),
+            self.virtual_sink_name.clone(),
+            format!("{}{}", VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX),
+        ];
+        if let Some(sink) = self.default_audio_sink.borrow().clone() {
+            names.push(sink);
+        }
+        for name in names {
+            allowed.push(name.clone());
+            // The node's `object.serial` is what lands in `target.object`; the
+            // node name is accepted too because both forms appear in the wild.
+            if let Some((_, serial)) = self.find_node_target(&name) {
+                allowed.push(serial);
+            }
+        }
+        allowed
+    }
+
+    /// Streams we may route: not ours, not blocklisted, and not already
+    /// pointed at a device the user chose.
+    ///
+    /// Upstream `iter_routable_output_streams`.
+    /// Serials of every live output sink, by `object.serial`.
+    ///
+    /// `target.object` is a serial, so a serial that no longer belongs to a
+    /// live sink is a target left over from a previous run of this app. Such a
+    /// value is treated as "no explicit target" rather than as a deliberate
+    /// choice: the sink it names is gone, so honouring it would leave the
+    /// stream unrouted forever.
+    fn live_sink_serials(&self) -> Vec<String> {
+        let registry = match self.core.get_registry() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let found = Arc::new(Mutex::new(Vec::new()));
+        let found_clone = found.clone();
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ == ObjectType::Node
+                    && let Some(props) = &global.props
+                    && props.get("media.class").unwrap_or("") == "Audio/Sink"
+                    && let Some(serial) = props.get("object.serial")
+                {
+                    found_clone.lock().unwrap().push(serial.to_string());
+                }
+            })
+            .register();
+        let _ = self.roundtrip();
+        found.lock().unwrap().clone()
+    }
+
+    pub fn routable_output_streams(&self) -> Vec<StreamNode> {
+        let allowed = self.processing_path_targets();
+        let live_serials = self.live_sink_serials();
+        if std::env::var("MINI_EQ_DEBUG_ROUTING").is_ok() {
+            info!("routable filter: allowed targets = {allowed:?}");
+            for s in self.list_stream_nodes() {
+                let t = self.stream_target(s.id);
+                info!(
+                    "  stream {} name={:?} app={:?} role={:?} dont_move={} target={:?} internal={} => {}",
+                    s.id,
+                    s.node_name,
+                    s.app_name,
+                    s.media_role,
+                    s.dont_move,
+                    t.target_object,
+                    self.is_internal_stream(&s),
+                    if self.is_internal_stream(&s) {
+                        "skip (internal)"
+                    } else {
+                        match t.target_object.as_deref() {
+                            Some(x)
+                                if !x.is_empty()
+                                    && !allowed.iter().any(|a| a == x)
+                                    && live_serials.iter().any(|serial| serial == x) =>
+                            {
+                                "skip (foreign target)"
+                            }
+                            Some(x) if !x.is_empty() && !allowed.iter().any(|a| a == x) => {
+                                "ROUTABLE (stale target, sink gone)"
+                            }
+                            _ => "ROUTABLE",
+                        }
+                    }
+                );
+            }
+        }
+        self.list_stream_nodes()
+            .into_iter()
+            .filter(|s| !self.is_internal_stream(s))
+            .filter(|s| {
+                // No explicit target is fine: WirePlumber is choosing the
+                // default, which is what we want to override. An explicit
+                // foreign target is not.
+                match self.stream_target(s.id).target_object.as_deref() {
+                    Some(target) if !target.is_empty() => {
+                        allowed.iter().any(|a| a == target)
+                            // Stale serial from a previous instance: the sink it
+                            // names does not exist, so it is not a deliberate
+                            // choice and must not keep the stream out of the
+                            // EQ forever.
+                            || !live_serials.iter().any(|serial| serial == target)
+                    }
+                    _ => true,
+                }
+            })
+            .collect()
+    }
+
     pub fn auto_route_to_sink(&mut self, sink_name: &str) -> Result<(), Error> {
         info!("Auto-routing all playback streams to sink: {}", sink_name);
 
@@ -322,10 +504,17 @@ impl RoutingEngine {
             }
         };
 
-        let streams = self.list_playback_streams();
+        let streams = self.routable_output_streams();
         let mut routed = 0usize;
-        for (node_id, name) in &streams {
-            if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
+        let mut skipped_dont_move = 0usize;
+        for node in &streams {
+            let node_id = &node.id;
+            let name = &node.node_name;
+            // `node.dont-move` is the stream owner's own instruction not to
+            // move it. Upstream raises on it; here it is counted and left alone.
+            if node.dont_move {
+                debug!("not routing '{name}' ({node_id}): node.dont-move");
+                skipped_dont_move += 1;
                 continue;
             }
             // Remember where this stream pointed BEFORE we move it, exactly as
@@ -355,6 +544,9 @@ impl RoutingEngine {
         self.set_current_sink(sink_name);
         self.auto_route = true;
 
+        if skipped_dont_move > 0 {
+            info!("Left {} stream(s) alone: node.dont-move", skipped_dont_move);
+        }
         info!(
             "Auto-routing complete: {} stream(s) -> {}",
             routed, sink_name
@@ -381,7 +573,7 @@ impl RoutingEngine {
     /// re-resolves the stream's target from scratch, and the silence while it
     /// does is what made toggling the switch audibly disruptive.
     pub fn unroute_all(&mut self, fallback_sink: Option<&str>) -> Result<(), Error> {
-        let streams = self.list_playback_streams();
+        let streams = self.routable_output_streams();
 
         // Is anything still pointed at the EQ? Read it from the streams'
         // targets rather than assuming, so a second call -- the UI switch and
@@ -389,8 +581,8 @@ impl RoutingEngine {
         // no-op instead of a second round of writes on the way out.
         let route_target = self.last_route_target.lock().unwrap().clone();
         let still_on_eq = route_target.as_ref().is_some_and(|(_, serial)| {
-            streams.iter().any(|(id, _)| {
-                self.stream_target(*id).target_object.as_deref() == Some(serial.as_str())
+            streams.iter().any(|node| {
+                self.stream_target(node.id).target_object.as_deref() == Some(serial.as_str())
             })
         });
         let recorded_empty = self.routed_targets.lock().unwrap().is_empty();
@@ -406,10 +598,8 @@ impl RoutingEngine {
         let mut restored = 0usize;
         {
             self.ensure_default_metadata()?;
-            for (node_id, name) in &streams {
-                if name.contains(VIRTUAL_SINK_BASE) || name.contains(OUTPUT_CLIENT_NAME) {
-                    continue;
-                }
+            for node in &streams {
+                let (node_id, name) = (&node.id, &node.node_name);
                 if let Some(target) = recorded.get(node_id) {
                     self.restore_stream_target(*node_id, target)?;
                     restored_ids.insert(*node_id);
@@ -422,17 +612,19 @@ impl RoutingEngine {
             self.roundtrip()?;
         }
 
-        // Everything else: nothing was recorded, so we do not know where it
-        // came from. Fall back to the sink the EQ was feeding, then to
-        // clearing the target.
+        // Everything else we could legitimately have routed: nothing was
+        // recorded, so we do not know where it came from. Fall back to the sink
+        // the EQ was feeding, then to clearing the target.
+        //
+        // Built from `routable_output_streams()` deliberately: a stream we
+        // refuse to route (a blocklisted desktop or speech app, or one the user
+        // pointed at another device) must not be written to on the way out
+        // either -- sending it to the fallback would be exactly the disruption
+        // the routability filter just stopped us causing.
         let leftovers: Vec<(u32, String)> = streams
             .iter()
-            .filter(|(node_id, name)| {
-                !name.contains(VIRTUAL_SINK_BASE)
-                    && !name.contains(OUTPUT_CLIENT_NAME)
-                    && !restored_ids.contains(node_id)
-            })
-            .cloned()
+            .filter(|node| !restored_ids.contains(&node.id))
+            .map(|node| (node.id, node.node_name.clone()))
             .collect();
         let mut moved = 0usize;
         if !leftovers.is_empty() {
@@ -512,14 +704,18 @@ impl RoutingEngine {
     /// normal case -- WirePlumber picks the default for those.
     pub fn stream_target(&self, stream_id: u32) -> StreamTarget {
         let cache = self.target_cache.lock().unwrap();
+        // The cache stores `(type, value)`; the fields are value-and-type.
+        // Getting this backwards makes every stream look like it is pointed at
+        // the literal string "Spa:Id", so the foreign-target check rejects
+        // everything and nothing is ever routed.
         let get = |key: &str| {
             cache
                 .get(&(stream_id, key.to_string()))
                 .cloned()
                 .unwrap_or((None, None))
         };
-        let (target_node, target_node_type) = get("target.node");
-        let (target_object, target_object_type) = get("target.object");
+        let (target_node_type, target_node) = get("target.node");
+        let (target_object_type, target_object) = get("target.object");
         StreamTarget {
             target_node,
             target_node_type,
@@ -837,6 +1033,14 @@ impl RoutingEngine {
 
     /// List app playback stream nodes (`media.class = Stream/Output/Audio`).
     pub fn list_playback_streams(&self) -> Vec<(u32, String)> {
+        self.list_stream_nodes()
+            .into_iter()
+            .map(|n| (n.id, n.node_name))
+            .collect()
+    }
+
+    /// Every playback stream, with the properties the routability filter needs.
+    pub fn list_stream_nodes(&self) -> Vec<StreamNode> {
         let registry = match self.core.get_registry() {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -850,10 +1054,17 @@ impl RoutingEngine {
                     && let Some(props) = &global.props
                     && props.get("media.class").unwrap_or("") == "Stream/Output/Audio"
                 {
-                    found_clone.lock().unwrap().push((
-                        global.id,
-                        props.get("node.name").unwrap_or("unknown").to_string(),
-                    ));
+                    found_clone.lock().unwrap().push(StreamNode {
+                        id: global.id,
+                        node_name: props.get("node.name").unwrap_or("unknown").to_string(),
+                        app_name: props
+                            .get("application.name")
+                            .or_else(|| props.get("node.name"))
+                            .unwrap_or("")
+                            .to_string(),
+                        media_role: props.get("media.role").unwrap_or("").to_string(),
+                        dont_move: props.get("node.dont-move").unwrap_or("") == "true",
+                    });
                 }
             })
             .register();

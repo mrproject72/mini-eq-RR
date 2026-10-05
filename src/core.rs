@@ -27,6 +27,31 @@ pub const VIRTUAL_SINK_BASE: &str = "mini_eq_sink";
 pub const VIRTUAL_SINK_DESCRIPTION: &str = "Mini-EQ-Sink";
 pub const FILTER_OUTPUT_SUFFIX: &str = "_output";
 
+/// Stream media roles that must never be routed through the EQ.
+///
+/// UI sounds and notifications are not programme material: pushing them through
+/// a filter chain adds its latency to every click and alert, and upstream
+/// excludes them by role (`BLOCKLIST_MEDIA_ROLES`,
+/// `pipewire_stream_router.py`).
+pub const BLOCKLIST_MEDIA_ROLES: [&str; 2] = ["event", "Notification"];
+
+/// Applications that must never be routed through the EQ, by `node.name` or
+/// `application.name`.
+///
+/// Desktop shell, media-key handling, the accessibility bus and speech
+/// dispatch all own sounds that must stay on the real device and must not be
+/// able to be silenced by this app misbehaving. Verbatim from upstream
+/// (`BLOCKLIST_STREAM_NAMES`).
+pub const BLOCKLIST_STREAM_NAMES: [&str; 7] = [
+    "GNOME Shell",
+    "Mutter",
+    "gsd-media-keys",
+    "libcanberra",
+    "speech-dispatcher",
+    "speech-dispatcher-dummy",
+    "speech-dispatcher-espeak-ng",
+];
+
 // ── Band Configuration ───────────────────────────────────────────────────────
 
 pub const MAX_BANDS: usize = 32;
