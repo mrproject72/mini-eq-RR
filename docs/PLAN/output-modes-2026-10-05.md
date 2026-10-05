@@ -74,22 +74,63 @@ filter (internal/blocklisted/foreign/dont-move) and nothing else.
 - Hotplug keeps the selection by device name (already done in
   `refresh_output_sinks`).
 
-## Per-device curves
+## Curves: presets are the storage, the link is only a name
 
-Replaces "Link to Output", whose name and behaviour were both wrong.
+Correction to an earlier draft of this plan, from the user: a "Save curve for
+<device>" action is redundant. Presets already exist and already store curves,
+and a device's curve changing is the normal case, not something to be saved.
+So there is no second storage concept here — only a mapping from device to
+preset name, plus the two behaviours that were missing around it.
 
-- **"Save curve for \<device\>"** writes the current curve to that device's link
-  in `output-presets.json` (`set_output_preset_link`, keyed by
-  `output_preset_key_for_sink`).
-- **Auto-load on switch** already exists (`apply_output_preset_for_sink`).
-- **Status per device**, using upstream's vocabulary from
-  `OUTPUT_PRESET_STATUS_LABELS`: `Applied` / `Different` / `Linked` /
-  `Missing` / `Modified`. The two value labels in the current row are dead --
-  written only by their own click handler -- so this also fixes what the user
-  can actually see.
-- Optional **auto-save on switch** preference, off by default: saving without
-  being asked is how a curve gets lost.
-- Keep **Set Fallback** as the single global default for devices with no link.
+### Automatic, no save step
+
+- A device with a linked preset **loads it when you select that device**
+  (`apply_output_preset_for_sink`, already implemented).
+- **Edits are written back automatically.** While the selected device has a link,
+  changing the curve updates that preset by itself — debounced, not per edit.
+  Nothing to press, and the device's curve is simply whatever you last had, which
+  is what was asked for.
+- **Guard:** only when the linked preset belongs to exactly one device. A preset
+  linked from several devices is a starting point the user may want to keep, and
+  silently overwriting it from one device would be its own surprise. In that case
+  the chip says `Modified` and the user chooses.
+
+### Update preset: the missing primitive
+
+The workaround for updating a filter is: press `+`, then rename the new preset to
+the same name as the existing one. That is a hack caused by a missing overwrite
+action, and it belongs to the preset panel rather than to this mode work.
+
+- Add an **Update** action next to `+`: write the current curve into the selected
+  preset. Enabled exactly when the state chip reads `Modified`.
+- It works whatever the curve came from — a linked device, a loaded preset, an
+  AutoEq import — so the "+ and rename" dance has a one-click replacement.
+- Small and independent. Worth doing before or alongside the mode split rather
+  than after it.
+
+### Status
+
+Reuse the preset panel's existing state chip (`Saved` / `Modified` / `Neutral` /
+`Unsaved`, `window_presets.rs`) rather than inventing a second status vocabulary
+in the Output page. Upstream's `Applied / Different / Linked / Missing /
+Modified` is the same idea in a different place; one source of truth is better
+than two that can disagree.
+
+### Keeping "Link to Output"
+
+The link still has a job — it says *which* preset a device uses — but it should
+not read as a save. Renamed to a preset picker plus an unlink:
+
+```
+Curve            [ <preset> ▾ ]  [unlink, when linked]
+```
+
+Choosing a preset in that dropdown links it to the current device immediately.
+That replaces both dead value labels (`fallback_label`, `link_label` are written
+only by their own click handlers, so they always read `None`) and the row that
+currently says "Link to Output" twice.
+
+**Set Fallback** stays as it is: one global preset for devices with no link.
 
 Migration: the live config holds `{"links": {"default": "preset_1"}}` from the
 old button. On first read, treat a `default` key as the fallback only, never as a
@@ -113,7 +154,7 @@ Today the monitor follows the chain's output (`resolve_monitor_target` →
 ```
 Output mode      [ Selected output ] [ All outputs ]
 Device           [ Default Output (follow system) ▾ ]
-Curve            <preset name>   [Save for this device]   status: Applied
+Curve            [ <preset> ▾ ]   [unlink]     chip: Saved / Modified
 Monitor          [ Follow EQ output ▾ ]
 ```
 
@@ -143,14 +184,17 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
 
 ## Sequencing
 
-1. **Mode split.** `RoutingEngine` gains a mode and the scope predicate;
-   `auto_route_to_sink` takes the scope. Replace the switch with the two buttons.
+1. **Update preset** (overwrite) in the preset panel, enabled when the chip says
+   `Modified`. Small, independent, and it retires the "+ and rename" workaround
+   immediately.
 2. **Working follow-default.** Watcher retargets the chain live. Removes the
    "the dropdown does nothing" impression even before the mode is chosen.
-3. **Per-device curves.** Save button, status labels, de-duplicate the row text,
-   drop the dead labels.
-4. **Monitor device.**
-5. Only then reconsider anything about per-app control (see below).
+3. **Mode split.** `RoutingEngine` gains a mode and the scope predicate;
+   `auto_route_to_sink` takes the scope. Replace the switch with the two buttons.
+4. **Curves.** Preset picker + unlink in place of "Link to Output", and debounced
+   auto-write-back into a singly-linked preset.
+5. **Monitor device.**
+6. Only then reconsider anything about per-app control (see below).
 
 ## Explicitly out of scope
 
@@ -174,8 +218,11 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
 - Mode round trip: All outputs routes a stream that Selected leaves alone.
 - Follow-default: a default-sink change moves the chain without a rebuild (assert
   the live path, not the log line).
-- Curve status: Applied / Modified / Missing per device; save writes the key the
-  reader will use.
+- Update overwrites the selected preset and the chip returns to `Saved`.
+- Auto-write-back writes into a singly-linked preset, and does **not** write into
+  one linked from two devices (the chip stays `Modified` instead).
+- The preset picker links a device to the preset the reader will use on the next
+  switch, and unlink removes it.
 
 ## Open questions
 
@@ -187,3 +234,11 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
   the config), with the status line making it obvious.
 - Does the monitor device need to survive a chain rebuild? Recommend yes, with
   `Follow EQ output` re-resolving after it.
+- Auto-write-back debounce: recommend ~1.5 s after the last edit, so a drag does
+  not rewrite the file continuously while the chain is reloading anyway.
+- Should a preset be protectable from auto-write-back (a "lock" that forces the
+  explicit Update path)? Cheap to add and it removes the last reason to be
+  nervous about the automatic behaviour. Recommend yes, defaulting to unlocked.
+- What happens when a device's linked preset is deleted? Recommend the chip shows
+  `Missing`, the link is dropped, and the curve stays as it is rather than
+  silently reverting.
