@@ -4,6 +4,7 @@ runtime-version: "50"
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm21
 command: mini-eq-rr
 finish-args:
   - --socket=fallback-x11
@@ -128,10 +129,11 @@ modules:
   - name: mini-eq-rr
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
       env:
         CARGO_HOME: /run/build/mini-eq-rr/cargo
         CARGO_NET_OFFLINE: "true"
+        LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
     build-commands:
       - mkdir -p .cargo && cp cargo/config .cargo/config.toml
       - cargo build --release --offline --frozen
