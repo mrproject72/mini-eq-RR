@@ -46,6 +46,11 @@ jobs:
         run: cargo test --lib
       - name: Build
         run: cargo build --release
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-eq-rr-linux-x86_64
+          path: target/release/mini-eq-rr
   flatpak:
     runs-on: ubuntu-24.04
     container:
@@ -58,3 +63,10 @@ jobs:
           cargo vendor vendor > .cargo-config
           mkdir -p .cargo && mv .cargo-config .cargo/config.toml
           flatpak-builder --force-clean --repo=repo build-dir io.github.mrproject72.mini_eq_rr.yml
+      - name: Create flatpak bundle
+        run: flatpak build-bundle repo mini-eq-rr.flatpak io.github.mrproject72.mini_eq_rr
+      - name: Upload flatpak bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-eq-rr-flatpak
+          path: mini-eq-rr.flatpak
