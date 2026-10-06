@@ -130,8 +130,6 @@ modules:
   - name: mini-eq-rr
     buildsystem: simple
     build-commands:
-      - cargo vendor vendor > .cargo-config
-      - mkdir -p .cargo && mv .cargo-config .cargo/config.toml
       - cargo build --release --offline --frozen
       - install -Dm755 target/release/mini-eq-rr ${FLATPAK_DEST}/bin/mini-eq-rr
       - install -Dm644 assets/metainfo/io.github.mrproject72.mini_eq_rr.metainfo.xml -t ${FLATPAK_DEST}/share/metainfo
