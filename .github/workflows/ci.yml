@@ -46,3 +46,15 @@ jobs:
         run: cargo test --lib
       - name: Build
         run: cargo build --release
+  flatpak:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-builder:gnome-47
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the flatpak
+        run: |
+          cargo vendor vendor > .cargo-config
+          mkdir -p .cargo && mv .cargo-config .cargo/config.toml
+          flatpak-builder --force-clean --repo=repo build-dir io.github.mrproject72.mini_eq_rr.yml

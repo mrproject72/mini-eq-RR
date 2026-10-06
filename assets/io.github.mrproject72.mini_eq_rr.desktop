@@ -1,0 +1,12 @@
+[Desktop Entry]
+GenericName=System-wide Equalizer
+Comment=Minimal system-wide parametric equalizer for PipeWire
+Name=Mini EQ
+Keywords=equalizer;audio;pipewire;
+Categories=GTK;AudioVideo;Audio;
+Exec=mini-eq-rr
+Icon=io.github.mrproject72.mini_eq_rr
+StartupNotify=true
+Terminal=false
+Type=Application
+StartupWMClass=io.github.mrproject72.mini_eq_rr

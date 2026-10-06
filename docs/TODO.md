@@ -20,9 +20,8 @@ Ubuntu-only):
      default output (regression test for the "audio stops when the app
      closes" bug)
    - confirm biquad coefficients actually reach the node
-2. **Flatpak build job** — Flatpak is the intended distribution model and
-   there is no manifest yet. `flatpak-builder` in CI produces the artifact
-   and validates the sandbox story.
+2. ~~**Flatpak build job**~~ — DONE 2026-10-06: `io.github.mrproject72.mini_eq_rr.yml`
+   + `flatpak` job in `ci.yml`; appstream/desktop validated.
 3. **Fedora** (`fedora:latest`) — largest PipeWire + GNOME desktop overlap;
    exercises the RPM dependency path.
 4. **Arch** (`archlinux:latest`) — rolling, so it surfaces libadwaita /
@@ -45,9 +44,8 @@ The current `.github/workflows/ci.yml` runs `fmt`, `clippy -D warnings`,
 
 - **Branch protection on `main`** — require the CI check to pass and at
   least one review before merge. Right now nothing enforces it.
-- **Release artifacts** — the release job builds but uploads nothing. Add
-  `actions/upload-artifact` for the release binary, and ideally a
-  `.deb`/Flatpak bundle.
+- **Release artifacts** — CI now produces the flatpak repo via `flatpak-builder`;
+  still add `actions/upload-artifact` for the release binary and a `.deb`.
 - **Tag-triggered releases** — no workflow on `push: tags: [v*]`, so
   tagging does nothing.
 - **No integration test on live PipeWire** — all 90 tests are unit tests.
