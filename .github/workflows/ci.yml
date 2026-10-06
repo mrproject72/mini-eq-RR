@@ -52,21 +52,19 @@ jobs:
           name: mini-eq-rr-linux-x86_64
           path: target/release/mini-eq-rr
   flatpak:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     container:
-      image: ghcr.io/flathub-infra/flatpak-builder:gnome-47
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-47
       options: --privileged
     steps:
       - uses: actions/checkout@v4
-      - name: Build the flatpak
+      - name: Vendor crates for offline flatpak build
         run: |
           cargo vendor vendor > .cargo-config
           mkdir -p .cargo && mv .cargo-config .cargo/config.toml
-          flatpak-builder --force-clean --repo=repo build-dir io.github.mrproject72.mini_eq_rr.yml
-      - name: Create flatpak bundle
-        run: flatpak build-bundle repo mini-eq-rr.flatpak io.github.mrproject72.mini_eq_rr
-      - name: Upload flatpak bundle
-        uses: actions/upload-artifact@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          name: mini-eq-rr-flatpak
-          path: mini-eq-rr.flatpak
+          bundle: mini-eq-rr.flatpak
+          manifest-path: io.github.mrproject72.mini_eq_rr.yml
+          cache: true
+          cache-key: flatpak-builder-${{ github.sha }}
