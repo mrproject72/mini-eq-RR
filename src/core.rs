@@ -27,6 +27,39 @@ pub const VIRTUAL_SINK_BASE: &str = "mini_eq_sink";
 pub const VIRTUAL_SINK_DESCRIPTION: &str = "Mini-EQ-Sink";
 pub const FILTER_OUTPUT_SUFFIX: &str = "_output";
 
+/// Virtual sink node name for a physical output device (multi-chain EQ).
+///
+/// One EQ chain per device: `mini_eq_sink_<sanitized device name>`, e.g.
+/// `mini_eq_sink_alsa_output_pci_0000_04_00_6_analog_stereo`.
+/// `VIRTUAL_SINK_BASE` stays the prefix, so every `starts_with` check in
+/// routing keeps matching. Deterministic across restarts (derived from the
+/// stable PipeWire node name), never empty.
+pub fn eq_virtual_sink_for(physical_sink: &str) -> String {
+    let mut suffix = String::with_capacity(physical_sink.len());
+    for ch in physical_sink.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' {
+            suffix.push(ch);
+        } else {
+            suffix.push('_');
+        }
+    }
+    let suffix = suffix.trim_matches(['_', '-', '.']);
+    let suffix = if suffix.is_empty() {
+        "unknown".to_string()
+    } else {
+        suffix.to_string()
+    };
+    format!("{VIRTUAL_SINK_BASE}_{suffix}")
+}
+
+/// Filter-chain playback node name for a physical output device.
+pub fn eq_filter_output_for(physical_sink: &str) -> String {
+    format!(
+        "{}{FILTER_OUTPUT_SUFFIX}",
+        eq_virtual_sink_for(physical_sink)
+    )
+}
+
 /// Stream media roles that must never be routed through the EQ.
 ///
 /// UI sounds and notifications are not programme material: pushing them through
@@ -58,9 +91,73 @@ pub const MAX_BANDS: usize = 32;
 pub const DEFAULT_ACTIVE_BANDS: usize = 10;
 pub const PRESET_VERSION: i32 = 1;
 pub const PRESET_FILE_SUFFIX: &str = ".json";
-pub const OUTPUT_PRESET_LINKS_VERSION: i32 = 1;
+pub const OUTPUT_PRESET_LINKS_VERSION: i32 = 2;
 pub const OUTPUT_PRESET_LINKS_FILE: &str = "output-presets.json";
 pub const OUTPUT_PRESET_ROUTE_KEY_PREFIX: &str = "pipewire-route:v1:";
+
+/// Which streams the EQ reaches. Stored in `output-presets.json` as `"mode"`.
+///
+/// Two modes, named for what they do to the streams rather than for a scope:
+/// - **Selected** (default): only streams already aimed at the chosen device
+///   are routed into the EQ. Nothing that was deliberately pointed elsewhere is
+///   touched. The device you picked is the scope of the EQ.
+/// - **Reroute**: every eligible stream is moved into the EQ, whatever device it
+///   was on. This is an explicit opt-out from the foreign-target rule.
+///
+/// `SetRoutingEnabled` ("are streams routed through the EQ at all") is
+/// orthogonal to this: it is the on/off of the machinery, while the mode says
+/// *which* streams the machinery takes when it is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputRoutingMode {
+    Selected,
+    Reroute,
+}
+
+impl OutputRoutingMode {
+    pub const SELECTED: Self = Self::Selected;
+    pub const REROUTE: Self = Self::Reroute;
+
+    pub fn from_mode_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "reroute" => Self::Reroute,
+            _ => Self::Selected,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Reroute => "reroute",
+        }
+    }
+}
+
+/// The persisted shape of `output-presets.json`, version 2.
+///
+/// Version 1 had only `links` and `default`; version 2 adds `mode` and
+/// `monitor`. The reader tolerates version 1 by treating a missing `mode` as
+/// `Selected` and a missing `monitor` as `Follow`, and it drops the legacy
+/// `"default"` link key (written by the old Link button) on the next write --
+/// that key is the fallback, never a device.
+pub struct OutputPresetConfig {
+    pub links: std::collections::HashMap<String, String>,
+    pub default_preset: Option<String>,
+    pub mode: OutputRoutingMode,
+    /// `Some(name)` to pin the monitor to a device, `None` to follow the EQ
+    /// output. Stored as the sink's node name, or the sentinel `"follow"`.
+    pub monitor: Option<String>,
+}
+
+impl Default for OutputPresetConfig {
+    fn default() -> Self {
+        Self {
+            links: std::collections::HashMap::new(),
+            default_preset: None,
+            mode: OutputRoutingMode::Selected,
+            monitor: None,
+        }
+    }
+}
 
 // ── EQ Modes ─────────────────────────────────────────────────────────────────
 
@@ -1322,8 +1419,13 @@ pub fn preset_storage_dir() -> std::path::PathBuf {
 }
 
 pub fn preset_path_for_name(name: &str) -> std::path::PathBuf {
+    preset_path_for_name_at(&preset_storage_dir(), name)
+}
+
+/// Path-injectable variant of [`preset_path_for_name`].
+pub fn preset_path_for_name_at(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let sanitized = sanitize_preset_name(name);
-    preset_storage_dir().join(format!("{}{}", sanitized, PRESET_FILE_SUFFIX))
+    dir.join(format!("{}{}", sanitized, PRESET_FILE_SUFFIX))
 }
 
 /// Sanitize a preset name exactly as upstream `sanitize_preset_name`:
@@ -1422,12 +1524,12 @@ pub fn output_preset_for_sink(sink_name: &str) -> Option<String> {
 
 /// Path-injectable variant of [`output_preset_for_sink`].
 pub fn output_preset_for_sink_at(path: &Path, sink_name: &str) -> Option<String> {
-    let (links, fallback) = load_output_preset_config_at(path).ok()?;
+    let cfg = load_output_preset_config_at(path).ok()?;
     let key = output_preset_key_for_sink(sink_name);
-    if let Some(name) = links.get(&key) {
+    if let Some(name) = cfg.links.get(&key) {
         return Some(name.clone());
     }
-    fallback
+    cfg.default_preset
 }
 
 /// Every output sink that has its own preset linked, as `(sink, preset)`.
@@ -1435,38 +1537,145 @@ pub fn output_preset_for_sink_at(path: &Path, sink_name: &str) -> Option<String>
 /// For the D-Bus `output-presets` capability, which is advertised but has
 /// nothing behind it.
 pub fn output_preset_links() -> Vec<(String, String)> {
-    let (links, _) = load_output_preset_config().unwrap_or_default();
-    let mut out: Vec<(String, String)> = links.into_iter().collect();
+    let cfg = load_output_preset_config().unwrap_or_default();
+    let mut out: Vec<(String, String)> = cfg.links.into_iter().collect();
     out.sort();
     out
 }
 
 /// The fallback preset name, if one is set.
 pub fn output_preset_fallback() -> Option<String> {
-    load_output_preset_config().ok()?.1
+    load_output_preset_config().ok()?.default_preset
 }
 
-pub fn load_output_preset_config()
--> anyhow::Result<(std::collections::HashMap<String, String>, Option<String>)> {
+/// The payload signature of the preset linked to `sink_name`, if any.
+///
+/// Used by auto-write-back to decide whether the live curve has moved away
+/// from the linked preset. Comparing signatures rather than re-deriving the
+/// "modified" state from the preset panel keeps the write-back independent of
+/// which preset is selected in the panel.
+pub fn output_preset_saved_signature_for_sink(sink_name: &str) -> Option<String> {
+    output_preset_saved_signature_for_sink_at(&output_preset_links_path(), sink_name)
+}
+
+/// Path-injectable variant of [`output_preset_saved_signature_for_sink`].
+pub fn output_preset_saved_signature_for_sink_at(path: &Path, sink_name: &str) -> Option<String> {
+    output_preset_saved_signature_for_sink_at_at(path, &preset_storage_dir(), sink_name)
+}
+
+/// Path-injectable for both the links file and the preset storage dir, so
+/// the saved-signature lookup can be exercised in a test directory
+/// without touching the real config.
+pub fn output_preset_saved_signature_for_sink_at_at(
+    links_path: &Path,
+    preset_dir: &std::path::Path,
+    sink_name: &str,
+) -> Option<String> {
+    let preset_name = output_preset_for_sink_at(links_path, sink_name)?;
+    let preset_path = preset_path_for_name_at(preset_dir, &preset_name);
+    if !preset_path.exists() {
+        return None;
+    }
+    let data = std::fs::read_to_string(&preset_path).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(&data).ok()?;
+    Some(preset_payload_state_signature(&payload))
+}
+
+/// How many sinks link to `preset_name`. Auto-write-back only writes into a
+/// preset linked from exactly one device: writing into one linked from two
+/// would silently change the curve for a device the user did not touch.
+pub fn output_preset_link_count_for_preset(preset_name: &str) -> usize {
+    load_output_preset_config()
+        .ok()
+        .map(|c| c.links.values().filter(|n| **n == *preset_name).count())
+        .unwrap_or(0)
+}
+
+/// The sinks linked to `preset_name`, sorted. Used to report to the user
+/// what a write-back would affect.
+pub fn output_preset_linked_sinks_for_preset(preset_name: &str) -> Vec<String> {
+    let cfg = load_output_preset_config().unwrap_or_default();
+    let mut out: Vec<String> = cfg
+        .links
+        .iter()
+        .filter(|(_, n)| n == &preset_name)
+        .map(|(k, _)| k.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The configured output routing mode. Missing or version-1 config reads as
+/// [`OutputRoutingMode::Selected`], which is what the app did before the mode
+/// existed.
+pub fn output_routing_mode() -> OutputRoutingMode {
+    output_routing_mode_at(&output_preset_links_path())
+}
+
+/// Path-injectable variant of [`output_routing_mode`].
+pub fn output_routing_mode_at(path: &Path) -> OutputRoutingMode {
+    load_output_preset_config_at(path)
+        .ok()
+        .map(|c| c.mode)
+        .unwrap_or(OutputRoutingMode::Selected)
+}
+
+pub fn set_output_routing_mode(mode: OutputRoutingMode) -> anyhow::Result<()> {
+    set_output_routing_mode_at(mode, &output_preset_links_path())
+}
+
+/// Path-injectable variant of [`set_output_routing_mode`].
+pub fn set_output_routing_mode_at(mode: OutputRoutingMode, path: &Path) -> anyhow::Result<()> {
+    let mut cfg = load_output_preset_config_at(path)?;
+    cfg.mode = mode;
+    write_output_preset_config_at(
+        path,
+        &cfg.links,
+        cfg.default_preset.as_deref(),
+        cfg.mode,
+        cfg.monitor.as_deref(),
+    )
+}
+
+/// The sink the monitor is pinned to, if any. `None` means "follow the EQ
+/// output". Stored as the sink's node name.
+pub fn output_monitor_sink() -> Option<String> {
+    load_output_preset_config().ok()?.monitor
+}
+
+pub fn set_output_monitor_sink(sink: Option<&str>) -> anyhow::Result<()> {
+    let mut cfg = load_output_preset_config()?;
+    cfg.monitor = sink.map(|s| s.to_string());
+    write_output_preset_config(&cfg)
+}
+
+pub fn load_output_preset_config() -> anyhow::Result<OutputPresetConfig> {
     load_output_preset_config_at(&output_preset_links_path())
 }
 
 /// Path-injectable variant of [`load_output_preset_config`].
-pub fn load_output_preset_config_at(
-    path: &Path,
-) -> anyhow::Result<(std::collections::HashMap<String, String>, Option<String>)> {
+pub fn load_output_preset_config_at(path: &Path) -> anyhow::Result<OutputPresetConfig> {
     if !path.exists() {
-        return Ok((std::collections::HashMap::new(), None));
+        return Ok(OutputPresetConfig::default());
     }
     let data = std::fs::read_to_string(path)?;
     let payload: serde_json::Value = serde_json::from_str(&data)?;
     let version = payload.get("version").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    if version != OUTPUT_PRESET_LINKS_VERSION {
+    if version > OUTPUT_PRESET_LINKS_VERSION {
         anyhow::bail!("unsupported output preset links version: {}", version);
     }
+
     let mut links = std::collections::HashMap::new();
     if let Some(links_obj) = payload.get("links").and_then(|v| v.as_object()) {
         for (key, value) in links_obj {
+            // The old Link button keyed its entry "default" -- that is the
+            // fallback, not a device. Reading it back as a sink would make
+            // `output_preset_for_sink("default")` return a preset, which is
+            // wrong: "default" is never a sink name. Drop it here and let the
+            // explicit `default` field carry the fallback.
+            if key == "default" {
+                continue;
+            }
             if let Some(preset_name) = value.as_str() {
                 links.insert(key.clone(), preset_name.to_string());
             }
@@ -1475,15 +1684,31 @@ pub fn load_output_preset_config_at(
     let default_preset = payload
         .get("default")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    Ok((links, default_preset.map(|s| s.to_string())))
-}
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
-pub fn write_output_preset_config(
-    links: &std::collections::HashMap<String, String>,
-    default_preset: Option<&str>,
-) -> anyhow::Result<()> {
-    write_output_preset_config_at(&output_preset_links_path(), links, default_preset)
+    // Version 1 has no mode: default to Selected, which is what the app did
+    // before the mode existed. Version 2 carries it explicitly.
+    let mode = payload
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(OutputRoutingMode::from_mode_str)
+        .unwrap_or(OutputRoutingMode::Selected);
+
+    // The monitor was never persisted before; `None` means "follow the EQ
+    // output", which is the existing behaviour.
+    let monitor = payload
+        .get("monitor")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Ok(OutputPresetConfig {
+        links,
+        default_preset,
+        mode,
+        monitor,
+    })
 }
 
 /// Path-injectable variant of [`write_output_preset_config`].
@@ -1491,6 +1716,8 @@ pub fn write_output_preset_config_at(
     path: &Path,
     links: &std::collections::HashMap<String, String>,
     default_preset: Option<&str>,
+    mode: OutputRoutingMode,
+    monitor: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1498,44 +1725,64 @@ pub fn write_output_preset_config_at(
     let mut obj = serde_json::json!({
         "version": OUTPUT_PRESET_LINKS_VERSION,
         "links": links,
+        "mode": mode.as_str(),
     });
     if let Some(default) = default_preset {
         obj.as_object_mut()
             .unwrap()
             .insert("default".to_string(), serde_json::json!(default));
     }
+    if let Some(monitor) = monitor {
+        obj.as_object_mut()
+            .unwrap()
+            .insert("monitor".to_string(), serde_json::json!(monitor));
+    }
     let data = serde_json::to_string_pretty(&obj)?;
     std::fs::write(path, format!("{}\n", data))?;
     Ok(())
 }
 
+/// Write the whole config back from its parsed parts. Convenience for the
+/// callers that already hold an `OutputPresetConfig`.
+pub fn write_output_preset_config(cfg: &OutputPresetConfig) -> anyhow::Result<()> {
+    write_output_preset_config_at(
+        &output_preset_links_path(),
+        &cfg.links,
+        cfg.default_preset.as_deref(),
+        cfg.mode,
+        cfg.monitor.as_deref(),
+    )
+}
+
 pub fn get_output_preset_fallback_name() -> anyhow::Result<Option<String>> {
-    let (_links, default) = load_output_preset_config()?;
-    Ok(default)
+    let cfg = load_output_preset_config()?;
+    Ok(cfg.default_preset)
 }
 
 pub fn set_output_preset_fallback_name(name: &str) -> anyhow::Result<()> {
-    let (links, _default) = load_output_preset_config()?;
+    let mut cfg = load_output_preset_config()?;
     let sanitized = sanitize_preset_name(name);
     if sanitized.is_empty() {
         anyhow::bail!("preset name is empty");
     }
-    write_output_preset_config(&links, Some(&sanitized))
+    cfg.default_preset = Some(sanitized);
+    write_output_preset_config(&cfg)
 }
 
 pub fn clear_output_preset_fallback_name() -> anyhow::Result<bool> {
-    let (links, default) = load_output_preset_config()?;
-    let had = default.is_some();
-    write_output_preset_config(&links, None)?;
+    let mut cfg = load_output_preset_config()?;
+    let had = cfg.default_preset.is_some();
+    cfg.default_preset = None;
+    write_output_preset_config(&cfg)?;
     Ok(had)
 }
 
 pub fn get_output_preset_link_match(output_keys: &[String]) -> Option<(String, String)> {
-    let Ok((links, _)) = load_output_preset_config() else {
+    let Ok(cfg) = load_output_preset_config() else {
         return None;
     };
     for key in output_keys {
-        if let Some(preset) = links.get(key) {
+        if let Some(preset) = cfg.links.get(key) {
             return Some((key.clone(), preset.clone()));
         }
     }
@@ -1543,21 +1790,92 @@ pub fn get_output_preset_link_match(output_keys: &[String]) -> Option<(String, S
 }
 
 pub fn set_output_preset_link(key: &str, preset_name: &str) -> anyhow::Result<()> {
-    let (mut links, default) = load_output_preset_config()?;
-    links.insert(key.to_string(), preset_name.to_string());
-    write_output_preset_config(&links, default.as_deref())
+    let mut cfg = load_output_preset_config()?;
+    cfg.links.insert(key.to_string(), preset_name.to_string());
+    write_output_preset_config(&cfg)
 }
 
 pub fn clear_output_preset_link(keys: &[String]) -> anyhow::Result<bool> {
-    let (mut links, default) = load_output_preset_config()?;
+    let mut cfg = load_output_preset_config()?;
     let mut removed = false;
     for key in keys {
-        if links.remove(key).is_some() {
+        if cfg.links.remove(key).is_some() {
             removed = true;
         }
     }
-    write_output_preset_config(&links, default.as_deref())?;
+    write_output_preset_config(&cfg)?;
     Ok(removed)
+}
+
+/// Write the current curve into the preset linked to `sink_name`, if exactly
+/// one device links to it.
+///
+/// Auto-write-back is the reason the link exists: editing the EQ while a
+/// device is linked should not require the user to remember to press Update.
+/// It only writes when the linked preset is linked from exactly one device —
+/// writing into one linked from two would silently change the curve for a
+/// device the user did not touch, and that is worse than leaving it Modified.
+///
+/// Returns `Ok(true)` when it wrote, `Ok(false)` when the sink is not linked,
+/// when the preset is a built-in, or when it is linked from more than one
+/// device (so the caller can leave the state chip alone).
+/// Path-injectable variant of [`auto_write_output_preset_for_sink`].
+///
+/// Takes both the links file and the preset storage directory, so the
+/// write-back can be exercised in a test directory without touching the
+/// real config.
+pub fn auto_write_output_preset_for_sink_at(
+    links_path: &Path,
+    preset_dir: &std::path::Path,
+    sink_name: &str,
+    bands: &[EqBand],
+    preamp_db: f64,
+) -> anyhow::Result<bool> {
+    let Some(preset_name) = output_preset_for_sink_at(links_path, sink_name) else {
+        return Ok(false);
+    };
+    if is_builtin_preset(&preset_name) {
+        return Ok(false);
+    }
+    let count = load_output_preset_config_at(links_path)
+        .ok()
+        .map(|c| c.links.values().filter(|n| **n == *preset_name).count())
+        .unwrap_or(0);
+    if count != 1 {
+        return Ok(false);
+    }
+    let dest = preset_path_for_name_at(preset_dir, &preset_name);
+    save_preset_to_file(&dest, bands, preamp_db)?;
+    log::info!(
+        "Auto write-back: wrote the current curve into preset '{preset_name}' (linked to {sink_name})"
+    );
+    Ok(true)
+}
+
+/// Write the current curve into the preset linked to `sink_name`, if exactly
+/// one device links to it.
+///
+/// Auto-write-back is the reason the link exists: editing the EQ while a
+/// device is linked should not require the user to remember to press Update.
+/// It only writes when the linked preset is linked from exactly one device —
+/// writing into one linked from two would silently change the curve for a
+/// device the user did not touch, and that is worse than leaving it Modified.
+///
+/// Returns `Ok(true)` when it wrote, `Ok(false)` when the sink is not linked,
+/// when the preset is a built-in, or when it is linked from more than one
+/// device (so the caller can leave the state chip alone).
+pub fn auto_write_output_preset_for_sink(
+    sink_name: &str,
+    bands: &[EqBand],
+    preamp_db: f64,
+) -> anyhow::Result<bool> {
+    auto_write_output_preset_for_sink_at(
+        &output_preset_links_path(),
+        &preset_storage_dir(),
+        sink_name,
+        bands,
+        preamp_db,
+    )
 }
 
 #[cfg(test)]
@@ -2708,20 +3026,38 @@ mod tests {
 
         let mut links = std::collections::HashMap::new();
         links.insert("sink1".to_string(), "preset1".to_string());
-        write_output_preset_config_at(&path, &links, Some("fallback")).unwrap();
+        write_output_preset_config_at(
+            &path,
+            &links,
+            Some("fallback"),
+            OutputRoutingMode::Selected,
+            None,
+        )
+        .unwrap();
 
-        let (loaded_links, default) = load_output_preset_config_at(&path).unwrap();
-        assert_eq!(loaded_links.get("sink1"), Some(&"preset1".to_string()));
-        assert_eq!(default, Some("fallback".to_string()));
+        let cfg = load_output_preset_config_at(&path).unwrap();
+        assert_eq!(cfg.links.get("sink1"), Some(&"preset1".to_string()));
+        assert_eq!(cfg.default_preset, Some("fallback".to_string()));
+        assert_eq!(cfg.mode, OutputRoutingMode::Selected);
+        assert_eq!(cfg.monitor, None);
 
-        // Clearing a link preserves the fallback preset.
-        let (mut links, default) = load_output_preset_config_at(&path).unwrap();
-        assert!(links.remove("sink1").is_some());
-        write_output_preset_config_at(&path, &links, default.as_deref()).unwrap();
+        // Clearing a link preserves the fallback preset. Write back to the same
+        // path the test is exercising -- `write_output_preset_config` writes
+        // to the real config dir, which is not what this test wants.
+        let mut cfg = load_output_preset_config_at(&path).unwrap();
+        assert!(cfg.links.remove("sink1").is_some());
+        write_output_preset_config_at(
+            &path,
+            &cfg.links,
+            cfg.default_preset.as_deref(),
+            cfg.mode,
+            cfg.monitor.as_deref(),
+        )
+        .unwrap();
 
-        let (loaded_links, default) = load_output_preset_config_at(&path).unwrap();
-        assert!(!loaded_links.contains_key("sink1"));
-        assert_eq!(default, Some("fallback".to_string()));
+        let cfg = load_output_preset_config_at(&path).unwrap();
+        assert!(!cfg.links.contains_key("sink1"));
+        assert_eq!(cfg.default_preset, Some("fallback".to_string()));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2732,9 +3068,84 @@ mod tests {
             .join("mini-eq-test")
             .join("does-not-exist-output-presets.json");
         let _ = std::fs::remove_file(&path);
-        let (links, default) = load_output_preset_config_at(&path).unwrap();
-        assert!(links.is_empty());
-        assert!(default.is_none());
+        let cfg = load_output_preset_config_at(&path).unwrap();
+        assert!(cfg.links.is_empty());
+        assert!(cfg.default_preset.is_none());
+        assert_eq!(cfg.mode, OutputRoutingMode::Selected);
+        assert_eq!(cfg.monitor, None);
+    }
+
+    /// Version 1 has no `mode` or `monitor` field: it must read as Selected /
+    /// follow, which is what the app did before the mode existed, and the
+    /// legacy `"default"` link key must not be mistaken for a sink.
+    #[test]
+    fn test_load_output_preset_config_v1_is_selected_and_drops_default_link() {
+        let path = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("output-presets-v1.json");
+        std::fs::write(
+            &path,
+            r#"{"links":{"default":"preset_1"},"default":"preset_1","version":1}"#,
+        )
+        .unwrap();
+        let cfg = load_output_preset_config_at(&path).unwrap();
+        assert!(
+            !cfg.links.contains_key("default"),
+            "the legacy 'default' link key is the fallback, not a device"
+        );
+        assert_eq!(cfg.default_preset, Some("preset_1".to_string()));
+        assert_eq!(cfg.mode, OutputRoutingMode::Selected);
+        assert_eq!(cfg.monitor, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_output_preset_config_v2_carries_mode_and_monitor() {
+        let path = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("output-presets-v2.json");
+        std::fs::write(
+            &path,
+            r#"{"links":{"sink1":"preset1"},"default":"fallback","mode":"reroute",
+               "monitor":"sink2","version":2}"#,
+        )
+        .unwrap();
+        let cfg = load_output_preset_config_at(&path).unwrap();
+        assert_eq!(cfg.links.get("sink1"), Some(&"preset1".to_string()));
+        assert_eq!(cfg.default_preset, Some("fallback".to_string()));
+        assert_eq!(cfg.mode, OutputRoutingMode::Reroute);
+        assert_eq!(cfg.monitor, Some("sink2".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_output_preset_config_writes_version_2() {
+        let path = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("output-presets-v2-write.json");
+        let _ = std::fs::remove_file(&path);
+        let mut links = std::collections::HashMap::new();
+        links.insert("sink1".to_string(), "preset1".to_string());
+        write_output_preset_config_at(
+            &path,
+            &links,
+            Some("fallback"),
+            OutputRoutingMode::Reroute,
+            Some("sink2"),
+        )
+        .unwrap();
+        let data = std::fs::read_to_string(&path).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(payload.get("version").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(
+            payload.get("mode").and_then(|v| v.as_str()),
+            Some("reroute")
+        );
+        assert_eq!(
+            payload.get("monitor").and_then(|v| v.as_str()),
+            Some("sink2")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2746,9 +3157,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("output-presets.json");
 
-        write_output_preset_config_at(&path, &std::collections::HashMap::new(), None).unwrap();
+        write_output_preset_config_at(
+            &path,
+            &std::collections::HashMap::new(),
+            None,
+            OutputRoutingMode::Selected,
+            None,
+        )
+        .unwrap();
         assert!(path.is_file());
 
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("mini-eq-test").join("nested"));
+    }
+
+    /// Auto-write-back writes the live curve into the preset linked to a sink,
+    /// and only when exactly one device links to it.
+    #[test]
+    fn auto_write_output_preset_for_sink_writes_only_for_singly_linked_preset() {
+        let dir = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("auto-write-back");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let links_path = dir.join("output-presets.json");
+        let preset_path = crate::core::preset_path_for_name_at(&dir, "linked_preset");
+
+        // Create the linked preset with a known curve.
+        let bands = crate::core::default_bands();
+        save_preset_to_file(&preset_path, &bands, 0.0).unwrap();
+
+        // Link it from one sink.
+        let mut links = std::collections::HashMap::new();
+        links.insert("sinkA".to_string(), "linked_preset".to_string());
+        write_output_preset_config_at(&links_path, &links, None, OutputRoutingMode::Selected, None)
+            .unwrap();
+
+        // Move the curve away from the saved one.
+        let mut moved = bands.clone();
+        moved[0].gain_db = 3.0;
+
+        // Writes: exactly one sink links to it.
+        let wrote =
+            auto_write_output_preset_for_sink_at(&links_path, &dir, "sinkA", &moved, 0.0).unwrap();
+        assert!(wrote, "a singly-linked preset must be written back");
+        // The write-back writes to the preset storage directory passed in, so
+        // read it back from there rather than from the real config dir.
+        let after_path = crate::core::preset_path_for_name_at(&dir, "linked_preset");
+        let after_data = std::fs::read_to_string(&after_path).unwrap();
+        let after_payload: serde_json::Value = serde_json::from_str(&after_data).unwrap();
+        let after_bands = preset_payload_bands(&after_payload).unwrap();
+        assert!((after_bands[0].gain_db - 3.0).abs() < 1e-9);
+
+        // Link it from a second sink: now the write-back must refuse.
+        links.insert("sinkB".to_string(), "linked_preset".to_string());
+        write_output_preset_config_at(&links_path, &links, None, OutputRoutingMode::Selected, None)
+            .unwrap();
+        let refused =
+            auto_write_output_preset_for_sink_at(&links_path, &dir, "sinkA", &moved, 0.0).unwrap();
+        assert!(
+            !refused,
+            "a preset linked from two devices must not be written back"
+        );
+
+        // A sink with no link: nothing to write.
+        let no_link =
+            auto_write_output_preset_for_sink_at(&links_path, &dir, "sinkC", &moved, 0.0).unwrap();
+        assert!(!no_link, "an unlinked sink has nothing to write back");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The saved signature for a linked sink is the preset's own signature, so
+    /// the write-back can compare the live curve against it.
+    #[test]
+    fn saved_signature_for_linked_sink_matches_the_preset() {
+        let dir = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("saved-signature");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let links_path = dir.join("output-presets.json");
+        let preset_path = crate::core::preset_path_for_name_at(&dir, "preset_a");
+
+        let bands = crate::core::default_bands();
+        save_preset_to_file(&preset_path, &bands, 0.0).unwrap();
+
+        let mut links = std::collections::HashMap::new();
+        links.insert("sinkA".to_string(), "preset_a".to_string());
+        write_output_preset_config_at(&links_path, &links, None, OutputRoutingMode::Selected, None)
+            .unwrap();
+
+        let sig = output_preset_saved_signature_for_sink_at_at(&links_path, &dir, "sinkA").unwrap();
+        // The claim is that the saved signature IS the preset file's own
+        // signature, so compare against the file rather than against a
+        // freshly-built payload: the file's floats have been through a JSON
+        // round-trip and differ from `default_bands()` in the last digits.
+        let file_data = std::fs::read_to_string(&preset_path).unwrap();
+        let file_payload: serde_json::Value = serde_json::from_str(&file_data).unwrap();
+        assert_eq!(sig, preset_payload_state_signature(&file_payload));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-device virtual sinks: prefixed, deterministic, sanitized and
+    /// pairwise distinct (multi-chain EQ).
+    #[test]
+    fn eq_virtual_sink_naming() {
+        let a = eq_virtual_sink_for("alsa_output.pci-0000_04_00.6.analog-stereo");
+        let b =
+            eq_virtual_sink_for("alsa_output.usb-Logitech_Logitech_H570e_Stereo-00.analog-stereo");
+        assert!(a.starts_with(VIRTUAL_SINK_BASE));
+        assert!(b.starts_with(VIRTUAL_SINK_BASE));
+        assert_ne!(a, b);
+        // Deterministic across calls (stable identity across restarts).
+        assert_eq!(
+            a,
+            eq_virtual_sink_for("alsa_output.pci-0000_04_00.6.analog-stereo")
+        );
+        // Only node-name-safe characters survive.
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        );
+        assert!(!a.contains(' ') && !a.contains('/'));
+        // Degenerate input still yields a usable, non-empty name.
+        let weird = eq_virtual_sink_for("  // ");
+        assert!(weird.starts_with(VIRTUAL_SINK_BASE));
+        assert!(weird.len() > VIRTUAL_SINK_BASE.len());
+        // Filter-output name derives from the virtual sink, not the device.
+        assert_eq!(
+            eq_filter_output_for("alsa_output.pci-0000_04_00.6.analog-stereo"),
+            format!("{a}{FILTER_OUTPUT_SUFFIX}")
+        );
     }
 }

@@ -30,10 +30,20 @@ use crate::dbus_control::MiniEqAppHandler;
 pub enum RemoteCommand {
     SetEqEnabled(bool),
     SetRouting(bool),
+    SetOutputMode(OutputModeArg),
+    SetOutputSink(String),
+    SetMonitorEnabled(bool),
+    SetMonitorSink(String),
     SetPreset(String),
     PresentWindow,
     Quit,
 }
+
+/// Argument to `SetOutputMode`: the mode as a string, so the D-Bus signature
+/// is `s` and the same `selected`/`reroute` values the UI buttons use can be
+/// passed by hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputModeArg(pub crate::core::OutputRoutingMode);
 
 /// Minimum interval between `AnalyzerLevelsChanged` emissions.
 ///
@@ -63,6 +73,14 @@ pub struct AppState {
     window_visible: Mutex<bool>,
     shutting_down: Mutex<bool>,
 
+    /// Which streams the EQ reaches. Published by the window from the mode
+    /// buttons; the D-Bus handler reads it for `GetState`.
+    output_mode: Mutex<crate::core::OutputRoutingMode>,
+    /// The sink the monitor is pinned to, or `None` to follow the EQ output.
+    monitor_sink: Mutex<Option<String>>,
+    /// The preset linked to the current output device, if any.
+    output_preset: Mutex<Option<String>>,
+
     /// Throttle state for `AnalyzerLevelsChanged`.
     last_analyzer_emit: Mutex<Option<std::time::Instant>>,
 
@@ -89,6 +107,9 @@ impl AppState {
             analyzer_display_gain_db: Mutex::new(0.0),
             window_visible: Mutex::new(false),
             shutting_down: Mutex::new(false),
+            output_mode: Mutex::new(crate::core::OutputRoutingMode::Selected),
+            monitor_sink: Mutex::new(None),
+            output_preset: Mutex::new(None),
             last_analyzer_emit: Mutex::new(None),
             pending: Mutex::new(VecDeque::new()),
             connection: Mutex::new(None),
@@ -159,6 +180,10 @@ impl AppState {
 
     /// Publish the per-tick values the D-Bus interface reports. Called by the
     /// window's update loop.
+    ///
+    /// `output_sink` is published (not merely set by callers) so GetState can
+    /// never disagree with the chain: a refused or failed switch leaves the
+    /// engine sink untouched and the next tick re-publishes it.
     pub fn publish(
         &self,
         levels: Vec<f64>,
@@ -166,12 +191,22 @@ impl AppState {
         visible: bool,
         running: bool,
         analyzer_enabled: bool,
+        output_mode: crate::core::OutputRoutingMode,
+        output_preset: Option<String>,
+        monitor_sink: Option<String>,
+        output_sink: Option<String>,
     ) {
         *Self::lock(&self.analyzer_levels) = levels;
         *Self::lock(&self.analyzer_display_gain_db) = display_gain_db;
         *Self::lock(&self.window_visible) = visible;
         *Self::lock(&self.running) = running;
         *Self::lock(&self.analyzer_enabled) = analyzer_enabled;
+        *Self::lock(&self.output_mode) = output_mode;
+        *Self::lock(&self.output_preset) = output_preset;
+        *Self::lock(&self.monitor_sink) = monitor_sink;
+        if output_sink.is_some() {
+            *Self::lock(&self.output_sink) = output_sink;
+        }
     }
 
     /// Record that the UI started tearing down, so in-flight D-Bus calls stop
@@ -198,6 +233,25 @@ impl MiniEqAppHandler for AppState {
         Self::lock(&self.output_sink).clone()
     }
 
+    fn output_mode(&self) -> crate::core::OutputRoutingMode {
+        *Self::lock(&self.output_mode)
+    }
+
+    fn output_preset(&self) -> Option<String> {
+        Self::lock(&self.output_preset).clone()
+    }
+
+    fn monitor_sink(&self) -> Option<String> {
+        Self::lock(&self.monitor_sink).clone()
+    }
+
+    fn set_output_mode(&self, mode: crate::core::OutputRoutingMode) {
+        *Self::lock(&self.output_mode) = mode;
+        self.post(RemoteCommand::SetOutputMode(
+            crate::remote_control::OutputModeArg(mode),
+        ));
+    }
+
     fn set_eq_enabled(&self, enabled: bool) {
         *Self::lock(&self.eq_enabled) = enabled;
         self.post(RemoteCommand::SetEqEnabled(enabled));
@@ -206,6 +260,30 @@ impl MiniEqAppHandler for AppState {
     fn route_system_audio(&self, enabled: bool) {
         *Self::lock(&self.routed) = enabled;
         self.post(RemoteCommand::SetRouting(enabled));
+    }
+
+    fn set_output_sink(&self, sink: &str) {
+        // Deliberately NOT cached here (unlike routed/eq_enabled): the window
+        // may REFUSE the switch (sticky chain under Selected), in which case
+        // an eager write would leave GetState reporting a device the chain
+        // never moved to. The window publishes the true engine sink every
+        // tick instead (see publish), so the worst case is ≤33 ms of staleness
+        // rather than a permanent lie. Live-test T6a caught exactly this.
+        self.post(RemoteCommand::SetOutputSink(sink.to_string()));
+    }
+
+    fn set_monitor_enabled(&self, enabled: bool) {
+        *Self::lock(&self.analyzer_enabled) = enabled;
+        self.post(RemoteCommand::SetMonitorEnabled(enabled));
+    }
+
+    fn set_monitor_sink(&self, sink: &str) {
+        *Self::lock(&self.monitor_sink) = if sink.is_empty() {
+            None
+        } else {
+            Some(sink.to_string())
+        };
+        self.post(RemoteCommand::SetMonitorSink(sink.to_string()));
     }
 
     fn current_preset_name(&self) -> Option<String> {
@@ -268,6 +346,10 @@ mod tests {
 
         state.set_eq_enabled(false);
         state.route_system_audio(true);
+        state.set_output_sink("some-sink");
+        state.set_monitor_enabled(true);
+        state.set_monitor_sink("some-sink");
+        state.set_monitor_sink("");
         state.present_main_window(None);
         state.quit_fully();
         state.load_library_preset("rock");
@@ -277,6 +359,10 @@ mod tests {
             vec![
                 RemoteCommand::SetEqEnabled(false),
                 RemoteCommand::SetRouting(true),
+                RemoteCommand::SetOutputSink("some-sink".to_string()),
+                RemoteCommand::SetMonitorEnabled(true),
+                RemoteCommand::SetMonitorSink("some-sink".to_string()),
+                RemoteCommand::SetMonitorSink(String::new()),
                 RemoteCommand::PresentWindow,
                 RemoteCommand::Quit,
                 RemoteCommand::SetPreset("rock".to_string()),
@@ -331,13 +417,53 @@ mod tests {
         let state = AppState::new();
         assert!(!state.window_visible());
 
-        state.publish(vec![0.25; 4], 12.0, true, true, true);
+        state.publish(
+            vec![0.25; 4],
+            12.0,
+            true,
+            true,
+            true,
+            crate::core::OutputRoutingMode::Selected,
+            None,
+            None,
+            Some("sink-a".to_string()),
+        );
 
         assert_eq!(state.analyzer_levels(), vec![0.25; 4]);
         assert_eq!(state.analyzer_display_gain_db(), 12.0);
         assert!(state.window_visible());
         assert!(state.running());
         assert!(state.analyzer_enabled());
+        assert_eq!(state.output_sink().as_deref(), Some("sink-a"));
+    }
+
+    /// GetState's output_sink tracks the published engine sink, and a
+    /// set_output_sink that the window may refuse leaves no trace: the
+    /// handler must not cache ahead of the window (live-test T6a caught the
+    /// permanent lie this caused).
+    #[test]
+    fn output_sink_comes_from_publish_not_from_the_setter() {
+        let state = AppState::new();
+        assert_eq!(state.output_sink(), None);
+        state.set_output_sink("sink-b");
+        // Queued for the window, but GetState still shows the old truth.
+        assert_eq!(state.output_sink(), None);
+        assert_eq!(
+            state.drain_pending(),
+            vec![RemoteCommand::SetOutputSink("sink-b".to_string())]
+        );
+        state.publish(
+            vec![],
+            0.0,
+            true,
+            true,
+            false,
+            crate::core::OutputRoutingMode::Selected,
+            None,
+            None,
+            Some("sink-a".to_string()),
+        );
+        assert_eq!(state.output_sink().as_deref(), Some("sink-a"));
     }
 
     /// The analyzer signal is throttled by TIME, not by value. A
@@ -354,7 +480,17 @@ mod tests {
         assert!(!state.maybe_emit_analyzer_levels_changed());
 
         // Identical levels must not matter either way.
-        state.publish(vec![0.5; 10], 0.0, true, true, true);
+        state.publish(
+            vec![0.5; 10],
+            0.0,
+            true,
+            true,
+            true,
+            crate::core::OutputRoutingMode::Selected,
+            None,
+            None,
+            None,
+        );
         assert!(!state.maybe_emit_analyzer_levels_changed());
     }
 

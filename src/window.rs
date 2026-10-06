@@ -17,6 +17,20 @@ use crate::window_state;
 use crate::window_utility::UtilityPane;
 use crate::window_utils;
 
+/// The curve a device starts with when its EQ is enabled for the first
+/// time this session: its linked preset when one is set in the config
+/// (fallback names included there), else a neutral curve.
+fn device_initial_curve(dev: &str) -> (Vec<crate::core::EqBand>, f64) {
+    if let Some(name) = crate::core::output_preset_for_sink(dev) {
+        if let Ok((preamp, bands)) =
+            crate::core::load_preset_from_file(&crate::core::preset_path_for_name(&name))
+        {
+            return (bands, preamp);
+        }
+    }
+    (crate::core::default_bands(), 0.0)
+}
+
 /// Snapshot the live fader state as `EqBand`s (the shape the DSP/peak math uses).
 ///
 /// When `smooth` is set the Smooth override is applied on the way out:
@@ -93,11 +107,9 @@ fn recompute_solo_active(faders: &[Rc<RefCell<crate::band_fader::EqBandFader>>])
 /// The fallback preset covers sinks with no link of their own, so a device
 /// nobody configured still gets a sensible curve.
 ///
-/// Called from the Output dropdown only. The 500 ms default-sink watcher does
-/// not take part: the filter chain deliberately does not follow the system
-/// default (its output re-link needs live validation), so the sink the EQ is
-/// feeding has not changed and there is nothing to switch. If the chain ever
-/// starts following the default, this call belongs there too.
+/// Called from the Output dropdown and the default-sink watcher. Both paths
+/// retarget the chain first and then load the new device's preset, so the
+/// curve that lands is the one the device is linked to.
 fn apply_output_preset_for_sink(
     sink_name: &str,
     last_identity: &RefCell<Option<String>>,
@@ -127,12 +139,11 @@ fn apply_output_preset_for_sink(
 /// the engine's own destination means listening to a sink no audio is
 /// reaching — the spectrum and the peak meter simply freeze. The system
 /// default is only a fallback for the case where the engine never started.
-fn resolve_monitor_target(engine_sink: &Rc<RefCell<String>>, be: &mut PipeWireBackend) -> String {
-    let current = engine_sink.borrow().clone();
-    if !current.is_empty() {
-        return current;
-    }
-    be.default_output_sink().unwrap_or_default()
+/// The sink the monitor taps. A pinned monitor device (from
+/// `output-monitor` in the config) wins; otherwise the chain's current
+/// output.
+fn resolve_monitor_target(be: &mut PipeWireBackend) -> String {
+    be.resolve_monitor_target(None)
 }
 
 /// Main application window.
@@ -244,11 +255,16 @@ impl MiniEqWindow {
             window.add_action(&quit_action);
         }
 
-        // System-wide EQ toggle with an explicit ON/OFF readout. The bare
-        // switch left the routing state ambiguous at a glance, and the
-        // tooltip is only reachable with the pointer.
+        // Output mode buttons (Selected / Reroute) live in the sidebar's
+        // Output Controls panel (see window_utility.rs), not the header.
+        let mode_selected = utility.mode_selected.clone();
+        let mode_reroute = utility.mode_reroute.clone();
+
+        // EQ on/off. A plain Off/On switch: "is audio routed through the EQ
+        // at all". The mode buttons in Output Controls say *which* streams it
+        // takes when it is on.
         let route_switch = gtk4::Switch::new();
-        route_switch.set_tooltip_text(Some("System-wide EQ"));
+        route_switch.set_tooltip_text(Some("Enable/Disable EQ"));
         let route_state_label = gtk4::Label::new(Some("Off"));
         route_state_label.set_css_classes(&["metric-title"]);
         route_state_label.set_valign(gtk4::Align::Center);
@@ -549,19 +565,28 @@ impl MiniEqWindow {
         // `update_state_live_or_reload` hardcoded `eq_enabled = true`, so the
         // bands were always pushed wet. The tick now folds the switch state
         // into the push signature and passes it through as `eq_enabled`.
-        // `state-set` (not `notify::active`) so a programmatic `set_active`
-        // from the D-Bus drain does not re-enter — that path sets the flag
-        // itself.
+        // `state-set` (not `notify::active`) so the toggle itself carries the
+        // state change. NOTE: this fires for programmatic `set_active` too,
+        // so the D-Bus drain blocks it around its own sync (see
+        // `bypass_state_handler`) instead of relying on it not firing.
+        //
+        // The handler id is kept so the D-Bus drain can block it around a
+        // programmatic `set_active`: contrary to an older comment here,
+        // GTK4 DOES emit `state-set` for `set_active`, and the live test
+        // showed every remote toggle running twice.
+        //
+        // One cell holds the route switch's `state-set` handler id, so the
+        // device-select path can block it while updating the switch to a newly
+        // selected device's own on/off state (GTK4 emits `state-set` even for
+        // `set_active`, which would otherwise fire a full EQ on/off).
+        let route_state_handler: Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>> =
+            Rc::new(RefCell::new(None));
         {
             let state_for_bypass = app_state.clone();
             utility
                 .bypass_switch
                 .connect_state_set(move |_switch, bypassed| {
                     let eq_enabled = !bypassed;
-                    // INFO, not DEBUG: "the A/B switch does nothing" was
-                    // reported repeatedly and the switch gave no feedback at
-                    // all. One line per toggle makes the state observable from
-                    // a log however the change was triggered (click or D-Bus).
                     log::info!("A/B compare: bypassed={bypassed} (eq_enabled={eq_enabled})");
                     if *state_for_bypass.eq_enabled.lock().unwrap() != eq_enabled {
                         *state_for_bypass.eq_enabled.lock().unwrap() = eq_enabled;
@@ -580,7 +605,7 @@ impl MiniEqWindow {
             utility.bypass_switch.set_tooltip_text(Some(if routed {
                 "Compare with/without the EQ. Works because app audio is routed through the EQ."
             } else {
-                "Turn on the systemwide EQ switch first — audio has to be routed \
+                "Turn on the EQ switch first — audio has to be routed \
                  through the EQ for this to have any effect."
             }));
         }
@@ -752,6 +777,23 @@ impl MiniEqWindow {
         });
         window.add_controller(key_controller);
 
+        // Shared output/monitor device state, owned at function scope and
+        // cloned into the tick closure (remote drain), the Output dropdown,
+        // the default-sink watcher and the monitor blocks below: which output
+        // had its preset applied, whether the chain follows the system
+        // default, and where the monitor is pinned. One cell for all three
+        // drivers so D-Bus commands and the dropdown cannot diverge.
+        let output_preset_identity: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        // Devices whose chain still needs its payload pushed (waiting on the
+        // live proxy). Shared by the tick, the per-device ON handlers and the
+        // D-Bus drain.
+        let device_pending: Rc<RefCell<std::collections::HashSet<String>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        let device_pending_tick = device_pending.clone();
+        let output_follows_default = Rc::new(std::cell::Cell::new(true));
+        let monitor_pinned: Rc<RefCell<Option<String>>> =
+            Rc::new(RefCell::new(crate::core::output_monitor_sink()));
+
         // Start real-time update loop for graph + headroom + backend push
         {
             let graph = utility.graph.clone();
@@ -777,6 +819,7 @@ impl MiniEqWindow {
             // Tracked separately from the payload signature so an A/B toggle can
             // skip the 400 ms fader-drag debounce.
             let last_pushed_eq_enabled = Rc::new(RefCell::new(true));
+            let device_pending = device_pending_tick.clone();
             let last_push = Rc::new(RefCell::new(
                 std::time::Instant::now() - std::time::Duration::from_millis(500),
             ));
@@ -786,9 +829,23 @@ impl MiniEqWindow {
             // change back, keeping the two in sync).
             let window_handle = window.clone();
             let route_switch_handle = route_switch.clone();
+            let mode_selected_handle = mode_selected.clone();
+            let mode_reroute_handle = mode_reroute.clone();
             let bypass_switch_handle = utility.bypass_switch.clone();
             let presets_handle = utility.presets.clone();
             let app_state_handle = app_state.clone();
+            // Cloned for the remote drain inside the tick closure; the owners
+            // live at function scope (created above) and are also consumed by
+            // the dropdown/watcher/monitor blocks further down.
+            let output_preset_identity = output_preset_identity.clone();
+            let output_follows_default = output_follows_default.clone();
+            let monitor_pinned = monitor_pinned.clone();
+            let monitor_switch_handle = utility.graph.borrow().monitor_switch.clone();
+            let monitor_summary_handle = utility.monitor.summary.clone();
+            // Clones of the handler-id cells for the remote drain (the cells
+            // themselves live at function scope, created before the bypass
+            // switch block above).
+            let route_state_handler_tick = route_state_handler.clone();
 
             // Wire the Monitor Settings controls (the only place the app
             // exposes them, as upstream) to the backend.
@@ -830,6 +887,12 @@ impl MiniEqWindow {
             let monitor_frozen_tick = monitor_frozen.clone();
             let monitor_display_gain_tick = monitor_display_gain.clone();
             let held_levels: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+            // Auto-write-back debounce: the instant of the last edit that moved
+            // the curve away from the linked preset. Cleared when the curve
+            // comes back in sync, so a drag rewrites once ~1.5 s after it
+            // stops rather than continuously.
+            let last_edit_instant: Rc<RefCell<Option<std::time::Instant>>> =
+                Rc::new(RefCell::new(None));
 
             glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
                 // --- Remote control (D-Bus) -----------------------------
@@ -846,9 +909,17 @@ impl MiniEqWindow {
                         &backend,
                         &engine_sink,
                         &route_switch_handle,
+                        &mode_selected_handle,
+                        &mode_reroute_handle,
                         &bypass_switch_handle,
                         &presets_handle,
                         &window_handle,
+                        &output_preset_identity,
+                        &output_follows_default,
+                        &monitor_pinned,
+                        &monitor_switch_handle,
+                        &monitor_summary_handle,
+                        &route_state_handler_tick,
                     );
                 }
 
@@ -943,6 +1014,9 @@ impl MiniEqWindow {
                 // Publish what the D-Bus interface reports, reusing the levels
                 // already read above rather than asking the backend twice.
                 // `visible` is derived rather than tracked so it cannot drift.
+                let output_preset_for_state =
+                    crate::core::output_preset_for_sink(&engine_sink.borrow());
+                let monitor_sink_for_state = crate::core::output_monitor_sink();
                 app_state_handle.publish(
                     levels.clone(),
                     monitor_display_gain_tick.value(),
@@ -953,6 +1027,16 @@ impl MiniEqWindow {
                         .as_ref()
                         .map(|be| be.monitor_enabled())
                         .unwrap_or(false),
+                    backend
+                        .borrow()
+                        .as_ref()
+                        .map(|be| be.output_mode())
+                        .unwrap_or(crate::core::OutputRoutingMode::Selected),
+                    output_preset_for_state,
+                    monitor_sink_for_state,
+                    // The chain's true destination, every tick: a refused or
+                    // failed output switch must never linger in GetState.
+                    Some(engine_sink.borrow().clone()).filter(|s| !s.is_empty()),
                 );
                 // Rate-limited inside AppState (upstream parity: 100 ms). Only
                 // while the monitor is running, matching upstream, which stops
@@ -1001,6 +1085,51 @@ impl MiniEqWindow {
                     if *last_state_signature.borrow() != signature {
                         *last_state_signature.borrow_mut() = signature;
                         presets_for_chip.borrow_mut().update_state_chip();
+                    }
+                }
+
+                // Auto-write-back: when the active output device is linked to a preset and
+                // the live curve moves away from it, the curve is written into
+                // that preset after a debounce, so a drag does not rewrite the
+                // file continuously while the chain is reloading anyway. It
+                // only writes into a preset linked from exactly one device --
+                // writing into one linked from two would silently change the
+                // curve for a device the user did not touch, which is worse
+                // than leaving it Modified.
+                //
+                // The debounce is on the last EDIT, not the last tick: a drag
+                // that settles rewrites once, ~1.5 s after it stops.
+                {
+                    let signature = crate::core::preset_payload_state_signature(
+                        &crate::core::preset_payload(&bands, preamp_db),
+                    );
+                    let saved =
+                        crate::core::output_preset_saved_signature_for_sink(&engine_sink.borrow());
+                    if saved.as_deref() != Some(signature.as_str()) {
+                        // The curve has moved away from the linked preset.
+                        *last_edit_instant.borrow_mut() = Some(std::time::Instant::now());
+                    } else {
+                        // Back in sync: nothing to write.
+                        *last_edit_instant.borrow_mut() = None;
+                    }
+                    if let Some(when) = *last_edit_instant.borrow() {
+                        if when.elapsed() >= std::time::Duration::from_millis(1500) {
+                            let sink = engine_sink.borrow().clone();
+                            let bands_for_write = bands.clone();
+                            let preamp_for_write = preamp_db;
+                            *last_edit_instant.borrow_mut() = None;
+                            if let Err(e) = crate::core::auto_write_output_preset_for_sink(
+                                &sink,
+                                &bands_for_write,
+                                preamp_for_write,
+                            ) {
+                                log::warn!("Auto write-back failed: {e}");
+                            } else {
+                                // The panel's chip is recomputed from the live
+                                // signature next tick, so it reflects the write.
+                                presets_for_chip.borrow_mut().update_state_chip();
+                            }
+                        }
                     }
                 }
 
@@ -1069,42 +1198,70 @@ impl MiniEqWindow {
                 let bypass_changed = eq_enabled != *last_pushed_eq_enabled.borrow();
                 let debounced_payload = payload_changed
                     && last_push.borrow().elapsed() >= std::time::Duration::from_millis(400);
-                if debounced_payload || bypass_changed {
-                    // Startup grace: the live node proxy is captured
-                    // asynchronously after the module load. Pushing before it
-                    // exists used to fall through to a full module
-                    // unload+reload, cutting the audio a SECOND time just
-                    // after startup. Leave the signature unpushed so the next
-                    // tick retries once the proxy has arrived.
-                    let live_ready = backend
+                // Per-device EQ: the selected device's edits are the only band
+                // payload; every known chain still deserves a wet/bypass push
+                // when A/B changes. Anything pushed gets taken off the pending
+                // set only when its live proxy has accepted the push (startup
+                // grace, like the legacy singleton had).
+                let selected = engine_sink.borrow().clone();
+                if debounced_payload && !selected.is_empty() {
+                    device_pending.borrow_mut().insert(selected.clone());
+                }
+                if bypass_changed {
+                    let devs: Vec<String> = backend
                         .borrow()
                         .as_ref()
-                        .map(|be| be.has_live_node())
-                        .unwrap_or(false);
-                    if live_ready {
+                        .map(|be| be.device_physical_sinks())
+                        .unwrap_or_default();
+                    for dev in devs {
+                        device_pending.borrow_mut().insert(dev);
+                    }
+                }
+                {
+                    let mut pending = device_pending.borrow_mut();
+                    for dev in pending.clone().iter() {
+                        let (exists, ready) = {
+                            let guard = backend.borrow();
+                            match guard.as_ref() {
+                                Some(be) => {
+                                    (be.has_device_chain(dev), be.has_device_live_node(dev))
+                                }
+                                None => (false, false),
+                            }
+                        };
+                        if !exists {
+                            // Chain gone (failed creation or teardown): nothing
+                            // to retry forever.
+                            pending.remove(dev);
+                            continue;
+                        }
+                        if !ready {
+                            continue; // proxy still arriving; retry next tick
+                        }
                         if let Some(be) = backend.borrow_mut().as_mut() {
-                            // Re-read the engine sink every tick: the Output
-                            // dropdown can move it while this timer runs.
-                            let sink_now = engine_sink.borrow().clone();
-                            if !sink_now.is_empty() {
-                                let _ = be.set_preamp(preamp_db);
-                                *be.get_bands_mut() = bands.clone();
-                                match be.update_state_live_or_reload(&sink_now, eq_enabled) {
-                                    Ok(()) => {
-                                        log::debug!(
-                                            "Backend state applied (eq_enabled={eq_enabled})"
-                                        );
-                                    }
-                                    Err(e) => log::warn!("Failed to apply backend state: {}", e),
+                            if *dev == selected && !selected.is_empty() {
+                                be.set_device_bands(dev, bands.clone());
+                                be.set_device_preamp(dev, preamp_db);
+                            }
+                            match be.device_push_live(dev, eq_enabled) {
+                                Ok(true) => {
+                                    pending.remove(dev);
+                                }
+                                Ok(false) => {} // not ready yet
+                                Err(e) => {
+                                    pending.remove(dev);
+                                    log::warn!("Backend device push failed: {e}");
                                 }
                             }
-                            // Mark pushed either way so a failing state is not
-                            // retried every tick; further edits change the sig.
-                            *last_pushed_sig.borrow_mut() = payload_sig;
-                            *last_pushed_eq_enabled.borrow_mut() = eq_enabled;
-                            *last_push.borrow_mut() = std::time::Instant::now();
                         }
                     }
+                }
+                if debounced_payload {
+                    *last_pushed_sig.borrow_mut() = payload_sig;
+                    *last_push.borrow_mut() = std::time::Instant::now();
+                }
+                if bypass_changed {
+                    *last_pushed_eq_enabled.borrow_mut() = eq_enabled;
                 }
                 ControlFlow::Continue
             });
@@ -1128,13 +1285,18 @@ impl MiniEqWindow {
         let output_names_for_refresh = output_names.clone();
         let dropdown_for_refresh = output_dropdown.clone();
         let backend_for_outputs = backend.clone();
-        // Identity of the output whose preset was last applied. Shared by the
-        // dropdown and the default-sink watcher so neither of them re-applies a
-        // preset for the sink the other already handled.
-        let output_preset_identity: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        // Cloned here too: the select handler below re-syncs the header
+        // switch with the newly selected device's own on/off state.
+        let route_switch_for_output = route_switch.clone();
+        let route_handler_for_output = route_state_handler.clone();
+        // Identity of the output whose preset was last applied, and whether
+        // the chain follows the system default. Shared by the dropdown, the
+        // default-sink watcher and the D-Bus commands; created before the
+        // tick closure above, cloned here for these blocks.
+        let output_preset_identity = output_preset_identity.clone();
         // True while index 0 ("Default Output") is selected. The default-sink
         // watcher below must not fight an explicitly chosen device.
-        let output_follows_default = Rc::new(std::cell::Cell::new(true));
+        let output_follows_default = output_follows_default.clone();
 
         let refresh_output_sinks = std::rc::Rc::new(move || {
             let sinks = backend_for_outputs
@@ -1190,23 +1352,28 @@ impl MiniEqWindow {
             let summary_for_select = utility.monitor.summary.clone();
             output_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
                 let idx = dd.selected() as usize;
-                let names = names_for_select.borrow();
+                // Cloned, not borrowed: the refusal path below re-enters this
+                // handler via `set_selected`, and a live borrow would panic.
+                let names = names_for_select.borrow().clone();
                 // Index 0 means "follow the system default". That still has to
                 // be resolved to a concrete sink: the filter chain's
                 // destination is fixed when the module loads, so going back to
                 // the default has to rebuild the chain onto whatever the
                 // default currently is — the same work as picking a device.
-                let chosen = if idx == 0 {
-                    follow_default_for_select.set(true);
-                    backend_for_select
-                        .borrow_mut()
-                        .as_mut()
-                        .and_then(|be| be.default_output_sink())
-                        .unwrap_or_default()
+                // The follow flag is only committed once the switch is known
+                // to go ahead (a refused switch must leave it untouched).
+                let (chosen, want_follow) = if idx == 0 {
+                    (
+                        backend_for_select
+                            .borrow_mut()
+                            .as_mut()
+                            .and_then(|be| be.default_output_sink())
+                            .unwrap_or_default(),
+                        true,
+                    )
                 } else {
-                    follow_default_for_select.set(false);
                     match names.get(idx) {
-                        Some(name) => name.clone(),
+                        Some(name) => (name.clone(), false),
                         None => return,
                     }
                 };
@@ -1218,25 +1385,11 @@ impl MiniEqWindow {
                     log::debug!("Output device: already on {chosen}");
                     return;
                 }
-                // Rebuilding the filter chain is disruptive: the sink node is
-                // destroyed and recreated, so there is a brief audio gap and
-                // every routed stream has to be re-pointed at the new node. Do
-                // it off the UI's critical path.
-                // Inline on the GTK thread: PipeWire is main-thread-only, and
-                // the existing System-EQ switch handler already does its
-                // routing work the same way.
-                let ok = backend_for_select
-                    .borrow_mut()
-                    .as_mut()
-                    .map(|b| b.retarget_output(&chosen))
-                    .unwrap_or(false);
-                log::info!(
-                    "Output switch to {chosen}: {}",
-                    if ok { "ok" } else { "FAILED" }
-                );
-                if !ok {
-                    return;
-                }
+                // Selecting a device NEVER re-engineers audio: every device has
+                // its own chain and stays exactly as the user left it. All that
+                // changes is the editing context (faders/preamp) and where the
+                // monitor listens.
+                follow_default_for_select.set(want_follow);
                 *engine_sink_for_select.borrow_mut() = chosen.clone();
                 apply_output_preset_for_sink(&chosen, &output_preset_identity, &presets_for_output);
                 if state_for_select.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str())
@@ -1244,17 +1397,36 @@ impl MiniEqWindow {
                     *state_for_select.output_sink.lock().unwrap() = Some(chosen.clone());
                     state_for_select.emit_state_changed();
                 }
-                // The monitor taps the monitor ports of a PHYSICAL sink, and
-                // those ports are not touched by the chain rebuild — so after
-                // a switch it is still listening to the sink the EQ just left,
-                // where nothing plays any more. That is what froze the
-                // spectrum and the peak meter the moment another output was
-                // chosen. Follow the new output.
+                // The header switch always reflects the SELECTED device's own
+                // on/off state, so flipping to a device whose EQ is off shows
+                // it off (and vice versa) without touching audio.
+                let dev_on = backend_for_select
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|be| be.has_routed_streams_for(&chosen));
+                {
+                    let sw = route_switch_for_output.clone();
+                    if let Some(id) = route_handler_for_output.borrow().as_ref() {
+                        sw.block_signal(id);
+                    }
+                    if dev_on != sw.is_active() {
+                        sw.set_active(dev_on);
+                    }
+                    if let Some(id) = route_handler_for_output.borrow().as_ref() {
+                        sw.unblock_signal(id);
+                    }
+                }
+                if *state_for_select.routed.lock().unwrap() != dev_on {
+                    *state_for_select.routed.lock().unwrap() = dev_on;
+                    state_for_select.emit_state_changed();
+                }
+                // The monitor taps the PHYSICAL sink: follow the selection when
+                // no device was pinned manually.
                 if let Some(be) = backend_for_select.borrow_mut().as_mut() {
-                    if be.monitor_enabled() {
+                    if be.monitor_enabled() && crate::core::output_monitor_sink().is_none() {
                         match be.retarget_monitor(&chosen) {
                             Ok(()) => summary_for_select.set_text("On \u{00b7} Live (retargeted)"),
-                            Err(e) => log::warn!("Monitor retarget to {chosen} failed: {e}"),
+                            Err(e) => log::warn!("Monitor retarget failed: {e}"),
                         }
                     }
                 }
@@ -1271,44 +1443,40 @@ impl MiniEqWindow {
             let last_default_sink: Rc<std::cell::Cell<String>> =
                 Rc::new(std::cell::Cell::new(String::new()));
             let backend_sink_watch = backend.clone();
-            let summary_sink_watch = utility.monitor.summary.clone();
             let refresh_outputs_watch = refresh_output_sinks.clone();
-            let follow_default_watch = output_follows_default.clone();
-            let engine_sink_watch = engine_sink.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 // Detect the system default output changing and follow it
-                // with the MONITOR. The monitor is a separate capture
-                // stream, so stop+start cannot interrupt the EQ audio path.
+                // with the EQ itself. `retarget_output` moves the chain's
+                // output stream live when it can and only rebuilds the module
+                // as a fallback, so this is cheap and does not touch any
+                // playback stream.
                 //
-                // The filter-chain's own output re-link is deliberately
-                // NOT attempted here: doing it blind (remove link + create
-                // link) risks silence or a feedback loop and needs live
-                // validation against a real sink switch. See docs/TODO.md.
+                // The change is delivered by the metadata `property` listener
+                // in real time (`take_default_sink_change`), so this timer is
+                // a cheap flag read, not a poll: no PipeWire pump, no 50 ms
+                // stall per tick. The 500 ms cadence is only the debounce
+                // between acting on it.
+                //
+                // The chain only follows the default while the user has NOT
+                // picked a device: an explicit choice pins the chain, and
+                // letting this watcher pull it away would undo the selection.
                 // Re-read the output device list on the same cadence. The
                 // refresh closure is a no-op unless the list actually changed,
                 // so polling is cheap and also catches hotplug.
                 refresh_outputs_watch();
 
                 if let Some(be) = backend_sink_watch.borrow_mut().as_mut() {
-                    // Only while the user has NOT picked a device. After an
-                    // explicit choice this watcher would pull the monitor off
-                    // the sink the EQ is actually playing to, freezing it
-                    // again — the same failure the dropdown had.
-                    let follow = follow_default_watch.get();
-                    let on_engine_sink = follow
-                        || be.default_output_sink().as_deref()
-                            == Some(engine_sink_watch.borrow().as_str());
-                    if let Some(now) = be.refresh_default_audio_sink_name() {
+                    if let Some(now) = be.take_default_sink_change() {
                         let prev = last_default_sink.replace(now.clone());
-                        if !prev.is_empty() && prev != now && be.monitor_enabled() && on_engine_sink
-                        {
-                            log::info!("Default output changed {prev} -> {now}, following monitor");
-                            match be.retarget_monitor(&now) {
-                                Ok(()) => {
-                                    summary_sink_watch.set_text("On \u{00b7} Live (retargeted)");
-                                }
-                                Err(e) => log::warn!("Monitor retarget failed: {e}"),
-                            }
+                        if !prev.is_empty() && prev != now {
+                            // With one chain per device there is nothing to
+                            // follow: a chain only serves its own device, so a
+                            // default change does not move anything. New
+                            // streams just resolve to whichever device they
+                            // actually play to, and that device's chain handles
+                            // them if the user enabled EQ there. We still log
+                            // it for visibility.
+                            log::info!("Default output changed {prev} -> {now}");
                         }
                     }
                 }
@@ -1350,51 +1518,184 @@ impl MiniEqWindow {
             });
         }
 
-        // System-wide EQ switch: route all app playback streams into the
-        // virtual EQ sink (on) / log that unrouting is not yet implemented
-        // (off).
+        // EQ on/off, which also carries the bypass and the routed flag.
+        // The mode is read from the buttons at switch-on and remembered, so
+        // toggling off and back on restores the mode rather than always
+        // re-routing everything. Switching off hands the streams back
+        // (unroute), so the EQ truly leaves the signal path.
         {
             let backend_for_switch = backend.clone();
-            let engine_sink_for_switch = engine_sink.clone();
             let state_for_switch = app_state.clone();
             let bypass_for_route = utility.bypass_switch.clone();
-            route_switch.connect_state_set(move |_switch, on| {
-                if let Some(be) = backend_for_switch.borrow_mut().as_mut() {
-                    if on {
-                        if let Err(e) = be.auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE) {
-                            log::warn!("System EQ: auto-route failed: {}", e);
+            let mode_reroute_for_switch = mode_reroute.clone();
+            let engine_sink_for_switch = engine_sink.clone();
+            let device_pending_for_switch = device_pending.clone();
+            // Handler id kept for the D-Bus drain (see bypass above):
+            // `set_active` emits `state-set`, so the drain blocks this while
+            // syncing the widget and performs the routing itself.
+            *route_state_handler.borrow_mut() = Some(
+                route_switch.connect_state_set(move |_switch, on| {
+                if !on {
+                    bypass_for_route.set_sensitive(false);
+                    bypass_for_route.set_tooltip_text(Some(
+                        "Turn on the EQ switch first — audio has to be \
+                         routed through the EQ for this to have any effect.",
+                    ));
+                    if let Some(be) = backend_for_switch.borrow_mut().as_mut() {
+                        // EQ off for the selected device: its streams are handed
+                        // back to their real targets, and only that device is
+                        // touched. Every other device's chain keeps running.
+                        let dev = engine_sink_for_switch.borrow().clone();
+                        if !dev.is_empty() {
+                            if let Err(e) = be.unroute_device(&dev, Some(&dev)) {
+                                log::warn!("EQ off: unroute device failed: {e}");
+                            }
                         }
+                    }
+                    if *state_for_switch.routed.lock().unwrap() {
+                        *state_for_switch.routed.lock().unwrap() = false;
+                        state_for_switch.emit_state_changed();
+                    }
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(be) = backend_for_switch.borrow_mut().as_mut() {
+                    let mode = if mode_reroute_for_switch.is_active() {
+                        crate::core::OutputRoutingMode::Reroute
                     } else {
-                        // Recorded targets are restored verbatim; the EQ's own
-                        // output sink is only the fallback for streams this
-                        // process never routed.
-                        let chain_output = engine_sink_for_switch.borrow().clone();
-                        if let Err(e) = be.unroute_all(Some(&chain_output)) {
-                            log::warn!("System EQ off: unroute failed: {}", e);
+                        crate::core::OutputRoutingMode::Selected
+                    };
+                    be.set_output_mode(mode);
+                    let dev = engine_sink_for_switch.borrow().clone();
+                    if !dev.is_empty() {
+                        // Chain for THIS device, created on first enable. Its
+                        // starting curve comes from the device's linked preset
+                        // (or the fallback/neutral default), never from another
+                        // device's curve.
+                        if !be.has_device_chain(&dev) {
+                            let (bands, preamp) = device_initial_curve(&dev);
+                            if let Err(e) = be.ensure_device_chain(&dev, bands) {
+                                log::warn!("EQ on: failed to start EQ for {dev}: {e}");
+                            } else {
+                                be.set_device_preamp(&dev, preamp);
+                            }
+                        }
+                        be.set_current_sink(&dev);
+                        let eq_name = crate::core::eq_virtual_sink_for(&dev);
+                        if let Err(e) = be.auto_route_to_sink(&eq_name) {
+                            log::warn!("EQ on: auto-route failed: {e}");
+                        }
+                        device_pending_for_switch.borrow_mut().insert(dev.clone());
+                        // Keep the monitor on this device while following
+                        // (no pinned device) -- it is freshly audible now.
+                        if be.monitor_enabled()
+                            && crate::core::output_monitor_sink().is_none()
+                        {
+                            if let Err(e) = be.retarget_monitor(&dev) {
+                                log::warn!("EQ on: monitor retarget failed: {e}");
+                            }
                         }
                     }
                 }
-                // The A/B switch bypasses the EQ *inside* mini_eq_sink, so it
-                // can only be audible while app audio is actually routed
-                // through that sink. With systemwide routing off, playback
-                // streams go straight to the real output and every EQ control —
-                // including this one — is out of the signal path. Leaving the
-                // switch live and sensitive in that state made it look broken.
-                bypass_for_route.set_sensitive(on);
-                bypass_for_route.set_tooltip_text(Some(if on {
-                    "Compare with/without the EQ. Works because app audio is routed through the EQ."
-                } else {
-                    "Turn on the systemwide EQ switch first — audio has to be routed \
-                     through the EQ for this to have any effect."
-                }));
-                // Keep GetState / StateChanged honest when the change came
-                // from the UI rather than from D-Bus.
-                if *state_for_switch.routed.lock().unwrap() != on {
-                    *state_for_switch.routed.lock().unwrap() = on;
+                bypass_for_route.set_sensitive(true);
+                bypass_for_route.set_tooltip_text(Some(
+                    "Compare with/without the EQ. Works because app audio is routed through the EQ.",
+                ));
+                if *state_for_switch.routed.lock().unwrap() != true {
+                    *state_for_switch.routed.lock().unwrap() = true;
                     state_for_switch.emit_state_changed();
                 }
                 glib::Propagation::Proceed
+            }));
+        }
+
+        // The two mode buttons are mutually exclusive and the mode is persisted
+        // across restarts, so the remembered choice is restored here rather
+        // than only shown after the user clicks. The default is Selected, which
+        // is also what a missing or version-1 config reads as.
+        {
+            let backend_restore = backend.clone();
+            let mode_selected_restore = mode_selected.clone();
+            let mode_reroute_restore = mode_reroute.clone();
+            let restore_mode = std::rc::Rc::new(move || {
+                let mode = crate::core::output_routing_mode();
+                if mode == crate::core::OutputRoutingMode::Reroute {
+                    mode_reroute_restore.set_active(true);
+                    mode_selected_restore.set_active(false);
+                } else {
+                    mode_selected_restore.set_active(true);
+                    mode_reroute_restore.set_active(false);
+                }
+                if let Some(be) = backend_restore.borrow_mut().as_mut() {
+                    be.set_output_mode(mode);
+                }
             });
+            // Clicking one turns the other off. The mode is only acted on when
+            // the switch is on; turning Reroute on while the EQ is off does not
+            // route anything, it only decides what a later switch-on does.
+            let mode_reroute_a = mode_reroute.clone();
+            let backend_a = backend.clone();
+            let state_a = app_state.clone();
+            let engine_sink_for_modes = engine_sink.clone();
+            let persist_selected = std::rc::Rc::new(move || {
+                let mode = if mode_reroute_a.is_active() {
+                    crate::core::OutputRoutingMode::Reroute
+                } else {
+                    crate::core::OutputRoutingMode::Selected
+                };
+                if let Err(e) = crate::core::set_output_routing_mode(mode) {
+                    log::warn!("persist output mode: {e}");
+                }
+                if let Some(be) = backend_a.borrow_mut().as_mut() {
+                    be.set_output_mode(mode);
+                    if be.is_routed() {
+                        if mode == crate::core::OutputRoutingMode::Reroute {
+                            // Reroute: everything moves into the SELECTED
+                            // device's chain (its presets/bands apply to all).
+                            let sel = engine_sink_for_modes.borrow().clone();
+                            if !sel.is_empty() {
+                                let eq = crate::core::eq_virtual_sink_for(&sel);
+                                match be.auto_route_to_sink(&eq) {
+                                    Ok(()) => {
+                                        log::info!("Output mode -> {mode:?} (re-routed into {eq})")
+                                    }
+                                    Err(e) => log::warn!("Output mode re-route failed: {e}"),
+                                }
+                            }
+                        } else {
+                            // Narrowing to Selected: hand back the streams that
+                            // are effectively aimed elsewhere in every chain.
+                            for dev in be.device_physical_sinks() {
+                                if let Err(e) = be.rescope_device(&dev) {
+                                    log::warn!("Output mode rescope failed for {dev}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+                if *state_a.routed.lock().unwrap() {
+                    state_a.emit_state_changed();
+                }
+            });
+            let persist_reroute = persist_selected.clone();
+            let mode_selected_b = mode_selected.clone();
+            let mode_reroute_b = mode_reroute.clone();
+            mode_selected.connect_clicked(move |_btn| {
+                if !mode_selected_b.is_active() {
+                    return;
+                }
+                mode_reroute_b.set_active(false);
+                persist_selected();
+            });
+            let mode_selected_c = mode_selected.clone();
+            let mode_reroute_c = mode_reroute.clone();
+            mode_reroute.connect_clicked(move |_btn| {
+                if !mode_reroute_c.is_active() {
+                    return;
+                }
+                mode_selected_c.set_active(false);
+                persist_reroute();
+            });
+            restore_mode();
         }
 
         // --- Tear down routing BEFORE the backend goes away.
@@ -1435,69 +1736,69 @@ impl MiniEqWindow {
         // require restarting the filter-chain engine.
         {
             let backend_for_monitor = backend.clone();
-            let monitor_target = engine_sink.clone();
             let summary = utility.monitor.summary.clone();
-            utility
-                .graph
-                .borrow()
-                .monitor_switch
-                .connect_state_set(move |_switch, on| {
-                    if let Some(be) = backend_for_monitor.borrow_mut().as_mut() {
-                        if on {
-                            let target = resolve_monitor_target(&monitor_target, be);
-                            if target.is_empty() {
-                                log::warn!("Monitor: no output sink to capture");
-                                summary.set_text("Off · no sink");
-                                return glib::Propagation::Stop;
-                            }
-                            match be.start_monitor(&target) {
-                                Ok(()) => {
-                                    log::info!("Monitor enabled on {target}");
-                                    summary.set_text("On · Live");
-                                    let _ = crate::settings::save_monitor_enabled(true);
-                                }
-                                Err(e) => {
-                                    log::warn!("Monitor start failed: {e}");
-                                    summary.set_text("Off");
+            // Handler id kept for the D-Bus drain and the restore below, both
+            // of which sync the widget programmatically (`set_active` emits
+            // `state-set`, so they block this while doing so and perform the
+            // backend work themselves).
+            {
+                let state_for_monitor = app_state.clone();
+                utility
+                    .graph
+                    .borrow()
+                    .monitor_switch
+                    .connect_state_set(move |_switch, on| {
+                        if let Some(be) = backend_for_monitor.borrow_mut().as_mut() {
+                            if on {
+                                let target = resolve_monitor_target(be);
+                                if target.is_empty() {
+                                    log::warn!("Monitor: no output sink to capture");
+                                    summary.set_text("Off · no sink");
                                     return glib::Propagation::Stop;
                                 }
+                                match be.start_monitor(&target) {
+                                    Ok(()) => {
+                                        log::info!("Monitor enabled on {target}");
+                                        summary.set_text(&format!(
+                                            "On \u{00b7} Live{}",
+                                            if let Some(pinned) = crate::core::output_monitor_sink()
+                                            {
+                                                format!(" ({pinned})")
+                                            } else {
+                                                String::new()
+                                            }
+                                        ));
+                                        let _ = crate::settings::save_monitor_enabled(true);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Monitor start failed: {e}");
+                                        summary.set_text("Off");
+                                        return glib::Propagation::Stop;
+                                    }
+                                }
+                            } else {
+                                be.stop_monitor();
+                                summary.set_text("Off");
+                                let _ = crate::settings::save_monitor_enabled(false);
                             }
-                        } else {
-                            be.stop_monitor();
-                            summary.set_text("Off");
-                            let _ = crate::settings::save_monitor_enabled(false);
                         }
-                    }
-                    glib::Propagation::Proceed
-                });
-
-            // Restore the persisted monitor state. load_monitor_enabled()
-            // existed but was never called, so the monitor always came up
-            // off regardless of how the user left it.
-            let want_monitor = crate::settings::load_monitor_enabled();
+                        *state_for_monitor.analyzer_enabled.lock().unwrap() = on;
+                        state_for_monitor.emit_state_changed();
+                        glib::Propagation::Proceed
+                    });
+            }
+            // Restore the persisted monitor state; the widget handler above
+            // starts the capture on set_active.
             {
                 let sw = utility.graph.borrow().monitor_switch.clone();
-                let summary = utility.monitor.summary.clone();
-                let backend_restore = backend.clone();
-                let monitor_target = engine_sink.clone();
-                sw.set_active(want_monitor);
-                if want_monitor {
-                    if let Some(be) = backend_restore.borrow_mut().as_mut() {
-                        let target = resolve_monitor_target(&monitor_target, be);
-                        if !target.is_empty() && be.start_monitor(&target).is_ok() {
-                            log::info!("Monitor restored on {target}");
-                            summary.set_text("On · Live");
-                        }
-                    }
-                }
-                let _ = summary;
+                sw.set_active(crate::settings::load_monitor_enabled());
             }
         }
 
         // Output Controls (Headroom panel): per-output-device auto-preset.
-        // Fallback = default preset for unmatched outputs; Link to Output =
-        // auto-load the current preset for the active output device. Both
-        // act on the currently-selected preset (from the Preset panel).
+        // Fallback = default preset for unmatched outputs; the Curve dropdown
+        // = the preset linked to the active output device. Both act on the
+        // currently-selected preset (from the Preset panel).
         {
             let presets = utility.presets.clone();
             let fallback_label = utility.fallback_label.clone();
@@ -1514,31 +1815,281 @@ impl MiniEqWindow {
                     None => log::info!("No preset selected to set as fallback"),
                 }
             });
+        }
 
-            let presets = utility.presets.clone();
-            let link_label = utility.link_label.clone();
-            utility.link_button.connect_clicked(move |_| {
-                match presets.borrow().current_preset_name() {
-                    Some(name) => {
-                        // Key by the sink the EQ is actually feeding. The old
-                        // code wrote the literal "default", so there was one
-                        // undifferentiated entry no matter how many outputs
-                        // existed -- and nothing read it anyway.
-                        let key = crate::core::output_preset_key_for_sink(&engine_sink.borrow());
-                        if key.is_empty() {
-                            log::info!("Link preset: no output device known yet");
-                            return;
-                        }
-                        if let Err(e) = crate::core::set_output_preset_link(&key, &name) {
-                            log::warn!("Link preset to output failed: {e}");
-                        } else {
-                            link_label.set_text(&name);
-                            log::info!("Linked preset {name} to output");
-                        }
+        // Curve: the preset linked to the active output device. Choosing a
+        // preset in this dropdown links it to the device immediately, so the
+        // reader will use it on the next switch. Unlink drops the link and the
+        // fallback applies instead.
+        //
+        // The model is refilled from the preset library on a 330 ms cadence,
+        // so a preset created or deleted elsewhere shows up here without a
+        // restart. The active device's linked preset is selected; "(none)"
+        // means the fallback applies.
+        {
+            let curve_dropdown = utility.curve_dropdown.clone();
+            let unlink_button = utility.unlink_button.clone();
+            let engine_sink_for_curve = engine_sink.clone();
+            let presets_for_curve = utility.presets.clone();
+            // Guard so programmatic model/selection refreshes do not fire
+            // the link handler below (which would re-link + reload a preset
+            // on every 330 ms tick).
+            let curve_syncing: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+            let curve_known: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let curve_syncing_for_refresh = curve_syncing.clone();
+            // Full preset list for the Curve dropdown: "(none)" (fallback
+            // applies) + built-ins + customs. Previously this only listed
+            // custom presets and never showed "(none)", so with a single
+            // preset it looked like it only contained the current curve.
+            let refresh_curve_model = std::rc::Rc::new(move || {
+                let names = crate::window_presets::curve_model_names();
+                let active = crate::core::output_preset_for_sink(&engine_sink_for_curve.borrow());
+                // Position of the linked preset in the model (0 = "(none)").
+                let want: u32 = active
+                    .as_ref()
+                    .and_then(|name| names.iter().position(|n| n == name))
+                    .unwrap_or(0) as u32;
+                let selected = curve_dropdown.selected();
+                if *curve_known.borrow() == names && selected == want {
+                    return;
+                }
+                *curve_known.borrow_mut() = names.clone();
+                let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                let model = gtk4::StringList::new(&refs);
+                curve_syncing_for_refresh.set(true);
+                curve_dropdown.set_model(Some(&model));
+                curve_dropdown.set_selected(want);
+                curve_syncing_for_refresh.set(false);
+                unlink_button.set_sensitive(active.is_some());
+            });
+            let refresh_curve_model_for_tick = refresh_curve_model.clone();
+            let curve_dropdown_for_tick = utility.curve_dropdown.clone();
+            let unlink_button_for_tick = utility.unlink_button.clone();
+            let engine_sink_for_unlink = engine_sink.clone();
+            let curve_dropdown_for_unlink = utility.curve_dropdown.clone();
+            let unlink_button_for_unlink = utility.unlink_button.clone();
+            let presets_for_link = utility.presets.clone();
+            let engine_sink_for_link = engine_sink.clone();
+            let unlink_button_for_link = utility.unlink_button.clone();
+            let curve_dropdown_for_notify = utility.curve_dropdown.clone();
+            let unlink_button_for_click = utility.unlink_button.clone();
+            let curve_syncing_for_notify = curve_syncing.clone();
+            curve_dropdown_for_notify.connect_selected_notify(move |dd| {
+                if curve_syncing_for_notify.get() {
+                    return;
+                }
+                let pos = dd.selected();
+                if pos == 0 {
+                    // "(none)" is not a real preset; treat it as "no link".
+                    return;
+                }
+                let Some(name) = dd
+                    .model()
+                    .and_then(|m| m.downcast_ref::<gtk4::StringList>().cloned())
+                    .and_then(|m| m.string(pos))
+                else {
+                    return;
+                };
+                let name = name.to_string();
+                let key = crate::core::output_preset_key_for_sink(&engine_sink_for_link.borrow());
+                if key.is_empty() {
+                    log::info!("Link preset: no output device known yet");
+                    return;
+                }
+                if let Err(e) = crate::core::set_output_preset_link(&key, &name) {
+                    log::warn!("Link preset to output failed: {e}");
+                } else {
+                    log::info!("Linked preset {name} to output {key}");
+                    // Loading the linked preset now means the curve on screen
+                    // is the one this device will use.
+                    if let Err(e) = presets_for_link.borrow_mut().load_library_preset(&name) {
+                        log::warn!("Could not load linked preset {name}: {e}");
                     }
-                    None => log::info!("No preset selected to link to output"),
+                    unlink_button_for_link.set_sensitive(true);
                 }
             });
+            unlink_button_for_click.connect_clicked(move |_| {
+                let key = crate::core::output_preset_key_for_sink(&engine_sink_for_unlink.borrow());
+                if key.is_empty() {
+                    log::info!("Unlink preset: no output device known yet");
+                    return;
+                }
+                match crate::core::clear_output_preset_link(std::slice::from_ref(&key)) {
+                    Ok(true) => {
+                        log::info!("Unlinked preset from output {key}");
+                        curve_dropdown_for_unlink.set_selected(0);
+                        unlink_button_for_unlink.set_sensitive(false);
+                    }
+                    Ok(false) => {}
+                    Err(e) => log::warn!("Unlink preset failed: {e}"),
+                }
+            });
+            // Refill the model on a 330 ms cadence so a preset created or
+            // deleted elsewhere is visible here without a restart, and so the
+            // selection tracks the active device's linked preset.
+            {
+                let refresh_for_tick = refresh_curve_model_for_tick.clone();
+                let _ = curve_dropdown_for_tick;
+                let _ = unlink_button_for_tick;
+                let _ = presets_for_curve;
+                glib::timeout_add_local(std::time::Duration::from_millis(330), move || {
+                    refresh_for_tick();
+                    glib::ControlFlow::Continue
+                });
+            }
+            refresh_curve_model();
+        }
+
+        // Monitor device: which sink the spectrum and loudness readout tap.
+        // `Follow EQ output` (index 0) re-resolves to whatever the chain is
+        // playing to; a specific sink pins the monitor to one device so you
+        // can equalise on headphones and still watch the speakers. It is
+        // listen-only — it does not change where the EQ'd audio goes. The
+        // choice is persisted in `output-presets.json` as `monitor`, so a
+        // pinned monitor survives a chain rebuild and `Follow EQ output`
+        // re-resolves after it.
+        {
+            let monitor_dropdown = utility.monitor.monitor_dropdown.clone();
+            let backend_for_monitor = backend.clone();
+            // Pinned monitor device, shared with the D-Bus SetMonitorSink
+            // command; created before the tick closure above.
+            let monitor_pinned = monitor_pinned.clone();
+            let monitor_pinned_for_refresh = monitor_pinned.clone();
+            // Parallel node names for the labels above (index 0 = follow,
+            // i.e. no name). The model is only rebuilt when the sink set
+            // actually changes; rebuilding every tick reset the user's
+            // selection and re-fired the notify handler below, which is what
+            // dropped the monitor after an output switch.
+            let monitor_known: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let monitor_syncing: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+            let monitor_known_for_refresh = monitor_known.clone();
+            let monitor_syncing_for_refresh = monitor_syncing.clone();
+            let refresh_monitor_model = std::rc::Rc::new(move || {
+                let sinks = backend_for_monitor
+                    .borrow()
+                    .as_ref()
+                    .map(|be| be.list_output_sinks())
+                    .unwrap_or_default();
+                let mut names: Vec<String> = Vec::with_capacity(sinks.len() + 1);
+                names.push(String::new());
+                let mut labels: Vec<String> = Vec::with_capacity(sinks.len() + 1);
+                labels.push("Follow EQ output".to_string());
+                for sink in &sinks {
+                    names.push(sink.name.clone());
+                    labels.push(crate::routing::display_label(&sink.description, &sink.name));
+                }
+                // Preserve the selection by NODE NAME where possible. On the
+                // first refresh the persisted pin decides the initial
+                // selection, so a pinned monitor survives a restart even
+                // before the dropdown has ever been touched. (Labels are
+                // display strings like "Built-in Audio"; they never equal the
+                // persisted node name, so matching against them lost the pin.)
+                let want = if let Some(pinned) = monitor_pinned_for_refresh.borrow().as_ref() {
+                    names
+                        .iter()
+                        .position(|n| n == pinned.as_str())
+                        .map(|i| i as u32)
+                        .unwrap_or(0)
+                } else {
+                    let selected = monitor_dropdown.selected() as usize;
+                    let current = monitor_known_for_refresh.borrow().clone();
+                    if selected < current.len() && !current[selected].is_empty() {
+                        let prev = current[selected].clone();
+                        names
+                            .iter()
+                            .position(|n| n == &prev)
+                            .map(|i| i as u32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                };
+                if *monitor_known_for_refresh.borrow() == names
+                    && monitor_dropdown.selected() == want
+                {
+                    monitor_dropdown.set_sensitive(sinks.len() > 1);
+                    return;
+                }
+                *monitor_known_for_refresh.borrow_mut() = names;
+                let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+                let model = gtk4::StringList::new(&label_refs);
+                monitor_syncing_for_refresh.set(true);
+                monitor_dropdown.set_model(Some(&model));
+                monitor_dropdown.set_sensitive(sinks.len() > 1);
+                monitor_dropdown.set_selected(want);
+                monitor_syncing_for_refresh.set(false);
+            });
+            let refresh_monitor_model_for_tick = refresh_monitor_model.clone();
+            let monitor_dropdown_for_notify = utility.monitor.monitor_dropdown.clone();
+            let backend_for_notify = backend.clone();
+            let summary_for_notify = utility.monitor.summary.clone();
+            let monitor_pinned_for_notify = monitor_pinned.clone();
+            let monitor_syncing_for_notify = monitor_syncing.clone();
+            let monitor_known_for_notify = monitor_known.clone();
+            monitor_dropdown_for_notify.connect_notify_local(Some("selected"), move |dd, _| {
+                if monitor_syncing_for_notify.get() {
+                    return;
+                }
+                let idx = dd.selected() as usize;
+                if idx == 0 {
+                    // Follow the chain's current output.
+                    *monitor_pinned_for_notify.borrow_mut() = None;
+                    if let Err(e) = crate::core::set_output_monitor_sink(None) {
+                        log::warn!("persist monitor device: {e}");
+                    }
+                    if let Some(be) = backend_for_notify.borrow_mut().as_mut() {
+                        let target = be.resolve_monitor_target(None);
+                        if !target.is_empty() && be.monitor_enabled() {
+                            match be.retarget_monitor(&target) {
+                                Ok(()) => summary_for_notify.set_text("On \u{00b7} Live (follow)"),
+                                Err(e) => log::warn!("Monitor retarget failed: {e}"),
+                            }
+                        }
+                    }
+                    return;
+                }
+                let name = monitor_known_for_notify
+                    .borrow()
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_default();
+                // Fall back to a live listing if the known model is stale.
+                let name = if name.is_empty() {
+                    backend_for_notify
+                        .borrow()
+                        .as_ref()
+                        .map(|be| be.list_output_sinks())
+                        .unwrap_or_default()
+                        .get(idx.saturating_sub(1))
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default()
+                } else {
+                    name
+                };
+                if name.is_empty() {
+                    return;
+                }
+                *monitor_pinned_for_notify.borrow_mut() = Some(name.clone());
+                if let Err(e) = crate::core::set_output_monitor_sink(Some(&name)) {
+                    log::warn!("persist monitor device: {e}");
+                }
+                if let Some(be) = backend_for_notify.borrow_mut().as_mut() {
+                    if be.monitor_enabled() {
+                        match be.retarget_monitor(&name) {
+                            Ok(()) => {
+                                summary_for_notify.set_text(&format!("On \u{00b7} Live ({name})"));
+                            }
+                            Err(e) => log::warn!("Monitor retarget to {name} failed: {e}"),
+                        }
+                    }
+                }
+            });
+            let refresh_for_tick = refresh_monitor_model_for_tick.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(330), move || {
+                refresh_for_tick();
+                glib::ControlFlow::Continue
+            });
+            refresh_monitor_model();
         }
 
         {
@@ -1800,49 +2351,204 @@ impl MiniEqWindow {
 /// Called from the 33 ms tick, on the GTK main thread, so it can touch both
 /// widgets and the PipeWire backend directly.
 ///
-/// Design note: for the two switches we set the widget rather than calling
-/// the backend ourselves. `set_active` does not emit `state-set`, so the
-/// existing `connect_state_set` handler is skipped — the routing is therefore
-/// performed here, and the widget's own notify handler pushes the resulting
-/// state back into `AppState`. That keeps one code path for "apply routing"
-/// regardless of whether the change came from the UI or from D-Bus.
+/// Design note: the arms mirror the widget selection into the widget AND
+/// perform the backend work themselves, with the widget's own `state-set`
+/// handler blocked around the programmatic `set_active` (GTK4 emits
+/// `state-set` for `set_active` too -- the live test showed every remote
+/// toggle running twice before the blocking was added).
 fn apply_remote_command(
     cmd: &crate::remote_control::RemoteCommand,
     app_state: &Arc<crate::remote_control::AppState>,
     backend: &Rc<RefCell<Option<PipeWireBackend>>>,
     engine_sink: &Rc<RefCell<String>>,
     route_switch: &gtk4::Switch,
+    mode_selected: &gtk4::ToggleButton,
+    mode_reroute: &gtk4::ToggleButton,
     bypass_switch: &gtk4::Switch,
     presets: &Rc<RefCell<crate::window_presets::PresetPanel>>,
     window: &adw::ApplicationWindow,
+    output_preset_identity: &Rc<RefCell<Option<String>>>,
+    output_follows_default: &Rc<std::cell::Cell<bool>>,
+    monitor_pinned: &Rc<RefCell<Option<String>>>,
+    monitor_switch: &gtk4::Switch,
+    monitor_summary: &gtk4::Label,
+    route_state_handler: &Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>>,
 ) {
     use crate::remote_control::RemoteCommand;
     match cmd {
         RemoteCommand::SetRouting(on) => {
-            if route_switch.is_active() != *on {
-                route_switch.set_active(*on);
+            // The widget handler performs the backend work (per-device
+            // unroute on off, device-chain ensure + route on). `set_active`
+            // emits `state-set`, so mirror simply and let it run; the D-Bus
+            // handler is no different from a manual toggle.
+            let want = *on;
+            if route_switch.is_active() != want {
+                route_switch.set_active(want);
+            }
+            app_state.emit_state_changed();
+        }
+        RemoteCommand::SetOutputMode(mode) => {
+            // `set_active` does not emit `clicked`, so the button's own handler
+            // is skipped -- apply the mode here and mirror it into the widget
+            // so the two stay in agreement whichever side moved first.
+            // Persisted like the buttons do: without this a D-Bus (or Shell
+            // extension) mode change is lost on restart -- the file kept the
+            // previous value while GetState reported the new one.
+            let want_reroute = mode.0 == crate::core::OutputRoutingMode::Reroute;
+            if let Err(e) = crate::core::set_output_routing_mode(mode.0) {
+                log::warn!("D-Bus: persist output mode: {e}");
+            }
+            if mode_reroute.is_active() != want_reroute {
+                mode_reroute.set_active(want_reroute);
+            }
+            if mode_selected.is_active() != !want_reroute {
+                mode_selected.set_active(!want_reroute);
             }
             if let Some(be) = backend.borrow_mut().as_mut() {
-                let result = if *on {
-                    be.auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE)
-                } else {
-                    be.unroute_all(Some(&engine_sink.borrow()))
-                };
-                if let Err(e) = result {
-                    log::warn!("D-Bus SetRoutingEnabled({on}) failed: {e}");
+                be.set_output_mode(mode.0);
+                if be.is_routed() {
+                    if mode.0 == crate::core::OutputRoutingMode::Reroute {
+                        let sel = engine_sink.borrow().clone();
+                        if !sel.is_empty() {
+                            let eq = crate::core::eq_virtual_sink_for(&sel);
+                            match be.auto_route_to_sink(&eq) {
+                                Ok(()) => log::info!(
+                                    "D-Bus output mode -> {mode:?} (re-routed into {eq})"
+                                ),
+                                Err(e) => log::warn!("D-Bus output mode re-route failed: {e}"),
+                            }
+                        }
+                    } else {
+                        for dev in be.device_physical_sinks() {
+                            if let Err(e) = be.rescope_device(&dev) {
+                                log::warn!("D-Bus output mode rescope failed for {dev}: {e}");
+                            }
+                        }
+                    }
                 }
             }
             app_state.emit_state_changed();
         }
         RemoteCommand::SetEqEnabled(on) => {
-            // `eq_enabled` means "EQ active", which is the inverse of the
-            // A/B compare (bypass) switch. The debounced tick reads the
-            // switch and pushes `eq_enabled` to the filter chain.
+            // A/B compare (bypass) switch. The tick reads the switch and
+            // pushes `eq_enabled` to the filter chains; the widget handler
+            // syncs AppState (fired here via set_active), exactly like a
+            // manual toggle.
             let bypass = !*on;
             if bypass_switch.is_active() != bypass {
                 bypass_switch.set_active(bypass);
             }
             *app_state.eq_enabled.lock().unwrap() = *on;
+            app_state.emit_state_changed();
+        }
+        RemoteCommand::SetOutputSink(name) => {
+            // Same path as the Output dropdown: retarget the chain, load the
+            // new device's preset, follow with the monitor. An empty name
+            // means "follow the system default".
+            // NOTE: the dropdown widget itself is not moved (it is built
+            // after the tick closure that runs this); GetState `output_sink`
+            // is the source of truth for remote clients.
+            let chosen = if name.is_empty() {
+                output_follows_default.set(true);
+                backend
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|be| be.default_output_sink())
+                    .unwrap_or_default()
+            } else {
+                output_follows_default.set(false);
+                name.clone()
+            };
+            if chosen.is_empty() {
+                log::warn!("D-Bus SetOutputSink: resolved to no sink");
+                return;
+            }
+            if Some(chosen.as_str()) == Some(engine_sink.borrow().as_str()) {
+                log::debug!("D-Bus SetOutputSink: already on {chosen}");
+                return;
+            }
+            // Same as the Output dropdown: selecting a device never moves
+            // audio. It only re-targets the edit context (faders/preamp pick
+            // up that device's last curve) and where the monitor listens.
+            *engine_sink.borrow_mut() = chosen.clone();
+            apply_output_preset_for_sink(&chosen, output_preset_identity, presets);
+            if app_state.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str()) {
+                *app_state.output_sink.lock().unwrap() = Some(chosen.clone());
+                app_state.emit_state_changed();
+            }
+            // The header switch always reflects the SELECTED device's own on/off.
+            let dev_on = backend
+                .borrow()
+                .as_ref()
+                .is_some_and(|b| b.has_routed_streams_for(&chosen));
+            {
+                let sw = route_switch.clone();
+                if let Some(id) = route_state_handler.borrow().as_ref() {
+                    sw.block_signal(id);
+                }
+                if dev_on != sw.is_active() {
+                    sw.set_active(dev_on);
+                }
+                if let Some(id) = route_state_handler.borrow().as_ref() {
+                    sw.unblock_signal(id);
+                }
+            }
+            if *app_state.routed.lock().unwrap() != dev_on {
+                *app_state.routed.lock().unwrap() = dev_on;
+                app_state.emit_state_changed();
+            }
+            if let Some(be) = backend.borrow_mut().as_mut() {
+                if be.monitor_enabled() && crate::core::output_monitor_sink().is_none() {
+                    match be.retarget_monitor(&chosen) {
+                        Ok(()) => monitor_summary.set_text("On \u{00b7} Live (retargeted)"),
+                        Err(e) => log::warn!("D-Bus: monitor retarget failed: {e}"),
+                    }
+                }
+            }
+        }
+        RemoteCommand::SetMonitorEnabled(on) => {
+            // `set_active` emits `state-set`, so the widget's own handler
+            // performs start/stop: mirror the request into the widget and let
+            // it do the backend work.
+            let want = *on;
+            if monitor_switch.is_active() != want {
+                monitor_switch.set_active(want);
+            }
+            app_state.emit_state_changed();
+        }
+        RemoteCommand::SetMonitorSink(name) => {
+            // Empty = follow the EQ output; otherwise pin to the named sink.
+            // The dropdown's 330 ms refresh reads the same `monitor_pinned`
+            // cell, so the widget follows within a tick.
+            if name.is_empty() {
+                *monitor_pinned.borrow_mut() = None;
+                if let Err(e) = crate::core::set_output_monitor_sink(None) {
+                    log::warn!("D-Bus: persist monitor device: {e}");
+                }
+                if let Some(be) = backend.borrow_mut().as_mut() {
+                    let target = be.resolve_monitor_target(None);
+                    if !target.is_empty() && be.monitor_enabled() {
+                        if let Err(e) = be.retarget_monitor(&target) {
+                            log::warn!("D-Bus: monitor retarget failed: {e}");
+                        }
+                    }
+                }
+            } else {
+                *monitor_pinned.borrow_mut() = Some(name.clone());
+                if let Err(e) = crate::core::set_output_monitor_sink(Some(name)) {
+                    log::warn!("D-Bus: persist monitor device: {e}");
+                }
+                if let Some(be) = backend.borrow_mut().as_mut() {
+                    if be.monitor_enabled() {
+                        match be.retarget_monitor(name) {
+                            Ok(()) => {
+                                monitor_summary.set_text(&format!("On \u{00b7} Live ({name})"))
+                            }
+                            Err(e) => log::warn!("D-Bus: monitor retarget failed: {e}"),
+                        }
+                    }
+                }
+            }
             app_state.emit_state_changed();
         }
         RemoteCommand::SetPreset(name) => match presets.borrow_mut().load_library_preset(name) {

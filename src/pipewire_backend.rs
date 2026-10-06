@@ -12,9 +12,7 @@ use pipewire::spa::pod::builder::Builder;
 use pipewire::{Error, context::ContextRc, core::CoreRc, loop_::Timeout, main_loop::MainLoopRc};
 use pipewire_sys as pw_sys;
 
-use crate::core::{
-    EQ_PREAMP_MAX_DB, EQ_PREAMP_MIN_DB, EqBand, FILTER_OUTPUT_SUFFIX, VIRTUAL_SINK_BASE,
-};
+use crate::core::{EqBand, VIRTUAL_SINK_BASE};
 use crate::filter_chain;
 use crate::routing::{OutputRoute, RoutingEngine};
 
@@ -35,19 +33,42 @@ impl Drop for ModuleHandle {
     }
 }
 
+/// One running EQ chain for one physical output device (multi-chain EQ).
+///
+/// Phase 1: registry + primitives alongside the legacy single-chain fields;
+/// callers migrate in later phases. Each device keeps its own module, live
+/// node proxy, bands and preamp, so devices process audio independently and
+/// simultaneously.
+pub struct DeviceChain {
+    /// Physical sink this chain plays out to.
+    pub physical_sink: String,
+    /// Virtual sink node (`core::eq_virtual_sink_for(physical_sink)`).
+    pub virtual_sink: String,
+    /// Filter-chain playback node (`core::eq_filter_output_for`).
+    pub filter_output: String,
+    /// The loaded module (private: unload happens by removing the whole
+    /// chain, whose `Drop` destroys the module exactly once).
+    module: Option<ModuleHandle>,
+    pub bands: Vec<EqBand>,
+    pub preamp_gain: f64,
+    /// Live proxy for this chain's virtual sink node (same role as the
+    /// legacy `filter_node`, per device).
+    pub filter_node: Rc<RefCell<Option<Node>>>,
+}
+
 pub struct PipeWireBackend {
     mainloop: MainLoopRc,
     context: ContextRc,
     core: CoreRc,
-    filter_chain_module: Option<ModuleHandle>,
-    bands: Vec<EqBand>,
-    preamp_gain: f64,
-    running: Arc<Mutex<bool>>,
     routing: RoutingEngine,
-    /// Live proxy for the filter-chain virtual sink node (`mini_eq_sink`).
-    /// Captured by the registry listener once the module creates it; used by
-    /// `apply_live_controls` to push `SPA_PARAM_Props` without a reload.
-    filter_node: Rc<RefCell<Option<Node>>>,
+    /// Per-device EQ chains, keyed by physical sink node name. Shared with
+    /// the registry listener (which fills each chain's live node proxy), so
+    /// it lives behind `Rc<RefCell>`.
+    ///
+    /// Borrow rule: never hold `borrow_mut` on this map across a
+    /// pump/roundtrip/module-load — the listener callback borrows it to
+    /// match newcomers and would panic on a live `borrow_mut`.
+    device_chains: Rc<RefCell<std::collections::HashMap<String, DeviceChain>>>,
     /// Kept alive so the registry `global` listener stays registered for the
     /// backend's lifetime (listeners unregister themselves when dropped).
     _registry_listener: Option<pipewire::registry::Listener>,
@@ -137,7 +158,7 @@ fn build_props_controls_pod_bytes(controls: &[(String, f64)]) -> Option<Vec<u8>>
 }
 
 impl PipeWireBackend {
-    pub fn new(bands: Vec<EqBand>) -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         info!("Initializing PipeWire backend");
 
         pipewire::init();
@@ -148,7 +169,17 @@ impl PipeWireBackend {
 
         info!("Connected to PipeWire server");
 
-        let routing = RoutingEngine::new(core.clone(), mainloop.clone());
+        let mut routing = RoutingEngine::new(core.clone(), mainloop.clone());
+        // Bind the `default` metadata NOW, not on the first routing op:
+        // main.rs needs the default sink immediately to create the engine,
+        // and the lazy path left it `None` so the engine never started.
+        match routing.prime_default_sink() {
+            Ok(()) => info!(
+                "Default output sink: {:?}",
+                routing.default_audio_sink_name()
+            ),
+            Err(e) => warn!("Could not bind default metadata at startup: {e}"),
+        }
         let analyzer =
             crate::analyzer::OutputSpectrumAnalyzer::new(core.clone(), crate::core::SAMPLE_RATE)?;
 
@@ -156,12 +187,8 @@ impl PipeWireBackend {
             mainloop,
             context,
             core,
-            filter_chain_module: None,
-            bands,
-            preamp_gain: 0.0,
-            running: Arc::new(Mutex::new(true)),
             routing,
-            filter_node: Rc::new(RefCell::new(None)),
+            device_chains: Rc::new(RefCell::new(std::collections::HashMap::new())),
             _registry_listener: None,
             analyzer,
             pending_monitor_target: None,
@@ -178,7 +205,7 @@ impl PipeWireBackend {
 
     fn setup_registry_listener(&self) -> Result<pipewire::registry::Listener, Error> {
         let registry = self.core.get_registry_rc()?;
-        let filter_node = self.filter_node.clone();
+        let device_chains = self.device_chains.clone();
         let registry_for_cb = registry.clone();
         let listener = registry.add_listener_local();
         let listener = listener.global(move |global| {
@@ -186,27 +213,215 @@ impl PipeWireBackend {
             if global.type_.to_str() != pipewire::types::ObjectType::Node.to_str() {
                 return;
             }
-            let is_eq_sink = global
+            // Per-device chains: capture the live node proxy for whichever
+            // chain owns this virtual sink name (all of ours start with the
+            // legacy `mini_eq_sink` prefix).
+            let name = global
                 .props
                 .as_ref()
                 .and_then(|p| p.get("node.name"))
-                .map(|n| n == VIRTUAL_SINK_BASE)
-                .unwrap_or(false);
-            if is_eq_sink && filter_node.borrow().is_none() {
-                match registry_for_cb.bind::<Node, _>(global) {
-                    Ok(node) => {
-                        info!(
-                            "Captured live filter node proxy: {} (id={})",
-                            VIRTUAL_SINK_BASE, global.id
-                        );
-                        *filter_node.borrow_mut() = Some(node);
+                .unwrap_or("");
+            if name.starts_with(VIRTUAL_SINK_BASE) {
+                let chains = device_chains.borrow();
+                if let Some(chain) = chains.values().find(|c| c.virtual_sink == name) {
+                    if chain.filter_node.borrow().is_none() {
+                        match registry_for_cb.bind::<Node, _>(global) {
+                            Ok(node) => {
+                                info!(
+                                    "Captured live device filter node proxy: {name} (id={})",
+                                    global.id
+                                );
+                                *chain.filter_node.borrow_mut() = Some(node);
+                            }
+                            Err(e) => warn!("Failed to bind device filter node: {e}"),
+                        }
                     }
-                    Err(e) => warn!("Failed to bind filter node: {}", e),
                 }
             }
         });
         let _listener = listener.register();
         Ok(_listener)
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-device EQ chains (multi-chain EQ)
+    // ---------------------------------------------------------------------
+
+    /// Virtual sink node name for a physical device. Pure constructor so
+    /// routing and the window can agree without a backend handle.
+    pub fn device_virtual_sink(physical_sink: &str) -> String {
+        crate::core::eq_virtual_sink_for(physical_sink)
+    }
+
+    /// True while a chain exists for this physical device.
+    pub fn has_device_chain(&self, physical_sink: &str) -> bool {
+        self.device_chains.borrow().contains_key(physical_sink)
+    }
+
+    /// Create the chain for a physical device if missing, loading
+    /// `libpipewire-module-filter-chain` with the given bands (fresh devices
+    /// start neutral; the window applies the linked preset afterwards).
+    ///
+    /// Returns `true` when the chain was created by this call. Never pumps
+    /// or round-trips while holding the map borrow (see the field docs).
+    pub fn ensure_device_chain(
+        &mut self,
+        physical_sink: &str,
+        bands: Vec<EqBand>,
+    ) -> Result<bool, Error> {
+        if physical_sink.is_empty() {
+            return Err(Error::CreationFailed);
+        }
+        if self.device_chains.borrow().contains_key(physical_sink) {
+            return Ok(false);
+        }
+        // Route must know the new sink before any stream aims at it.
+        self.routing.register_eq_sink(
+            &crate::core::eq_virtual_sink_for(physical_sink),
+            physical_sink,
+        );
+        let virtual_sink = Self::device_virtual_sink(physical_sink);
+        let filter_output = crate::core::eq_filter_output_for(physical_sink);
+        let args = filter_chain::build_filter_chain_module_args(
+            &bands,
+            0.0,
+            true,
+            &virtual_sink,
+            &filter_output,
+            physical_sink,
+            false,
+        );
+        let c_name = CString::new(filter_chain::FILTER_CHAIN_MODULE_NAME)
+            .map_err(|_| Error::CreationFailed)?;
+        let c_args = CString::new(args).map_err(|_| Error::CreationFailed)?;
+        // SAFETY: same contract as `create_filter_chain`.
+        let module = unsafe {
+            pw_sys::pw_context_load_module(
+                self.context.as_raw_ptr(),
+                c_name.as_ptr(),
+                c_args.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if module.is_null() {
+            warn!("pw_context_load_module returned NULL for {physical_sink}");
+            return Err(Error::CreationFailed);
+        }
+        self.device_chains.borrow_mut().insert(
+            physical_sink.to_string(),
+            DeviceChain {
+                physical_sink: physical_sink.to_string(),
+                virtual_sink: virtual_sink.clone(),
+                filter_output,
+                module: Some(ModuleHandle(module)),
+                bands,
+                preamp_gain: 0.0,
+                filter_node: Rc::new(RefCell::new(None)),
+            },
+        );
+        info!("Device filter-chain module loaded for {physical_sink} ({virtual_sink})");
+        Ok(true)
+    }
+
+    /// Tear down one device's chain. Its streams must have been handed back
+    /// first (per-device unroute); anything still pointed at the destroyed
+    /// sink is WirePlumber's to rescue.
+    /// Physical sinks with a live EQ chain.
+    pub fn device_physical_sinks(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.device_chains.borrow().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// One device's stored bands (if its chain exists).
+    pub fn device_bands(&self, physical_sink: &str) -> Option<Vec<EqBand>> {
+        self.device_chains
+            .borrow()
+            .get(physical_sink)
+            .map(|c| c.bands.clone())
+    }
+
+    /// True while at least one physical sink has routed streams.
+    pub fn any_eq_active(&self) -> bool {
+        self.device_physical_sinks()
+            .iter()
+            .any(|dev| self.routing.has_routed_streams_for(dev))
+    }
+
+    /// Drop a device's chain AND unregister it from the router.
+    pub fn drop_device_chain(&mut self, physical_sink: &str) -> bool {
+        let removed = match self.device_chains.borrow_mut().remove(physical_sink) {
+            Some(chain) => {
+                let had_module = chain.module.is_some();
+                drop(chain);
+                info!(
+                    "Device filter-chain module unloaded for {physical_sink} (had module: {had_module})"
+                );
+                true
+            }
+            None => false,
+        };
+        if removed {
+            self.routing
+                .unregister_eq_sink(&crate::core::eq_virtual_sink_for(physical_sink));
+        }
+        removed
+    }
+
+    /// Replace one device's bands (the DSP push happens via
+    /// `device_push_live`, like the legacy path).
+    pub fn set_device_bands(&mut self, physical_sink: &str, bands: Vec<EqBand>) {
+        if let Some(chain) = self.device_chains.borrow_mut().get_mut(physical_sink) {
+            chain.bands = bands;
+        }
+    }
+
+    /// Replace one device's preamp gain.
+    pub fn set_device_preamp(&mut self, physical_sink: &str, preamp_db: f64) {
+        if let Some(chain) = self.device_chains.borrow_mut().get_mut(physical_sink) {
+            chain.preamp_gain = preamp_db;
+        }
+    }
+
+    /// True once this device's live filter node proxy has been captured.
+    pub fn has_device_live_node(&self, physical_sink: &str) -> bool {
+        self.device_chains
+            .borrow()
+            .get(physical_sink)
+            .is_some_and(|c| c.filter_node.borrow().is_some())
+    }
+
+    /// Push one device's bands/preamp to its live filter node.
+    /// Returns `Ok(false)` when the proxy has not arrived yet (caller should
+    /// retry later, like the legacy startup grace).
+    pub fn device_push_live(&self, physical_sink: &str, eq_enabled: bool) -> Result<bool, Error> {
+        let chains = self.device_chains.borrow();
+        let Some(chain) = chains.get(physical_sink) else {
+            return Err(Error::CreationFailed);
+        };
+        let node_borrow = chain.filter_node.borrow();
+        let node = match node_borrow.as_ref() {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        let controls = filter_chain::bq_raw_control_values(
+            &chain.bands,
+            chain.preamp_gain,
+            eq_enabled,
+            crate::core::SAMPLE_RATE,
+        );
+        if controls.is_empty() {
+            return Ok(true);
+        }
+        let data = build_props_controls_pod_bytes(&controls).ok_or(Error::CreationFailed)?;
+        let pod = Pod::from_bytes(&data).ok_or(Error::CreationFailed)?;
+        node.set_param(ParamType::Props, 0, pod);
+        debug!(
+            "device_push_live: pushed {} control(s) to {}",
+            controls.len(),
+            chain.virtual_sink
+        );
+        Ok(true)
     }
 
     // ---------------------------------------------------------------------
@@ -320,6 +535,31 @@ impl PipeWireBackend {
     /// Move the output monitor to a different sink. Stop + start is the
     /// safe way to do this: the monitor is an independent capture stream,
     /// so restarting it cannot interrupt the EQ audio path.
+    /// The sink the monitor taps. A pinned monitor device (from
+    /// `output-monitor` in the config) wins; otherwise the chain's current
+    /// output, or the system default when the chain has not chosen one yet.
+    ///
+    /// `pinned` is the sink name the user chose in the Monitor device dropdown,
+    /// if any; `None` means "follow the EQ output".
+    pub fn resolve_monitor_target(&self, pinned: Option<&str>) -> String {
+        if let Some(name) = pinned {
+            return name.to_string();
+        }
+        if let Some(pinned) = crate::core::output_monitor_sink() {
+            return pinned;
+        }
+        // The chain's PHYSICAL output, not `current_sink`: that follows the
+        // virtual sink while routing is on, which used to send the monitor to
+        // `mini_eq_sink` itself instead of the equalised device.
+        let current = self.routing.chain_output_sink().unwrap_or_default();
+        if !current.is_empty() {
+            return current;
+        }
+        self.routing
+            .current_default_audio_sink()
+            .unwrap_or_default()
+    }
+
     pub fn retarget_monitor(&mut self, new_sink: &str) -> Result<(), Error> {
         info!("Retargeting output monitor -> {new_sink}");
         self.stop_monitor();
@@ -391,290 +631,8 @@ impl PipeWireBackend {
         self.analyzer.is_enabled()
     }
 
-    /// Push the current band/preamp state to the live filter node via
-    /// `SPA_PARAM_Props`, mirroring upstream `set_node_params` /
-    /// `apply_state_to_engine`. This changes the DSP in milliseconds without
-    /// tearing down (and re-linking) the graph.
-    ///
-    /// Returns `Ok(false)` if the live node proxy is not available yet (caller
-    /// should fall back to a module reload).
-    /// True once the live filter node proxy has been captured. The proxy
-    /// arrives asynchronously AFTER the module load completes, so callers
-    /// must not treat "no proxy" as a live-push failure.
-    pub fn has_live_node(&self) -> bool {
-        self.filter_node.borrow().is_some()
-    }
-
-    pub fn apply_live_controls(&self, eq_enabled: bool) -> Result<bool, Error> {
-        let node_borrow = self.filter_node.borrow();
-        let node = match node_borrow.as_ref() {
-            Some(n) => n,
-            None => return Ok(false),
-        };
-
-        let controls = filter_chain::bq_raw_control_values(
-            &self.bands,
-            self.preamp_gain,
-            eq_enabled,
-            crate::core::SAMPLE_RATE,
-        );
-        if controls.is_empty() {
-            return Ok(true);
-        }
-
-        let data = build_props_controls_pod_bytes(&controls).ok_or(Error::CreationFailed)?;
-
-        let pod = Pod::from_bytes(&data).ok_or(Error::CreationFailed)?;
-        node.set_param(ParamType::Props, 0, pod);
-        debug!(
-            "apply_live_controls: pushed {} control(s) to {}",
-            controls.len(),
-            VIRTUAL_SINK_BASE
-        );
-        Ok(true)
-    }
-
-    /// Update the DSP for new bands WITHOUT a reload when the live node is
-    /// available; otherwise fall back to a full module reload.
-    ///
-    /// A filter-type change is a graph topology change (the biquad `label`
-    /// is fixed at module-load time), so it forces a restart instead of a
-    /// live push — matching upstream `set_filter_controls`.
-    pub fn update_state_live_or_reload(
-        &mut self,
-        output_sink: &str,
-        eq_enabled: bool,
-    ) -> Result<(), Error> {
-        // With the `bq_raw` coefficient strategy the filter TYPE lives in the
-        // coefficients, not the node label, so a type change is a live push
-        // just like Freq/Q/Gain. The graph topology never changes and the
-        // engine is never restarted, so the sink node id (and therefore the
-        // app streams' routing) stays stable across every edit.
-        //
-        // Startup grace: the live node proxy is captured asynchronously after
-        // the module load. Previously a push that landed before the proxy
-        // existed fell through to a full module unload+reload, cutting the
-        // audio a *second* time right after startup. The module was just
-        // loaded with the correct bands, so there is nothing to redo.
-        if !self.has_live_node() {
-            return Ok(());
-        }
-        // `eq_enabled` is the A/B compare / D-Bus `SetEqEnabled` flag. It was
-        // previously hardcoded to `true`, which left the A/B compare switch
-        // wired to nothing: the widget had no handler and the push always ran
-        // the bands wet.
-        match self.apply_live_controls(eq_enabled) {
-            Ok(true) => Ok(()),
-            _ => {
-                let bands = self.bands.clone();
-                self.update_band_coefficients(&bands, output_sink)
-            }
-        }
-    }
-
-    /// Build the filter-chain argument string for the current bands.
-    pub fn filter_chain_args(&self, output_sink: &str, eq_enabled: bool) -> String {
-        filter_chain::build_filter_chain_module_args(
-            &self.bands,
-            self.preamp_gain,
-            eq_enabled,
-            VIRTUAL_SINK_BASE,
-            &format!("{}{}", VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX),
-            output_sink,
-            // bq_raw (raw biquad coefficients) = upstream default. The
-            // filter type lives in the coefficients, so type edits stay
-            // live and never force a topology reload.
-            false,
-        )
-    }
-
-    /// Load `libpipewire-module-filter-chain`, which creates the virtual sink
-    /// (capture side), the DSP graph and the playback node as a single module.
-    ///
-    /// This replaces the previous per-node `create_object` calls: the
-    /// filter-chain is a module, not an object factory, and the sink/output
-    /// nodes are declared in its `capture.props`/`playback.props` sections.
-    pub fn create_filter_chain(&mut self, output_sink: &str) -> Result<(), Error> {
-        info!("Loading filter-chain module -> {}", output_sink);
-
-        let args = self.filter_chain_args(output_sink, true);
-        let c_name = CString::new(filter_chain::FILTER_CHAIN_MODULE_NAME)
-            .map_err(|_| Error::CreationFailed)?;
-        let c_args = CString::new(args).map_err(|_| Error::CreationFailed)?;
-
-        // SAFETY: `self.context` outlives the module (the module is destroyed in
-        // `unload_filter_chain_module` before the context drops), and both
-        // strings are NUL-terminated for the duration of the call.
-        let module = unsafe {
-            pw_sys::pw_context_load_module(
-                self.context.as_raw_ptr(),
-                c_name.as_ptr(),
-                c_args.as_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-
-        if module.is_null() {
-            warn!("pw_context_load_module returned NULL");
-            return Err(Error::CreationFailed);
-        }
-
-        self.filter_chain_module = Some(ModuleHandle(module));
-        info!("Filter-chain module loaded");
-        Ok(())
-    }
-
-    /// Tear down the loaded filter-chain module and its nodes.
-    pub fn unload_filter_chain_module(&mut self) {
-        if let Some(handle) = self.filter_chain_module.take() {
-            // Take the raw pointer out and skip `ModuleHandle::drop`, which
-            // would destroy the same module a second time (double free).
-            let ptr = handle.0;
-            std::mem::forget(handle);
-            // SAFETY: `ptr` came from `pw_context_load_module` and is destroyed
-            // exactly once, here.
-            unsafe { pw_sys::pw_impl_module_destroy(ptr) };
-            // Drop the cached node proxy. It is only ever captured when
-            // `is_none()`, so leaving it set would keep a dead node forever and
-            // every later live push would go nowhere. This matters for the
-            // reload path, which is how the output device is changed.
-            *self.filter_node.borrow_mut() = None;
-            info!("Filter-chain module unloaded");
-        }
-    }
-
-    /// Biquad control values for the current bands (bq_raw coefficients).
-    pub fn native_control_values(&self, eq_enabled: bool) -> Vec<(String, f64)> {
-        filter_chain::bq_raw_control_values(
-            &self.bands,
-            self.preamp_gain,
-            eq_enabled,
-            crate::core::SAMPLE_RATE,
-        )
-    }
-
     pub fn detect_output_routes(&self) -> Result<Vec<OutputRoute>, Error> {
         self.routing.detect_routes()
-    }
-
-    /// Move the EQ's output to a different device.
-    ///
-    /// Safe to call repeatedly with the same sink. Returns `false` if the
-    /// output client could not be found or the metadata write failed.
-    pub fn retarget_output(&mut self, sink_name: &str) -> bool {
-        if self.routing.get_current_sink() == Some(sink_name) {
-            return true;
-        }
-        // Validated first: reloading the filter chain is disruptive, so do not
-        // start one for a device that is not there.
-        if !self
-            .routing
-            .list_output_sinks()
-            .iter()
-            .any(|s| s.name == sink_name)
-        {
-            log::warn!("retarget_output: {sink_name} is not an available output sink");
-            return false;
-        }
-
-        // Live move FIRST, and only rebuild if it did not take.
-        //
-        // The chain's output is an ordinary stream node named
-        // `mini_eq_sink_output`; its destination is metadata like any other
-        // stream's, so it can simply be pointed at the new sink. That leaves the
-        // virtual sink node alive, which means the playback streams never have
-        // to be moved at all and the switch is inaudible.
-        //
-        // Upstream's order exactly: `retarget_filter_output()` first, and
-        // `restart_engine()` only if that raises. The port skipped the live path
-        // and always rebuilt, on the belief -- recorded in the comment below and
-        // verified wrong -- that a `node.passive` client cannot be retargeted.
-        // `node.passive` is a property of the node, not of the stream the
-        // adapter exposes; the stream is movable.
-        let filter_output = format!("{}{}", crate::core::VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX);
-        if let (Some(stream_id), Some((sink_id, serial))) = (
-            self.routing.output_stream_id_by_name(&filter_output),
-            self.routing.find_node_target(sink_name),
-        ) {
-            if self
-                .routing
-                .move_stream_to_target_checked(stream_id, sink_id, &serial)
-            {
-                self.routing.set_current_sink(sink_name);
-                log::info!("EQ output moved live to {sink_name} (no rebuild)");
-                return true;
-            }
-            log::info!("retarget_output: live move of {filter_output} did not take; rebuilding");
-        } else {
-            log::warn!(
-                "retarget_output: {filter_output} stream or {sink_name} sink not found; rebuilding"
-            );
-        }
-
-        // Rebuild path. Hand the streams back BEFORE the module goes away,
-        // while `mini_eq_sink` is still alive. Upstream's `restart_engine` does
-        // exactly this: restore, stop the engine, re-route once the new one is
-        // ready. Leaving them pointed at the sink that is about to be destroyed
-        // is what turned an output switch into silence.
-        if let Err(e) = self.routing.suspend_routing() {
-            log::warn!("retarget_output: could not suspend routing before the reload: {e}");
-        }
-
-        // Rebuild the module with the new destination. This is the fallback for
-        // when the live move above did not take, not the only way: it destroys
-        // and recreates `mini_eq_sink`, so every routed stream has to be moved
-        // off it and back on again.
-        let bands = self.bands.clone();
-        log::info!("Reloading filter chain to output on {sink_name}");
-        if let Err(e) = self.update_band_coefficients(&bands, sink_name) {
-            log::warn!("retarget_output: reload failed: {e}");
-            return false;
-        }
-
-        // The reload destroys and recreates `mini_eq_sink`, so its
-        // `object.serial` changes and every stream we routed to the old one now
-        // points at nothing. Re-route them -- but ONLY if they were routed.
-        //
-        // This used to re-route unconditionally, which meant changing the
-        // output device with the System EQ switch OFF dragged the user's
-        // streams into the EQ: something they had explicitly not asked for, on
-        // a chain that had just been torn down and rebuilt. Upstream gates the
-        // same step on `self.routed` (`restart_engine`: `stream_router` is only
-        // kept `if self.routed`).
-        if !self.routing.is_routed() {
-            self.routing.set_current_sink(sink_name);
-            log::info!("EQ output now on {sink_name} (streams not routed; left alone)");
-            return true;
-        }
-
-        // The new node appears asynchronously: `pw_context_load_module` returns
-        // before the registry carries the new node, so an immediate re-route
-        // looks the sink up, finds nothing, and fails with "Creation failed".
-        // Wait for it, bounded so a genuinely missing node cannot hang the UI.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline
-            && self
-                .routing
-                .find_node_id_by_name(crate::core::VIRTUAL_SINK_BASE)
-                .is_none()
-        {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        match self
-            .routing
-            .auto_route_to_sink(crate::core::VIRTUAL_SINK_BASE)
-        {
-            Ok(_) => {
-                self.routing.set_current_sink(sink_name);
-                log::info!("EQ output now on {sink_name}, streams re-routed");
-                true
-            }
-            Err(e) => {
-                log::warn!("retarget_output: streams not re-routed: {e}");
-                false
-            }
-        }
     }
 
     /// Every real output sink (`media.class == "Audio/Sink"`), excluding the
@@ -699,23 +657,79 @@ impl PipeWireBackend {
     }
 
     /// Name of the active physical output sink, falling back to the first
+    /// Record which physical sink the filter chain is feeding, without
+    /// touching any stream. Used once at startup: the chain is created
+    /// directly onto the default sink, and the routing engine must know
+    /// that so the monitor resolves to a real device instead of nothing.
+    pub fn set_current_sink(&mut self, sink_name: &str) {
+        self.routing.set_current_sink(sink_name);
+    }
     /// The user's current default output sink node name, read from the
     /// PipeWire `default` metadata (`default.audio.sink`). This is the
     /// sink the filter-chain playback node targets so EQ'd audio reaches
     /// the speakers the user actually hears on — portable across any
     /// PipeWire machine (no hardcoded device assumptions).
-    pub fn default_output_sink(&mut self) -> Option<String> {
+    pub fn default_output_sink(&self) -> Option<String> {
         self.routing.default_audio_sink_name()
     }
 
-    /// Re-read the system default output sink, bypassing the cache so a
-    /// runtime change is observable.
-    pub fn refresh_default_audio_sink_name(&mut self) -> Option<String> {
-        self.routing.refresh_default_audio_sink_name()
+    /// The system default output, updated by the metadata `property`
+    /// listener in real time. Returns `None` when nothing changed since the
+    /// last call, so the 500 ms default-sink timer can act on a flag read
+    /// instead of pumping the PipeWire loop.
+    pub fn take_default_sink_change(&self) -> Option<String> {
+        self.routing.take_default_sink_change()
+    }
+
+    /// Which streams the EQ reaches when it is on.
+    pub fn output_mode(&self) -> crate::core::OutputRoutingMode {
+        self.routing.output_mode()
+    }
+
+    pub fn set_output_mode(&mut self, mode: crate::core::OutputRoutingMode) {
+        self.routing.set_output_mode(mode);
+    }
+
+    /// True while the playback streams are routed through the EQ.
+    pub fn is_routed(&self) -> bool {
+        self.routing.is_routed()
+    }
+
+    /// True while at least one playback stream is pointed into the EQ.
+    /// See [`RoutingEngine::has_routed_streams`].
+    pub fn has_routed_streams(&self) -> bool {
+        self.routing.has_routed_streams()
+    }
+
+    /// Scoped reconcile for one device's chain (used when the routing mode
+    /// narrows to Selected).
+    pub fn rescope_device(&mut self, physical_sink: &str) -> Result<(usize, usize), Error> {
+        self.routing.rescope_device(physical_sink)
+    }
+
+    /// Per-device stream count > 0 helper (header switch state).
+    pub fn has_routed_streams_for(&self, physical_sink: &str) -> bool {
+        self.routing.has_routed_streams_for(physical_sink)
+    }
+
+    /// Per-device unroute (EQ off for that device).
+    pub fn unroute_device(
+        &mut self,
+        physical_sink: &str,
+        fallback: Option<&str>,
+    ) -> Result<(), Error> {
+        self.routing.unroute_device(physical_sink, fallback)
     }
 
     pub fn auto_route_to_sink(&mut self, sink_name: &str) -> Result<(), Error> {
         self.routing.auto_route_to_sink(sink_name)
+    }
+
+    /// Reconcile routed streams with the current output device/mode after a
+    /// device switch or a narrowing to Selected. See
+    /// [`RoutingEngine::rescope_routing`].
+    pub fn rescope_routing(&mut self) -> Result<(usize, usize), Error> {
+        self.routing.rescope_routing()
     }
 
     /// Hand playback streams back where they were before the EQ took them
@@ -755,70 +769,6 @@ impl PipeWireBackend {
         }
         warn!("exit: no real output sink to fall back to; restoring recorded targets only");
         self.routing.unroute_all(None)
-    }
-
-    /// Update the DSP graph for a new set of bands.
-    ///
-    /// The native filter-chain computes coefficients at the DSP clock rate, so
-    /// live edits are applied by reloading the module with fresh Freq/Q/Gain
-    /// control values rather than by pushing raw coefficients.
-    pub fn update_band_coefficients(
-        &mut self,
-        bands: &[EqBand],
-        output_sink: &str,
-    ) -> Result<(), Error> {
-        info!("Updating band coefficients for {} bands", bands.len());
-
-        self.bands = bands.to_vec();
-        self.unload_filter_chain_module();
-        self.create_filter_chain(output_sink)
-    }
-
-    pub fn set_preamp(&mut self, gain_db: f64) -> Result<(), Error> {
-        // Use the shared bounds, not a literal: the Auto-Safe budget depends on
-        // the floor matching `core::EQ_PREAMP_MIN_DB`.
-        self.preamp_gain = gain_db.clamp(EQ_PREAMP_MIN_DB, EQ_PREAMP_MAX_DB);
-        info!("Preamp gain set to {} dB", self.preamp_gain);
-        Ok(())
-    }
-
-    pub fn get_bands(&self) -> &[EqBand] {
-        &self.bands
-    }
-
-    pub fn get_bands_mut(&mut self) -> &mut Vec<EqBand> {
-        &mut self.bands
-    }
-
-    pub fn get_preamp(&self) -> f64 {
-        self.preamp_gain
-    }
-
-    pub fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
-    }
-
-    pub fn stop(&mut self) {
-        *self.running.lock().unwrap() = false;
-        self.unload_filter_chain_module();
-        info!("PipeWire backend stopping");
-    }
-
-    pub fn run(&mut self) {
-        info!("Entering PipeWire main loop");
-        self.mainloop.run();
-    }
-
-    pub fn quit(&mut self) {
-        self.mainloop.quit();
-        info!("PipeWire main loop quit");
-    }
-}
-
-impl Default for PipeWireBackend {
-    fn default() -> Self {
-        let bands = crate::core::default_bands();
-        Self::new(bands).expect("Failed to create PipeWire backend")
     }
 }
 
@@ -933,7 +883,6 @@ fn run_pw_cli_pumped(
 /// pumps a few iterations so globals arrive before reading.
 fn registry_node_names(mainloop: &MainLoopRc, core: &CoreRc) -> Result<Vec<(String, u32)>, Error> {
     use pipewire::loop_::Timeout;
-    use std::sync::{Arc, Mutex};
 
     let names: Arc<Mutex<Vec<(String, u32)>>> = Arc::new(Mutex::new(Vec::new()));
     let names_clone = names.clone();
@@ -970,7 +919,6 @@ struct PortRecord {
 /// Snapshot ports from our registry. Loop-thread only.
 fn registry_port_snapshot(mainloop: &MainLoopRc, core: &CoreRc) -> Result<Vec<PortRecord>, Error> {
     use pipewire::loop_::Timeout;
-    use std::sync::{Arc, Mutex};
 
     let ports: Arc<Mutex<Vec<PortRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let ports_clone = ports.clone();
@@ -1014,7 +962,6 @@ struct LinkRecord {
 /// Snapshot links from our registry. Loop-thread only.
 fn registry_link_snapshot(mainloop: &MainLoopRc, core: &CoreRc) -> Result<Vec<LinkRecord>, Error> {
     use pipewire::loop_::Timeout;
-    use std::sync::{Arc, Mutex};
 
     let links: Arc<Mutex<Vec<LinkRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let links_clone = links.clone();

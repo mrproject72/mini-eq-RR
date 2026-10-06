@@ -165,7 +165,7 @@ fn run_headless(duration: Option<u64>, import_apo: Option<&std::path::Path>) {
         },
         None => default_bands(),
     };
-    let mut backend = match PipeWireBackend::new(bands) {
+    let mut backend = match PipeWireBackend::new() {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("Failed to initialise PipeWire backend: {}", e);
@@ -173,16 +173,33 @@ fn run_headless(duration: Option<u64>, import_apo: Option<&std::path::Path>) {
         }
     };
 
-    if let Err(e) = backend.create_filter_chain("mini_eq_sink_output") {
-        log::warn!("Failed to create filter chain: {}", e);
+    let sink = backend
+        .default_output_sink()
+        .or_else(|| backend.list_output_sinks().first().map(|s| s.name.clone()));
+    match sink {
+        Some(sink) => match backend.ensure_device_chain(&sink, bands) {
+            Ok(_) => println!("Filter-chain engine running -> {}", sink),
+            Err(e) => eprintln!("Failed to create filter chain: {}", e),
+        },
+        None => eprintln!("Headless: no output sink detected"),
     }
 
     match duration {
         Some(secs) => {
             println!("Duration: {}s", secs);
-            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < end {
+                backend.pump();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
-        None => println!("Running until interrupted"),
+        None => {
+            println!("Running until interrupted");
+            loop {
+                backend.pump();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -202,20 +219,54 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
     let shared_backend: Rc<RefCell<Option<PipeWireBackend>>> = Rc::new(RefCell::new(None));
     let mut engine_sink = String::new();
     {
-        match PipeWireBackend::new(default_bands()) {
+        match PipeWireBackend::new() {
             Ok(mut backend) => {
-                let sink = output_sink.or_else(|| backend.default_output_sink());
+                // The `default.audio.sink` metadata property typically arrives
+                // just AFTER the bind roundtrip completes (observed: bind
+                // replays None, the real value lands a tick later), so a
+                // single read here usually misses it and the engine would
+                // never start. Wait briefly for it, then fall back to the
+                // first listed sink rather than giving up with no EQ at all.
+                let mut sink = output_sink
+                    .clone()
+                    .or_else(|| backend.default_output_sink());
+                if sink.is_none() {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while sink.is_none() && std::time::Instant::now() < deadline {
+                        backend.pump();
+                        sink = backend.default_output_sink();
+                        if sink.is_none() {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
+                }
+                let sink =
+                    sink.or_else(|| backend.list_output_sinks().first().map(|s| s.name.clone()));
                 match sink {
                     Some(sink) => {
                         engine_sink = sink.clone();
-                        match backend.create_filter_chain(&sink) {
-                            Ok(()) => log::info!("Filter-chain engine running -> {}", sink),
+                        // Honor the device's configured preset immediately, the
+                        // same rule the per-device ON handler uses at EQ start.
+                        let (bands, preamp) = match mini_eq_rr::core::output_preset_for_sink(&sink)
+                        {
+                            Some(name) => mini_eq_rr::core::load_preset_from_file(
+                                &mini_eq_rr::core::preset_path_for_name(&name),
+                            )
+                            .map(|(p, b)| (b, p))
+                            .unwrap_or_else(|_| (mini_eq_rr::core::default_bands(), 0.0)),
+                            None => (mini_eq_rr::core::default_bands(), 0.0),
+                        };
+                        match backend.ensure_device_chain(&sink, bands) {
+                            Ok(_) => {
+                                log::info!("Filter-chain engine running -> {}", sink);
+                                backend.set_current_sink(&sink);
+                                backend.set_device_preamp(&sink, preamp);
+                            }
                             Err(e) => log::warn!("Failed to load filter chain: {}", e),
                         }
                         if auto_route {
-                            if let Err(e) =
-                                backend.auto_route_to_sink(mini_eq_rr::core::VIRTUAL_SINK_BASE)
-                            {
+                            let eq = mini_eq_rr::core::eq_virtual_sink_for(&sink);
+                            if let Err(e) = backend.auto_route_to_sink(&eq) {
                                 log::warn!("Failed to auto-route: {}", e);
                             }
                         }

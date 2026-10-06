@@ -28,7 +28,13 @@ pub const CAPABILITIES: &[&str] = &[
     "start-active-at-login",
     "set-routing",
     "set-preset",
+    "set-output-mode",
+    "set-output-sink",
+    "set-monitor-enabled",
+    "set-monitor-sink",
     "output-presets",
+    "output-mode",
+    "monitor-sink",
     "analyzer-levels",
     "startup-notification",
 ];
@@ -48,6 +54,18 @@ pub const INTROSPECTION_XML: &str = r#"<node>
     </method>
     <method name="SetRoutingEnabled">
       <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="SetOutputMode">
+      <arg name="mode" type="s" direction="in"/>
+    </method>
+    <method name="SetOutputSink">
+      <arg name="name" type="s" direction="in"/>
+    </method>
+    <method name="SetMonitorEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="SetMonitorSink">
+      <arg name="name" type="s" direction="in"/>
     </method>
     <method name="SetPreset">
       <arg name="name" type="s" direction="in"/>
@@ -82,8 +100,31 @@ pub trait MiniEqAppHandler: Send + Sync + 'static {
     fn routed(&self) -> bool;
     fn output_sink(&self) -> Option<String>;
 
+    /// Which streams the EQ reaches: `selected` or `reroute`. Orthogonal to
+    /// `routed`, which is the on/off of the machinery.
+    fn output_mode(&self) -> crate::core::OutputRoutingMode {
+        crate::core::OutputRoutingMode::Selected
+    }
+    /// The preset linked to the current output device, if any.
+    fn output_preset(&self) -> Option<String> {
+        None
+    }
+    /// The sink the monitor is pinned to, or `None` to follow the EQ output.
+    fn monitor_sink(&self) -> Option<String> {
+        None
+    }
+
     fn set_eq_enabled(&self, enabled: bool);
     fn route_system_audio(&self, enabled: bool);
+    fn set_output_mode(&self, mode: crate::core::OutputRoutingMode);
+    /// Retarget the EQ output to a concrete sink (`""` = follow the system
+    /// default). Exists so the live test — and the Shell extension — can
+    /// drive the same path as the Output dropdown without a display.
+    fn set_output_sink(&self, sink: &str);
+    /// Start/stop the output monitor (spectrum + loudness tap).
+    fn set_monitor_enabled(&self, enabled: bool);
+    /// Pin the monitor to a concrete sink (`""` = follow the EQ output).
+    fn set_monitor_sink(&self, sink: &str);
 
     fn current_preset_name(&self) -> Option<String> {
         None
@@ -152,6 +193,18 @@ pub fn build_state(handler: &dyn MiniEqAppHandler) -> HashMap<String, glib::Vari
     state.insert(
         "output_sink".to_string(),
         glib::Variant::from(handler.output_sink().unwrap_or_default()),
+    );
+    state.insert(
+        "output_mode".to_string(),
+        glib::Variant::from(handler.output_mode().as_str()),
+    );
+    state.insert(
+        "output_preset".to_string(),
+        glib::Variant::from(handler.output_preset().unwrap_or_default()),
+    );
+    state.insert(
+        "monitor_sink".to_string(),
+        glib::Variant::from(handler.monitor_sink().unwrap_or_default()),
     );
     state.insert(
         "background_mode".to_string(),
@@ -373,6 +426,59 @@ impl MiniEqDBusControl {
                 None => invocation.return_dbus_error(
                     &format!("{}.InvalidArguments", INTERFACE_NAME),
                     "Invalid arguments for SetRoutingEnabled",
+                ),
+            },
+            "SetOutputMode" => match params.get::<(String,)>() {
+                Some((mode,)) => {
+                    let parsed = crate::core::OutputRoutingMode::from_mode_str(&mode);
+                    handler.set_output_mode(parsed);
+                    if let Some(ref conn) = conn {
+                        Self::emit_state_changed(conn, handler);
+                    }
+                    invocation.return_value(None)
+                }
+                None => invocation.return_dbus_error(
+                    &format!("{}.InvalidArguments", INTERFACE_NAME),
+                    "Invalid arguments for SetOutputMode",
+                ),
+            },
+            "SetOutputSink" => match params.get::<(String,)>() {
+                Some((name,)) => {
+                    handler.set_output_sink(&name);
+                    if let Some(ref conn) = conn {
+                        Self::emit_state_changed(conn, handler);
+                    }
+                    invocation.return_value(None)
+                }
+                None => invocation.return_dbus_error(
+                    &format!("{}.InvalidArguments", INTERFACE_NAME),
+                    "Invalid arguments for SetOutputSink",
+                ),
+            },
+            "SetMonitorEnabled" => match params.get::<(bool,)>() {
+                Some((enabled,)) => {
+                    handler.set_monitor_enabled(enabled);
+                    if let Some(ref conn) = conn {
+                        Self::emit_state_changed(conn, handler);
+                    }
+                    invocation.return_value(None)
+                }
+                None => invocation.return_dbus_error(
+                    &format!("{}.InvalidArguments", INTERFACE_NAME),
+                    "Invalid arguments for SetMonitorEnabled",
+                ),
+            },
+            "SetMonitorSink" => match params.get::<(String,)>() {
+                Some((name,)) => {
+                    handler.set_monitor_sink(&name);
+                    if let Some(ref conn) = conn {
+                        Self::emit_state_changed(conn, handler);
+                    }
+                    invocation.return_value(None)
+                }
+                None => invocation.return_dbus_error(
+                    &format!("{}.InvalidArguments", INTERFACE_NAME),
+                    "Invalid arguments for SetMonitorSink",
                 ),
             },
             "SetPreset" => match params.get::<(String,)>() {

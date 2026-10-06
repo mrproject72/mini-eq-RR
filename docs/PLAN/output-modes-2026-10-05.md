@@ -198,12 +198,30 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
    from the preset and anything gated on it would never wake up. The chip is now
    recomputed from the live signature in the update loop, only when it changes.
 2. **Working follow-default.** Watcher retargets the chain live. Removes the
-   "the dropdown does nothing" impression even before the mode is chosen.
+    "the dropdown does nothing" impression even before the mode is chosen.
+    **Done 2026-10-05.** The chain now moves live on a default-sink change
+    (`retarget_output`), gated on `output_follows_default` so a pinned device is
+    left alone. The poll was pure waste — `refresh_default_audio_sink_name()`
+    pumped the PipeWire loop for up to 50 ms per tick to catch a metadata
+    property the `property` listener already delivers in real time. It now sets
+    a flag (`default_sink_changed`), and the 500 ms timer is a cheap flag read
+    via `take_default_sink_change()`.
 3. **Mode split.** `RoutingEngine` gains a mode (`Selected` / `Reroute`) and the
-   scope predicate; `auto_route_to_sink` takes the scope. Replace the switch with
-   the two buttons.
+    scope predicate; `auto_route_to_sink` takes the scope. Replace the switch with
+    the two buttons. **Done 2026-10-05.** `target_in_scope` is pure and tested;
+    version 2 of `output-presets.json` persists the mode and the monitor sink;
+    `SetOutputMode` is a new D-Bus method and `output_mode` /
+    `output_preset` / `monitor_sink` are published in `GetState`.
 4. **Curves.** Preset picker + unlink in place of "Link to Output", and debounced
-   auto-write-back into a singly-linked preset.
+    auto-write-back into a singly-linked preset. **Done 2026-10-05.** The row is
+    now `Curve [ <preset> ▾ ] [unlink]`; choosing a preset links it to the active
+    device and loads it, unlink drops the link and the fallback applies. The
+    model is refilled from the library on a 330 ms cadence. Auto-write-back
+    writes the live curve into the linked preset after a 1.5 s debounce on the
+    last edit, and only when exactly one device links to it — writing into one
+    linked from two would change the curve for a device the user did not touch.
+    Built-ins are never written. The comparison is against the preset's own
+    saved signature, not the panel's "modified" state.
 5. **Monitor device.**
 6. Only then reconsider anything about per-app control (see below).
 
@@ -240,16 +258,27 @@ Version bump with a read path that tolerates `version: 1` (no mode → Selected)
 - Should changing mode while streams are routed re-route immediately, or only on
   the next device change? Re-routing on the spot is more predictable; leaving it
   until the next change is less churn. Default: re-route immediately, since the
-  user just told us what they want.
+  user just told us what they want. **Answered 2026-10-05: yes, re-route
+  immediately.** `set_output_mode` re-routes when the engine is already on, so
+  the change is visible in the audio path rather than only on the next switch.
 - Should "Reroute" remember itself across restarts? Recommend yes (it is in
-  the config), with the status line making it obvious.
+  the config), with the status line making it obvious. **Answered 2026-10-05:
+  yes.** `output_routing_mode` / `set_output_routing_mode` round-trip through
+  `output-presets.json` (version 2), and the buttons restore the remembered
+  choice on startup.
 - Does the monitor device need to survive a chain rebuild? Recommend yes, with
-  `Follow EQ output` re-resolving after it.
+  `Follow EQ output` re-resolving after it. **Answered 2026-10-05: yes, and it
+  is persisted.** `output-monitor` in the config is `None` for follow or the
+  sink's node name; `resolve_monitor_target` prefers the pinned sink and falls
+  back to the chain's current output.
 - Auto-write-back debounce: recommend ~1.5 s after the last edit, so a drag does
   not rewrite the file continuously while the chain is reloading anyway.
+  **Done 2026-10-05.** The debounce is on the last edit, not the last tick, so a
+  drag rewrites once ~1.5 s after it stops rather than continuously.
 - Should a preset be protectable from auto-write-back (a "lock" that forces the
   explicit Update path)? Cheap to add and it removes the last reason to be
   nervous about the automatic behaviour. Recommend yes, defaulting to unlocked.
+  **Not yet implemented.**
 - What happens when a device's linked preset is deleted? Recommend the chip shows
   `Missing`, the link is dropped, and the curve stays as it is rather than
   silently reverting.

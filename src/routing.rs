@@ -116,7 +116,27 @@ pub struct RoutingEngine {
     /// uses it to gate the re-route after an engine restart
     /// (`restart_engine` only re-routes `if self.routed`).
     routed: bool,
+    /// Which streams the EQ reaches when it is on. See
+    /// [`crate::core::OutputRoutingMode`]. Stored separately from `routed`:
+    /// `routed` is the on/off of the machinery, this is *which* streams it takes.
+    /// Toggling the switch off and back on restores the remembered mode rather
+    /// than always re-routing everything.
+    output_mode: crate::core::OutputRoutingMode,
     current_sink: Option<String>,
+    /// Virtual sink node names of live per-device EQ chains
+    /// (`core::eq_virtual_sink_for`), registered by the backend as chains
+    /// are created/destroyed. Lets scope/allowed logic cover every device
+    /// sink, not just the legacy singleton.
+    eq_sinks: HashMap<String, String>,
+    /// The PHYSICAL sink the filter chain plays out to (what you hear).
+    ///
+    /// Distinct from `current_sink`, which `auto_route_to_sink` points at the
+    /// VIRTUAL sink (the streams' entry point) while routing is on. Reading
+    /// the monitor tap from `current_sink` therefore resolved to `mini_eq_sink`
+    /// itself whenever the EQ was on -- the monitor listened to the virtual
+    /// sink instead of the device, and a device switch followed by re-enable
+    /// left it there. Only physical sinks are recorded here.
+    chain_output_sink: Option<String>,
     virtual_sink_name: String,
     /// Handle to the PipeWire `default` metadata object, bound from the
     /// registry global whose `metadata.name == "default"`. Used to set each
@@ -133,6 +153,14 @@ pub struct RoutingEngine {
     /// The user's *configured* default sink (`default.configured.audio.sink`),
     /// used as a fallback when the runtime default is unset.
     configured_audio_sink: Rc<RefCell<Option<String>>>,
+    /// Set by the metadata `property` listener the instant
+    /// `default.audio.sink` changes. The value is already in
+    /// `default_audio_sink` above; this flag is the signal. It is the only
+    /// reason the 500 ms default-sink poll exists -- the listener fires in
+    /// real time, so polling is pure waste and the pump in
+    /// `refresh_default_audio_sink_name` is a 50 ms stall per tick that
+    /// cannot observe anything the listener has not already delivered.
+    default_sink_changed: Rc<RefCell<bool>>,
     /// Keeps the metadata `property` listeners alive (a dropped listener
     /// unregisters itself, so these must outlive the bind callback).
     metadata_listeners: Rc<RefCell<Vec<pipewire::metadata::MetadataListener>>>,
@@ -191,10 +219,14 @@ impl RoutingEngine {
             auto_route: false,
             routed: false,
             current_sink: None,
+            chain_output_sink: None,
+            eq_sinks: HashMap::new(),
+            output_mode: crate::core::OutputRoutingMode::Selected,
             virtual_sink_name: format!("{}.source", VIRTUAL_SINK_BASE),
             default_metadata: None,
             default_audio_sink: Rc::new(RefCell::new(None)),
             configured_audio_sink: Rc::new(RefCell::new(None)),
+            default_sink_changed: Rc::new(RefCell::new(false)),
             metadata_listeners: Rc::new(RefCell::new(Vec::new())),
             target_cache: Arc::new(Mutex::new(HashMap::new())),
             routed_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -326,6 +358,13 @@ impl RoutingEngine {
 
     pub fn set_current_sink(&mut self, sink_name: &str) {
         self.current_sink = Some(sink_name.to_string());
+        // Record the chain's physical destination for the monitor resolve
+        // path. The virtual sink (the streams' entry point, set by
+        // auto-route) is deliberately NOT recorded: it would send the monitor
+        // to `mini_eq_sink` itself instead of the device being equalised.
+        if sink_name != VIRTUAL_SINK_BASE {
+            self.chain_output_sink = Some(sink_name.to_string());
+        }
         info!("Current sink set to: {}", sink_name);
     }
 
@@ -333,9 +372,51 @@ impl RoutingEngine {
         self.current_sink.as_deref()
     }
 
+    /// Register an EQ virtual sink for a physical device (called as device
+    /// chains are created/destroyed, and once at startup for the legacy
+    /// singleton). Scope and allowed-target logic cover every registered
+    /// sink.
+    pub fn register_eq_sink(&mut self, eq_sink_name: &str, physical_sink: &str) {
+        self.eq_sinks
+            .insert(eq_sink_name.to_string(), physical_sink.to_string());
+    }
+
+    /// The physical sink a registered EQ virtual sink plays to.
+    pub fn physical_for_eq_sink(&self, eq_sink_name: &str) -> Option<String> {
+        self.eq_sinks.get(eq_sink_name).cloned()
+    }
+
+    /// Drop a per-device virtual sink from the known set.
+    pub fn unregister_eq_sink(&mut self, eq_sink_name: &str) {
+        self.eq_sinks.remove(eq_sink_name);
+    }
+
+    /// All known EQ virtual sinks (registered device chains).
+    pub fn eq_sink_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.eq_sinks.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The physical sink the filter chain plays out to, if known. See the
+    /// field docs: this stays physical while `current_sink` follows the
+    /// virtual sink during routing.
+    pub fn chain_output_sink(&self) -> Option<String> {
+        self.chain_output_sink.clone()
+    }
+
     /// True while the playback streams are routed through the EQ.
     pub fn is_routed(&self) -> bool {
         self.routed
+    }
+
+    /// Which streams the EQ reaches when it is on.
+    pub fn output_mode(&self) -> crate::core::OutputRoutingMode {
+        self.output_mode
+    }
+
+    pub fn set_output_mode(&mut self, mode: crate::core::OutputRoutingMode) {
+        self.output_mode = mode;
     }
 
     /// True when the stream is ours or must never be touched.
@@ -397,7 +478,20 @@ impl RoutingEngine {
             self.virtual_sink_name.clone(),
             format!("{}{}", VIRTUAL_SINK_BASE, FILTER_OUTPUT_SUFFIX),
         ];
+        // Every registered per-device EQ sink (+ its playback node): streams
+        // sitting in ANY device's chain are ours-in-waiting, never foreign.
+        for eq in self.eq_sinks.keys() {
+            names.push(eq.clone());
+            names.push(format!("{eq}{FILTER_OUTPUT_SUFFIX}"));
+        }
         if let Some(sink) = self.default_audio_sink.borrow().clone() {
+            names.push(sink);
+        }
+        // The chosen chain output: unroute sends streams there as the
+        // fallback, so a stream sitting on it is ours-in-waiting, not a
+        // foreign choice the user made. Without this, an off-to-fallback
+        // followed by re-on routes 0 streams under Selected.
+        if let Some(sink) = self.chain_output_sink.clone() {
             names.push(sink);
         }
         for name in names {
@@ -409,6 +503,58 @@ impl RoutingEngine {
             }
         }
         allowed
+    }
+
+    /// Whether a stream's routing target puts it in scope for the chosen device
+    /// under `mode`. Pure: it takes the target string rather than a stream, so
+    /// the predicate is testable without a live PipeWire connection.
+    ///
+    /// - **Selected**: in scope when the stream has no explicit target (the
+    ///   default is the device we picked) or its `target.object` matches the
+    ///   chosen sink's serial. A stream deliberately pointed at another device
+    ///   is out of scope -- that is the user's mixer deciding, and it stays
+    ///   absolute.
+    /// - **Reroute**: everything is in scope, including streams with a foreign
+    ///   target. This is the explicit opt-out from the foreign-target rule.
+    ///
+    /// The blocklist is applied before this predicate, so it is only ever asked
+    /// about a stream that survived it.
+    pub fn target_in_scope(
+        target_object: Option<&str>,
+        sink_serial: &str,
+        mode: crate::core::OutputRoutingMode,
+    ) -> bool {
+        if mode == crate::core::OutputRoutingMode::Reroute {
+            return true;
+        }
+        match target_object {
+            // No explicit target: WirePlumber is choosing the default, which is
+            // the device we picked. In scope.
+            None | Some("") => true,
+            Some(target) => target == sink_serial,
+        }
+    }
+
+    /// Whether a stream is in scope for the chosen device under `mode`.
+    ///
+    /// Called after the internal/blocklist filters, so the only question left is
+    /// *which device* the stream is aimed at.
+    ///
+    /// The chosen sink is identified by its `object.serial`, which is the value
+    /// WirePlumber matches on in `target.object`. Comparing against the serial
+    /// rather than the node name is what makes "this stream is already going to
+    /// the device I picked" true.
+    fn is_in_scope(
+        &self,
+        stream: &StreamNode,
+        sink_serial: &str,
+        mode: crate::core::OutputRoutingMode,
+    ) -> bool {
+        Self::target_in_scope(
+            self.stream_target(stream.id).target_object.as_deref(),
+            sink_serial,
+            mode,
+        )
     }
 
     /// Streams we may route: not ours, not blocklisted, and not already
@@ -495,8 +641,25 @@ impl RoutingEngine {
     }
 
     pub fn routable_output_streams(&self) -> Vec<StreamNode> {
+        self.routable_output_streams_for(
+            self.current_sink.as_deref().unwrap_or(VIRTUAL_SINK_BASE),
+            self.output_mode,
+        )
+    }
+
+    /// Filtered view for an explicit sink + mode, so the scope predicate can be
+    /// exercised on its own (see `tests::mode_scope_predicate`).
+    pub fn routable_output_streams_for(
+        &self,
+        sink_name: &str,
+        mode: crate::core::OutputRoutingMode,
+    ) -> Vec<StreamNode> {
         let allowed = self.processing_path_targets();
         let live_serials = self.live_sink_serials();
+        let sink_serial = self
+            .find_node_target(sink_name)
+            .map(|(_, serial)| serial)
+            .unwrap_or_default();
         if std::env::var("MINI_EQ_DEBUG_ROUTING").is_ok() {
             info!("routable filter: allowed targets = {allowed:?}");
             for s in self.list_stream_nodes() {
@@ -524,7 +687,13 @@ impl RoutingEngine {
                             Some(x) if !x.is_empty() && !allowed.iter().any(|a| a == x) => {
                                 "ROUTABLE (stale target, sink gone)"
                             }
-                            _ => "ROUTABLE",
+                            _ => {
+                                if self.is_in_scope(&s, &sink_serial, mode) {
+                                    "ROUTABLE"
+                                } else {
+                                    "skip (out of scope)"
+                                }
+                            }
                         }
                     }
                 );
@@ -536,7 +705,8 @@ impl RoutingEngine {
             .filter(|s| {
                 // No explicit target is fine: WirePlumber is choosing the
                 // default, which is what we want to override. An explicit
-                // foreign target is not.
+                // foreign target is not -- unless the mode says to take
+                // everything, in which case `is_in_scope` returns true below.
                 match self.stream_target(s.id).target_object.as_deref() {
                     Some(target) if !target.is_empty() => {
                         allowed.iter().any(|a| a == target)
@@ -549,7 +719,357 @@ impl RoutingEngine {
                     _ => true,
                 }
             })
+            .filter(|s| self.is_in_scope(s, &sink_serial, mode))
             .collect()
+    }
+
+    /// Candidates for unroute/suspend: everything routable, PLUS streams
+    /// already pointed into our processing path even when the mode scope
+    /// excludes them.
+    ///
+    /// Without the second half, switching the output device (which points
+    /// `current_sink` at the physical sink) and then switching the EQ off
+    /// leaves EQ-pointed streams behind: under Selected they are out of scope
+    /// for the physical sink, so the restore never sees them and they keep
+    /// pointing at `mini_eq_sink` -- audio stops when the app exits. A re-route
+    /// then records the EQ target as "where it came from", cementing it.
+    /// Reproduced by tests-live/live_test.sh (T7-off restored 0 streams).
+    pub fn restorable_output_streams(&self) -> Vec<StreamNode> {
+        let recorded_ids: std::collections::HashSet<u32> = self
+            .routed_targets
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        let allowed = self.processing_path_targets();
+        let sink_serial = self
+            .current_sink
+            .as_deref()
+            .and_then(|n| self.find_node_target(n))
+            .map(|(_, serial)| serial)
+            .unwrap_or_default();
+        let mode = self.output_mode;
+        self.list_stream_nodes()
+            .into_iter()
+            .filter(|s| !self.is_internal_stream(s))
+            .filter(|s| {
+                if recorded_ids.contains(&s.id) {
+                    return true;
+                }
+                let target = self.stream_target(s.id);
+                let obj = target.target_object.as_deref().unwrap_or("");
+                // Pointed into our processing path: ours by definition.
+                if !obj.is_empty() && allowed.iter().any(|a| a == obj) {
+                    return true;
+                }
+                Self::target_in_scope(target.target_object.as_deref(), &sink_serial, mode)
+            })
+            .collect()
+    }
+
+    /// True while at least one playback stream is pointed into the EQ.
+    ///
+    /// Gates manual output switches under Selected: moving the chain away
+    /// would orphan these streams, so the switch is refused instead (the
+    /// chain follows the active device). Internal streams are excluded, like
+    /// everywhere else.
+    pub fn has_routed_streams(&self) -> bool {
+        let mut serials: Vec<String> = self
+            .last_route_target
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, serial)| serial.clone())
+            .into_iter()
+            .collect();
+        if let Some((_, serial)) = self.find_node_target(VIRTUAL_SINK_BASE) {
+            if !serials.contains(&serial) {
+                serials.push(serial);
+            }
+        }
+        if serials.is_empty() {
+            return false;
+        }
+        self.list_stream_nodes().iter().any(|s| {
+            !self.is_internal_stream(s)
+                && self
+                    .stream_target(s.id)
+                    .target_object
+                    .as_deref()
+                    .is_some_and(|t| serials.iter().any(|x| x == t))
+        })
+    }
+
+    /// Reconcile routed streams with the current output device (or mode).
+    ///
+    /// Call after the chain moved to another sink, or after narrowing to
+    /// Selected, while routing is on. Under Reroute everything stays. Under
+    /// Selected a stream stays in the EQ only when it is *effectively* aimed
+    /// at the new device: its recorded target, or -- when it never had an
+    /// explicit one -- the system default (WirePlumber's choice for
+    /// target-less streams). Anything else is handed back, so changing the
+    /// Output dropdown never drags audio off the device it is playing on;
+    /// streams explicitly aimed at the new device that were never taken are
+    /// adopted. Returns `(pruned, adopted)`.
+    ///
+    /// No-op when not routed, under Reroute, or when a device cannot be
+    /// resolved (safer to keep the status quo than to guess).
+    pub fn rescope_routing(&mut self) -> Result<(usize, usize), Error> {
+        if !self.routed || self.output_mode == crate::core::OutputRoutingMode::Reroute {
+            return Ok((0, 0));
+        }
+        let chosen = self.chain_output_sink.clone().unwrap_or_default();
+        self.rescope_scoped(VIRTUAL_SINK_BASE, &chosen)
+    }
+
+    /// Device-scoped reconcile: streams effectively aimed elsewhere are
+    /// handed back, streams explicitly aimed at this device are (re)routed
+    /// into ITS virtual sink. Unlike the legacy `rescope_routing` this does
+    /// not require the global `routed` flag: per-device chains are adopted
+    /// whenever their device's EQ is asked to be consistent.
+    pub fn rescope_device(&mut self, physical_sink: &str) -> Result<(usize, usize), Error> {
+        if self.output_mode == crate::core::OutputRoutingMode::Reroute {
+            // Reroute takes everything in the selected chain; there is
+            // nothing to prune per device.
+            return Ok((0, 0));
+        }
+        let eq = crate::core::eq_virtual_sink_for(physical_sink);
+        self.rescope_scoped(&eq, physical_sink)
+    }
+
+    /// Shared body of `rescope_routing`/`rescope_device`.
+    ///
+    /// `eq_sink_name` is the virtual sink the streams get routed into,
+    /// `physical_name` the real device they are effectively aimed at.
+    fn rescope_scoped(
+        &mut self,
+        eq_sink_name: &str,
+        physical_name: &str,
+    ) -> Result<(usize, usize), Error> {
+        let chosen_serial_and_name = self.find_node_target(physical_name);
+        let Some((_, chosen_serial)) = chosen_serial_and_name else {
+            return Ok((0, 0));
+        };
+        let default_serial: Option<String> = self
+            .default_audio_sink
+            .borrow()
+            .clone()
+            .and_then(|n| self.find_node_target(&n))
+            .map(|(_, serial)| serial);
+        let Some((virt_id, virt_serial)) = self.find_node_target(eq_sink_name) else {
+            return Ok((0, 0));
+        };
+        // A stream's effective device: its recorded origin, falling back to
+        // the system default for streams that never had an explicit target.
+        let effective = |recorded: &StreamTarget| -> Option<String> {
+            recorded
+                .target_object
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| default_serial.clone())
+        };
+        let mut pruned = 0usize;
+        let mut adopted = 0usize;
+        let mut wrote = false;
+        self.ensure_default_metadata()?;
+        // 1. Hand back recorded streams that are effectively aimed elsewhere.
+        // 2. (Re-)route recorded in-scope streams that are not currently on
+        //    the EQ (post-suspend / post-rebuild state).
+        let recorded = self.routed_targets.lock().unwrap().clone();
+        {
+            let md = self.default_metadata.as_ref().unwrap();
+            for (id, rec) in &recorded {
+                match effective(rec) {
+                    Some(eff) if eff != chosen_serial => {
+                        md.set_property(
+                            *id,
+                            "target.node",
+                            rec.target_node_type.as_deref(),
+                            rec.target_node.as_deref(),
+                        );
+                        md.set_property(
+                            *id,
+                            "target.object",
+                            rec.target_object_type.as_deref(),
+                            rec.target_object.as_deref(),
+                        );
+                        self.routed_targets.lock().unwrap().remove(id);
+                        info!("Rescope: handed stream {id} back (aimed elsewhere)");
+                        pruned += 1;
+                        wrote = true;
+                    }
+                    _ => {
+                        // In scope (or undecidable): make sure it is actually
+                        // on the EQ. A `None` effective target means neither a
+                        // recorded origin nor a known default -- leave it.
+                        let on_eq = self.stream_target(*id).target_object.as_deref()
+                            == Some(virt_serial.as_str());
+                        if !on_eq && effective(rec).as_deref() == Some(chosen_serial.as_str()) {
+                            md.set_property(
+                                *id,
+                                "target.node",
+                                Some("Spa:Id"),
+                                Some(&virt_id.to_string()),
+                            );
+                            md.set_property(
+                                *id,
+                                "target.object",
+                                Some("Spa:Id"),
+                                Some(&virt_serial),
+                            );
+                            info!("Rescope: re-routed stream {id} into the EQ");
+                            adopted += 1;
+                            wrote = true;
+                        }
+                    }
+                }
+            }
+        }
+        // 3. Adopt unrecorded streams explicitly aimed at the new device --
+        //    and target-less ones when the new device IS the default.
+        //    `dont-move` is respected exactly like the initial auto-route.
+        {
+            let md = self.default_metadata.as_ref().unwrap();
+            for s in self.list_stream_nodes() {
+                if self.is_internal_stream(&s)
+                    || s.dont_move
+                    || self.routed_targets.lock().unwrap().contains_key(&s.id)
+                {
+                    continue;
+                }
+                let cur = self.stream_target(s.id);
+                let cur_obj = cur.target_object.as_deref().unwrap_or("");
+                let ours = !cur_obj.is_empty() && cur_obj == chosen_serial;
+                let follows_default =
+                    cur_obj.is_empty() && default_serial.as_deref() == Some(chosen_serial.as_str());
+                if ours || follows_default {
+                    md.set_property(
+                        s.id,
+                        "target.node",
+                        Some("Spa:Id"),
+                        Some(&virt_id.to_string()),
+                    );
+                    md.set_property(s.id, "target.object", Some("Spa:Id"), Some(&virt_serial));
+                    self.routed_targets.lock().unwrap().insert(s.id, cur);
+                    info!("Rescope: adopted stream '{}' ({})", s.node_name, s.id);
+                    adopted += 1;
+                    wrote = true;
+                }
+            }
+        }
+        *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial));
+        if wrote {
+            self.roundtrip()?;
+        }
+        if pruned > 0 || adopted > 0 {
+            info!("Rescope complete: {pruned} handed back, {adopted} (re-)routed");
+        }
+        Ok((pruned, adopted))
+    }
+
+    /// True while at least one stream is pointed into the given device's EQ
+    /// virtual sink. Unknown sink (chain not created yet / already dropped)
+    /// is false -- cannot be "on" it.
+    pub fn has_routed_streams_for(&self, physical_sink: &str) -> bool {
+        let eq = crate::core::eq_virtual_sink_for(physical_sink);
+        let Some((_, serial)) = self.find_node_target(&eq) else {
+            return false;
+        };
+        self.list_stream_nodes().iter().any(|s| {
+            !self.is_internal_stream(s)
+                && self.stream_target(s.id).target_object.as_deref() == Some(serial.as_str())
+        })
+    }
+
+    /// Hand back every stream pointed into `physical_sink`'s EQ chain.
+    ///
+    /// Streams with a recorded origin get that verbatim; unrecorded ones fall
+    /// back to `fallback_sink` (clearing their target when no fallback is
+    /// available). After this, no stream should reference the chain's virtual
+    /// sink -- so the chain can be dropped or its EQ switched "off" without
+    /// silencing the apps that used it.
+    pub fn unroute_device(
+        &mut self,
+        physical_sink: &str,
+        fallback_sink: Option<&str>,
+    ) -> Result<(), Error> {
+        let eq = crate::core::eq_virtual_sink_for(physical_sink);
+        let Some((_, eq_serial)) = self.find_node_target(&eq) else {
+            return Ok(());
+        };
+        self.ensure_default_metadata()?;
+        let streams = self.list_stream_nodes();
+        let recorded = self.routed_targets.lock().unwrap().clone();
+        let mut restored = 0usize;
+        let mut to_fallback = 0usize;
+        let mut wrote = false;
+        {
+            let md = self.default_metadata.as_ref().unwrap();
+            for s in &streams {
+                if self.is_internal_stream(s) {
+                    continue;
+                }
+                let cur = self.stream_target(s.id);
+                if cur.target_object.as_deref() != Some(eq_serial.as_str()) {
+                    continue;
+                }
+                match recorded.get(&s.id) {
+                    Some(rec) => {
+                        md.set_property(
+                            s.id,
+                            "target.node",
+                            rec.target_node_type.as_deref(),
+                            rec.target_node.as_deref(),
+                        );
+                        md.set_property(
+                            s.id,
+                            "target.object",
+                            rec.target_object_type.as_deref(),
+                            rec.target_object.as_deref(),
+                        );
+                        self.routed_targets.lock().unwrap().remove(&s.id);
+                        info!("UnrouteDevice: restored '{}' ({})", s.node_name, s.id);
+                        restored += 1;
+                    }
+                    None => {
+                        match fallback_sink.and_then(|n| self.find_node_target(n)) {
+                            Some((node_id, serial)) => {
+                                md.set_property(
+                                    s.id,
+                                    "target.node",
+                                    Some("Spa:Id"),
+                                    Some(&node_id.to_string()),
+                                );
+                                md.set_property(
+                                    s.id,
+                                    "target.object",
+                                    Some("Spa:Id"),
+                                    Some(&serial),
+                                );
+                            }
+                            None => {
+                                md.set_property(s.id, "target.node", None, None);
+                                md.set_property(s.id, "target.object", None, None);
+                            }
+                        }
+                        info!("UnrouteDevice: fallback for '{}' ({})", s.node_name, s.id);
+                        to_fallback += 1;
+                    }
+                }
+                wrote = true;
+            }
+        }
+        if wrote {
+            self.roundtrip()?;
+        }
+        if self.routed_targets.lock().unwrap().is_empty() {
+            self.routed = false;
+            *self.last_route_target.lock().unwrap() = None;
+        }
+        info!("UnrouteDevice({physical_sink}): {restored} restored, {to_fallback} to fallback");
+        Ok(())
     }
 
     /// Put the routed streams back on their own targets WITHOUT forgetting that
@@ -569,7 +1089,10 @@ impl RoutingEngine {
         if !self.routed {
             return Ok(());
         }
-        let streams = self.routable_output_streams();
+        // Restorable, not just routable: a recorded stream pointed at the
+        // virtual sink must be moved off it even when the mode scope would
+        // not route it (see restorable_output_streams).
+        let streams = self.restorable_output_streams();
         let recorded = self.routed_targets.lock().unwrap().clone();
         if recorded.is_empty() {
             return Ok(());
@@ -605,20 +1128,57 @@ impl RoutingEngine {
     }
 
     pub fn auto_route_to_sink(&mut self, sink_name: &str) -> Result<(), Error> {
-        info!("Auto-routing all playback streams to sink: {}", sink_name);
+        self.auto_route_to_sink_with_mode(sink_name, self.output_mode)
+    }
+
+    /// Route under an explicit mode. The switch handler passes the engine's
+    /// mode; the scope predicate (`is_in_scope`) is what differs between
+    /// Selected and Reroute, and it is only meaningful against a real sink.
+    pub fn auto_route_to_sink_with_mode(
+        &mut self,
+        sink_name: &str,
+        mode: crate::core::OutputRoutingMode,
+    ) -> Result<(), Error> {
+        info!("Auto-routing to sink: {sink_name} (mode {:?})", mode);
 
         let (sink_id, sink_serial) = match self.find_node_target(sink_name) {
             Some(t) => t,
             None => {
-                warn!(
-                    "Virtual sink node {} not found; cannot auto-route",
-                    sink_name
-                );
+                warn!("Virtual sink node {sink_name} not found; cannot auto-route");
                 return Err(Error::CreationFailed);
             }
         };
 
-        let streams = self.routable_output_streams();
+        // Scope against the PHYSICAL chain output as well as the virtual
+        // sink. `sink_name` here is the virtual sink (the route destination),
+        // but Selected means "streams already aimed at the chosen DEVICE":
+        // a stream we just sent to the fallback (explicit real-device target)
+        // would otherwise never be re-routed under Selected -- the re-on
+        // after an off routed 0 streams in the live test.
+        //
+        // When `sink_name` is a registered device sink, its owning physical
+        // device is the scope; the legacy singleton falls back to the global
+        // chain output.
+        let scope_physical = self
+            .physical_for_eq_sink(sink_name)
+            .or_else(|| self.chain_output_sink.clone());
+        let scope_sinks: Vec<String> = {
+            let mut v = vec![sink_name.to_string()];
+            if let Some(physical) = scope_physical {
+                if physical != sink_name {
+                    v.push(physical);
+                }
+            }
+            v
+        };
+        let mut streams: Vec<StreamNode> = Vec::new();
+        for scope in &scope_sinks {
+            for s in self.routable_output_streams_for(scope, mode) {
+                if !streams.iter().any(|x| x.id == s.id) {
+                    streams.push(s);
+                }
+            }
+        }
         let mut routed = 0usize;
         let mut skipped_dont_move = 0usize;
         for node in &streams {
@@ -636,10 +1196,28 @@ impl RoutingEngine {
             // way back faithful: a stream that was deliberately pointed at
             // another device, or one with no explicit target at all, goes back
             // to that, not to whatever WirePlumber picks for "no target".
+            //
+            // Never record our own virtual sink as the origin: a stream that
+            // is already EQ-pointed (failed unroute, previous instance) would
+            // otherwise cement the EQ target as "where it came from" and keep
+            // pointing at `mini_eq_sink` past unroute and quit.
             {
                 let mut recorded = self.routed_targets.lock().unwrap();
                 if !recorded.contains_key(node_id) {
-                    recorded.insert(*node_id, self.stream_target(*node_id));
+                    let cur = self.stream_target(*node_id);
+                    let obj = cur.target_object.as_deref().unwrap_or("");
+                    let ours = !obj.is_empty()
+                        && (Some(obj) == Some(sink_serial.as_str())
+                            || self
+                                .find_node_target(crate::core::VIRTUAL_SINK_BASE)
+                                .map(|(_, serial)| serial)
+                                .as_deref()
+                                == Some(obj));
+                    if ours {
+                        debug!("not recording '{name}' ({node_id}): already on the EQ path");
+                    } else {
+                        recorded.insert(*node_id, cur);
+                    }
                 }
             }
             *self.last_route_target.lock().unwrap() = Some((sink_id, sink_serial.clone()));
@@ -688,18 +1266,33 @@ impl RoutingEngine {
     /// re-resolves the stream's target from scratch, and the silence while it
     /// does is what made toggling the switch audibly disruptive.
     pub fn unroute_all(&mut self, fallback_sink: Option<&str>) -> Result<(), Error> {
-        let streams = self.routable_output_streams();
+        // Restorable, not just routable: streams we pointed at the virtual
+        // sink stay restore candidates even when the mode scope excludes
+        // them (device switch points current_sink at the physical sink, which
+        // would otherwise hide every EQ-pointed stream under Selected).
+        let streams = self.restorable_output_streams();
 
-        // Is anything still pointed at the EQ? Read it from the streams'
-        // targets rather than assuming, so a second call -- the UI switch and
-        // D-Bus both route through here, and a toggle fires both -- is a cheap
-        // no-op instead of a second round of writes on the way out.
+        // Is anything still pointed at the EQ? Check every chain we own (all
+        // registered serials, not just the latest), since a stream left in a
+        // per-device chain would otherwise slip past the early return.
         let route_target = self.last_route_target.lock().unwrap().clone();
-        let still_on_eq = route_target.as_ref().is_some_and(|(_, serial)| {
-            streams.iter().any(|node| {
-                self.stream_target(node.id).target_object.as_deref() == Some(serial.as_str())
-            })
-        });
+        let our_serials: HashSet<String> = self.processing_path_targets().into_iter().collect();
+        let still_on_eq = {
+            let mut found = route_target.as_ref().is_some_and(|(_, serial)| {
+                streams.iter().any(|node| {
+                    self.stream_target(node.id).target_object.as_deref() == Some(serial.as_str())
+                })
+            });
+            if !found {
+                found = streams.iter().any(|node| {
+                    self.stream_target(node.id)
+                        .target_object
+                        .as_deref()
+                        .is_some_and(|t| our_serials.contains(t))
+                });
+            }
+            found
+        };
         let recorded_empty = self.routed_targets.lock().unwrap().is_empty();
         if !still_on_eq && recorded_empty {
             info!("Unroute: nothing is pointed at the EQ; nothing to restore");
@@ -731,11 +1324,13 @@ impl RoutingEngine {
         // recorded, so we do not know where it came from. Fall back to the sink
         // the EQ was feeding, then to clearing the target.
         //
-        // Built from `routable_output_streams()` deliberately: a stream we
+        // Built from `restorable_output_streams()` deliberately: a stream we
         // refuse to route (a blocklisted desktop or speech app, or one the user
         // pointed at another device) must not be written to on the way out
         // either -- sending it to the fallback would be exactly the disruption
-        // the routability filter just stopped us causing.
+        // the routability filter just stopped us causing. Streams already
+        // pointed into our own processing path ARE included (they are ours),
+        // so an unrecorded one still lands on the fallback instead of dangling.
         let leftovers: Vec<(u32, String)> = streams
             .iter()
             .filter(|node| !restored_ids.contains(&node.id))
@@ -937,6 +1532,17 @@ impl RoutingEngine {
         self.roundtrip()
     }
 
+    /// Bind the `default` metadata now so the default sink is known.
+    ///
+    /// The binding is otherwise lazy (first routing op), which left
+    /// `default_audio_sink_name()` empty at startup: the engine was never
+    /// created, the Output dropdown showed only "Default Output" with nothing
+    /// behind it, and the monitor tapped nothing. The server replays current
+    /// properties when the listener binds, so one call here is enough.
+    pub fn prime_default_sink(&mut self) -> Result<(), Error> {
+        self.ensure_default_metadata()
+    }
+
     /// Lazily bind (and cache) the PipeWire `default` metadata object from
     /// the registry global whose `metadata.name == "default"`. While binding,
     /// register a `property` listener so the server's replayed properties
@@ -951,6 +1557,7 @@ impl RoutingEngine {
         let reg_c = registry.clone();
         let sink_c = self.default_audio_sink.clone();
         let cfg_c = self.configured_audio_sink.clone();
+        let changed_c = self.default_sink_changed.clone();
         let listeners_c = self.metadata_listeners.clone();
         let cache_c = self.target_cache.clone();
         let _listener = registry
@@ -970,6 +1577,7 @@ impl RoutingEngine {
                         let sink_l = sink_c.clone();
                         let cfg_l = cfg_c.clone();
                         let cache_l = cache_c.clone();
+                        let changed_l = changed_c.clone();
                         let _pl = md
                             .add_listener_local()
                             .property(move |subject, key, type_, value| {
@@ -1000,6 +1608,7 @@ impl RoutingEngine {
                                             value, parsed
                                         );
                                         *sink_l.borrow_mut() = parsed;
+                                        *changed_l.borrow_mut() = true;
                                     }
                                     Some("default.configured.audio.sink") => {
                                         *cfg_l.borrow_mut() = parse_metadata_node_name(value);
@@ -1032,47 +1641,45 @@ impl RoutingEngine {
     /// sink the filter-chain playback node should target so EQ'd audio
     /// reaches the speakers the user actually hears on — portable across
     /// any PipeWire machine.
-    pub fn default_audio_sink_name(&mut self) -> Option<String> {
-        self.ensure_default_metadata().ok()?;
-        // The server replays metadata properties asynchronously; pump the
-        // loop a few extra times so the `default.audio.sink` event lands
-        // before we read it.
-        if self.default_audio_sink.borrow().is_none() {
-            for _ in 0..20 {
-                self.mainloop
-                    .loop_()
-                    .iterate(Timeout::Finite(Duration::from_millis(20)));
-                if self.default_audio_sink.borrow().is_some() {
-                    break;
-                }
-            }
-        }
+    pub fn default_audio_sink_name(&self) -> Option<String> {
         self.default_audio_sink
             .borrow()
             .clone()
             .or_else(|| self.configured_audio_sink.borrow().clone())
     }
 
-    /// Re-read `default.audio.sink` from the metadata, bypassing the
-    /// cached value, so a change of the system default output can be
-    /// DETECTED at runtime.
+    /// The sink the filter chain's output points at, if known.
+    pub fn current_sink(&self) -> Option<String> {
+        self.current_sink.clone()
+    }
+
+    /// The current system default output, updated by the metadata `property`
+    /// listener in real time.
     ///
-    /// `default_audio_sink_name()` only pumps the loop when the cache is
-    /// empty, so it can never observe a later change -- which is why the
-    /// app used to keep the sink it started with forever.
-    pub fn refresh_default_audio_sink_name(&mut self) -> Option<String> {
-        self.ensure_default_metadata().ok()?;
-        // The metadata property is delivered asynchronously; pump briefly
-        // so the event lands before we read it back.
-        for _ in 0..5 {
-            self.mainloop
-                .loop_()
-                .iterate(Timeout::Finite(Duration::from_millis(10)));
-        }
+    /// Unlike `default_audio_sink_name` this does not pump the loop: the
+    /// listener fires synchronously when the server delivers the property, so
+    /// the value is already here. The pump in the old `refresh_*` method was
+    /// a 50 ms stall per 500 ms tick that could not observe anything the
+    /// listener had not already delivered.
+    pub fn current_default_audio_sink(&self) -> Option<String> {
         self.default_audio_sink
             .borrow()
             .clone()
             .or_else(|| self.configured_audio_sink.borrow().clone())
+    }
+
+    /// If the system default output changed since the last call, return the
+    /// new sink and clear the flag. The metadata `property` listener sets the
+    /// flag; this is the single consumer, so a change is acted on exactly once.
+    ///
+    /// Returns `None` when nothing changed -- which is the common case, so the
+    /// 500 ms default-sink poll can be a cheap flag read instead of a pump.
+    pub fn take_default_sink_change(&self) -> Option<String> {
+        if !*self.default_sink_changed.borrow() {
+            return None;
+        }
+        *self.default_sink_changed.borrow_mut() = false;
+        self.current_default_audio_sink()
     }
 
     /// Find a node's bound id AND its `object.serial` by node.name.
@@ -1442,5 +2049,89 @@ mod tests {
         assert!("mini_eq_sink.source".starts_with(VIRTUAL_SINK_BASE));
         // A real device must not be caught by the filter.
         assert!(!"alsa_output.pci-0000_04_00.6.analog-stereo".starts_with(VIRTUAL_SINK_BASE));
+    }
+
+    /// The scope predicate is the whole point of the mode split. It is pure --
+    /// it takes the target string rather than a stream -- so it is testable
+    /// without a live PipeWire connection.
+    ///
+    /// A stream with no explicit target is in scope for the chosen device
+    /// (WirePlumber is choosing the default, which is the device we picked);
+    /// one aimed at the chosen serial is in scope; one aimed at another
+    /// serial is out. Reroute overrides all of that and takes everything.
+    /// The blocklist is applied before this predicate, so it is not exercised
+    /// here -- `target_in_scope` is only ever asked about a stream that
+    /// survived it.
+    #[test]
+    fn mode_scope_predicate() {
+        use crate::core::OutputRoutingMode;
+
+        // Selected: the chosen serial wins, anything else is out, and no
+        // target means "the default is the device I picked".
+        assert!(RoutingEngine::target_in_scope(
+            None,
+            "AAA",
+            OutputRoutingMode::Selected
+        ));
+        assert!(RoutingEngine::target_in_scope(
+            Some(""),
+            "AAA",
+            OutputRoutingMode::Selected
+        ));
+        assert!(RoutingEngine::target_in_scope(
+            Some("AAA"),
+            "AAA",
+            OutputRoutingMode::Selected
+        ));
+        assert!(!RoutingEngine::target_in_scope(
+            Some("BBB"),
+            "AAA",
+            OutputRoutingMode::Selected
+        ));
+
+        // Reroute: the foreign-target rule is the explicit opt-out.
+        assert!(RoutingEngine::target_in_scope(
+            Some("BBB"),
+            "AAA",
+            OutputRoutingMode::Reroute
+        ));
+        assert!(RoutingEngine::target_in_scope(
+            None,
+            "AAA",
+            OutputRoutingMode::Reroute
+        ));
+    }
+
+    /// The two modes round-trip through the config: a remembered Reroute is
+    /// restored on the next startup, and Selected is the default for a missing
+    /// or version-1 file.
+    #[test]
+    fn output_routing_mode_roundtrips() {
+        let path = std::env::temp_dir()
+            .join("mini-eq-test")
+            .join("output-presets-mode.json");
+        let _ = std::fs::remove_file(&path);
+
+        // Default is Selected when nothing is written.
+        assert_eq!(
+            crate::core::output_routing_mode_at(&path),
+            crate::core::OutputRoutingMode::Selected
+        );
+
+        crate::core::set_output_routing_mode_at(crate::core::OutputRoutingMode::Reroute, &path)
+            .unwrap();
+        assert_eq!(
+            crate::core::output_routing_mode_at(&path),
+            crate::core::OutputRoutingMode::Reroute
+        );
+
+        crate::core::set_output_routing_mode_at(crate::core::OutputRoutingMode::Selected, &path)
+            .unwrap();
+        assert_eq!(
+            crate::core::output_routing_mode_at(&path),
+            crate::core::OutputRoutingMode::Selected
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

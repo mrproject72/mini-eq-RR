@@ -91,6 +91,11 @@ pub struct MonitorControls {
     /// upstream's `analyzer_frozen` gate on `on_analyzer_levels` and
     /// `on_analyzer_loudness` (`window_analyzer.py`).
     pub frozen: Rc<std::cell::Cell<bool>>,
+    /// The device the monitor taps: `Follow EQ output` (index 0, the default)
+    /// or a specific sink. Stored in `output-presets.json` as `monitor`, so a
+    /// pinned monitor survives a chain rebuild and `Follow EQ output`
+    /// re-resolves after it.
+    pub monitor_dropdown: gtk4::DropDown,
 }
 
 /// Stack page names (used by the header buttons to switch panels).
@@ -114,12 +119,20 @@ pub struct UtilityPane {
     pub bypass_switch: gtk4::Switch,
     /// Output device dropdown (moved from the header into Output Controls).
     pub output_dropdown: gtk4::DropDown,
+    /// Output mode: which streams the EQ reaches when it is on. Lives here in
+    /// Output Controls (not the header): Selected = only streams already aimed
+    /// at the chosen device; Reroute = move every eligible stream in.
+    pub mode_selected: gtk4::ToggleButton,
+    pub mode_reroute: gtk4::ToggleButton,
     /// Fallback preset action (default preset for unmatched outputs).
     pub fallback_button: gtk4::Button,
     pub fallback_label: gtk4::Label,
-    /// Link-to-output action (auto-load current preset for the active output).
-    pub link_button: gtk4::Button,
-    pub link_label: gtk4::Label,
+    /// The preset linked to the active output device. Choosing one links it;
+    /// the unlink button next to it drops the link. Replaces the old "Link to
+    /// Output" button, which wrote the sink's node name into a dead value
+    /// label and nothing ever read it back.
+    pub curve_dropdown: gtk4::DropDown,
+    pub unlink_button: gtk4::Button,
 }
 
 impl UtilityPane {
@@ -143,10 +156,12 @@ impl UtilityPane {
         let (
             output_controls,
             output_dropdown,
+            mode_selected,
+            mode_reroute,
             fallback_button,
             fallback_label,
-            link_button,
-            link_label,
+            curve_dropdown,
+            unlink_button,
         ) = Self::build_output_controls();
         let output_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         output_box.set_margin_top(8);
@@ -174,10 +189,12 @@ impl UtilityPane {
             monitor,
             bypass_switch,
             output_dropdown,
+            mode_selected,
+            mode_reroute,
             fallback_button,
             fallback_label,
-            link_button,
-            link_label,
+            curve_dropdown,
+            unlink_button,
         }
     }
 
@@ -204,14 +221,16 @@ impl UtilityPane {
 
     /// "Output Controls" section for the Headroom page: the output-device
     /// dropdown (moved out of the header) plus the per-output-device
-    /// auto-preset actions (Fallback / Link to Output).
+    /// auto-preset actions (Fallback / Curve).
     fn build_output_controls() -> (
         gtk4::Box,
         gtk4::DropDown,
+        gtk4::ToggleButton,
+        gtk4::ToggleButton,
         gtk4::Button,
         gtk4::Label,
+        gtk4::DropDown,
         gtk4::Button,
-        gtk4::Label,
     ) {
         let section = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
         section.set_css_classes(&["utility-section"]);
@@ -243,6 +262,34 @@ impl UtilityPane {
         output_row.append(&output_dropdown);
         section.append(&output_row);
 
+        // Output mode: which streams the EQ reaches when it is on. Two toggle
+        // buttons in a linked group. Selected (default) only takes streams
+        // already aimed at the chosen device; Reroute moves every eligible
+        // stream in regardless of device.
+        let mode_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let mode_label = gtk4::Label::new(Some("EQ scope"));
+        mode_label.set_css_classes(&["metric-title"]);
+        mode_label.set_hexpand(true);
+        mode_label.set_xalign(0.0);
+        mode_box.append(&mode_label);
+        let mode_linked = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        mode_linked.set_css_classes(&["linked"]);
+        let mode_selected = gtk4::ToggleButton::new();
+        mode_selected.set_label("Selected");
+        mode_selected.set_tooltip_text(Some(
+            "Equalise only the streams already playing to the chosen device. \
+             Nothing that was deliberately pointed elsewhere is touched.",
+        ));
+        let mode_reroute = gtk4::ToggleButton::new();
+        mode_reroute.set_label("Reroute");
+        mode_reroute.set_tooltip_text(Some(
+            "Move every eligible stream into the EQ, whatever device it was on.",
+        ));
+        mode_linked.append(&mode_selected);
+        mode_linked.append(&mode_reroute);
+        mode_box.append(&mode_linked);
+        section.append(&mode_box);
+
         // Fallback: default preset for unmatched output devices.
         let fallback_button = gtk4::Button::with_label("Set Fallback");
         fallback_button.set_tooltip_text(Some("Use the current preset for unmatched outputs"));
@@ -258,28 +305,39 @@ impl UtilityPane {
         fallback_row.append(&fallback_button);
         section.append(&fallback_row);
 
-        // Link to Output: auto-load the current preset for the active output.
-        let link_button = gtk4::Button::with_label("Link to Output");
-        link_button.set_tooltip_text(Some("Auto-load the current preset for this output device"));
-        let link_label = gtk4::Label::new(Some("None"));
-        link_label.set_css_classes(&["dim-label"]);
-        link_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        let link_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        let link_title = gtk4::Label::new(Some("Link to Output"));
-        link_title.set_css_classes(&["metric-title"]);
-        link_title.set_hexpand(true);
-        link_row.append(&link_title);
-        link_row.append(&link_label);
-        link_row.append(&link_button);
-        section.append(&link_row);
+        // Curve: the preset linked to the active output device. Choosing a preset
+        // in this dropdown links it to the device immediately, so the reader
+        // will use it on the next switch; the unlink button next to it drops
+        // the link. This replaces the old "Link to Output" button, which wrote
+        // the sink's node name into a value label that nothing ever read back.
+        let curve_list = gtk4::StringList::new(&["(none)"]);
+        let curve_dropdown = gtk4::DropDown::new(Some(curve_list), None::<gtk4::Expression>);
+        curve_dropdown.set_hexpand(true);
+        curve_dropdown.set_tooltip_text(Some(
+            "Equalise this device with the chosen preset. Unlink to let the \
+             fallback preset apply instead.",
+        ));
+        let unlink_button = gtk4::Button::from_icon_name("list-remove-symbolic");
+        unlink_button.set_tooltip_text(Some("Unlink this device from its preset"));
+        unlink_button.set_css_classes(&["destructive-action"]);
+        let curve_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let curve_title = gtk4::Label::new(Some("Curve"));
+        curve_title.set_css_classes(&["metric-title"]);
+        curve_title.set_hexpand(true);
+        curve_row.append(&curve_title);
+        curve_row.append(&curve_dropdown);
+        curve_row.append(&unlink_button);
+        section.append(&curve_row);
 
         (
             section,
             output_dropdown,
+            mode_selected,
+            mode_reroute,
             fallback_button,
             fallback_label,
-            link_button,
-            link_label,
+            curve_dropdown,
+            unlink_button,
         )
     }
 
@@ -356,6 +414,25 @@ impl UtilityPane {
             &freeze_switch,
             None,
         ));
+        // The device the monitor taps. `Follow EQ output` (index 0) is the
+        // default and re-resolves to whatever the chain is playing to; a
+        // specific sink pins the monitor to one device so you can equalise on
+        // headphones and still watch the speakers. The model is refilled from
+        // PipeWire on a 330 ms cadence in the window, so a hotplugged device
+        // appears here without a restart.
+        let monitor_list = gtk4::StringList::new(&["Follow EQ output"]);
+        let monitor_dropdown = gtk4::DropDown::new(Some(monitor_list), None::<gtk4::Expression>);
+        monitor_dropdown.set_hexpand(true);
+        monitor_dropdown.set_tooltip_text(Some(
+            "Which device the spectrum and loudness readout tap. Listen-only: \
+             it does not change where the EQ'd audio goes.",
+        ));
+        settings_list.append(&settings_row(
+            "Monitor device",
+            Some("The capture device for the spectrum and loudness readout"),
+            &monitor_dropdown,
+            None,
+        ));
         settings_box.append(&settings_list);
 
         settings_popover.set_child(Some(&settings_box));
@@ -397,6 +474,7 @@ impl UtilityPane {
             display_gain_value,
             freeze_switch,
             frozen: Rc::new(std::cell::Cell::new(false)),
+            monitor_dropdown,
         }
     }
 

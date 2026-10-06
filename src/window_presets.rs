@@ -792,3 +792,48 @@ pub fn preset_storage_dir() -> PathBuf {
 pub fn list_preset_names() -> Vec<String> {
     crate::core::list_preset_names()
 }
+
+/// Full model for the Output Controls "Curve" dropdown: `(none)` (the
+/// fallback preset applies) + built-ins + customs.
+///
+/// Pure (no GTK), so the live test can assert on it without a display.
+/// Extracted from the window's refresh closure: that closure used to list
+/// customs only and never showed `(none)`, so with a single preset the
+/// dropdown looked like it contained only the current curve.
+pub fn curve_model_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    names.push("(none)".to_string());
+    for b in BUILTIN_PRESET_NAMES {
+        names.push((*b).to_string());
+    }
+    for n in list_preset_names() {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: the Curve dropdown once listed customs only with no
+    /// `(none)` entry, so with a single preset it showed just the current
+    /// curve. The model must always carry the full list regardless of what
+    /// custom presets exist on disk.
+    #[test]
+    fn curve_model_always_has_none_and_builtins() {
+        let names = curve_model_names();
+        assert!(!names.is_empty());
+        assert_eq!(names[0], "(none)");
+        for b in BUILTIN_PRESET_NAMES {
+            assert!(names.contains(&b.to_string()), "missing builtin {b}");
+        }
+        // No duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for n in &names {
+            assert!(seen.insert(n.clone()), "duplicate entry {n}");
+        }
+    }
+}
