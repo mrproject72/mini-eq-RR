@@ -1141,11 +1141,26 @@ impl RoutingEngine {
     ) -> Result<(), Error> {
         info!("Auto-routing to sink: {sink_name} (mode {:?})", mode);
 
-        let (sink_id, sink_serial) = match self.find_node_target(sink_name) {
-            Some(t) => t,
-            None => {
-                warn!("Virtual sink node {sink_name} not found; cannot auto-route");
-                return Err(Error::CreationFailed);
+        let (sink_id, sink_serial) = {
+            // The virtual sink node can be missing if we just created its
+            // chain: the registry has not delivered the global yet. `find_node_target`
+            // does one roundtrip, so poll it a few times with a short pump
+            // before declaring failure -- bounded so a genuinely missing node
+            // cannot hang the caller.
+            let deadline = std::time::Instant::now() + Duration::from_millis(800);
+            let mut found = self.find_node_target(sink_name);
+            while found.is_none() && std::time::Instant::now() < deadline {
+                self.mainloop
+                    .loop_()
+                    .iterate(Timeout::Finite(Duration::from_millis(50)));
+                found = self.find_node_target(sink_name);
+            }
+            match found {
+                Some(t) => t,
+                None => {
+                    warn!("Virtual sink node {sink_name} not found; cannot auto-route");
+                    return Err(Error::CreationFailed);
+                }
             }
         };
 
