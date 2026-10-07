@@ -139,13 +139,15 @@ fi
 python3 - "$WAV" <<'EOF'
 import math, struct, sys, wave
 path = sys.argv[1]
-rate, secs = 48000, 300  # 300 s mono 440 Hz (outlives the test run)
+rate, secs = 48000, 300  # 300 s 1000 Hz tone (outlives the test run)
+# 1000 Hz: matches livetest_A's boosted band, so the wet/bypass level
+# comparison in T3b measures the actual EQ curve, not room mix.
 with wave.open(path, "wb") as w:
     w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
     chunk = 48000
     for start in range(0, rate * secs, chunk):
         frames = b"".join(
-            struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / rate)))
+            struct.pack("<h", int(12000 * math.sin(2 * math.pi * 1000 * i / rate)))
             for i in range(start, min(start + chunk, rate * secs))
         )
         w.writeframes(frames)
@@ -227,6 +229,117 @@ print((alsa or cands)[0] if (alsa or cands) else '')
 ")"
 echo "  second sink: ${SINK_B:-(none available)}"
 
+# --- Per-output preset seeding -------------------------------------------------
+# Two distinguishable presets, each linked to one output. Backs up the user's
+# links file and preset dir additions; cleanup() restores both. Defined early
+# so the audibility check (T3b) can use livetest_A before T6 re-seeds.
+# Real preset storage is ~/.config/mini-eq/output (preset_storage_dir);
+# ~/.config/mini-eq/presets is stale legacy and invisible to the app.
+PRESET_DIR="$HOME/.config/mini-eq/output"
+LINKS_FILE="$HOME/.config/mini-eq/output-presets.json"
+LINKS_BAK=/tmp/mini-eq-live-links.bak.json
+seed_output_presets() {
+  # Back up once: this runs twice per run (T3b + T6) and the second backup
+  # must not capture the first seeding, or cleanup restores seeded links.
+  if [ ! -f "$LINKS_BAK" ]; then
+    cp "$LINKS_FILE" "$LINKS_BAK" 2>/dev/null || echo '{"version":2}' > "$LINKS_BAK"
+  fi
+  python3 - "$INIT_SINK" "$SINK_B" "$PRESET_DIR" <<'EOF'
+import json, sys
+sink_a, sink_b, pdir = sys.argv[1], sys.argv[2], sys.argv[3]
+def band(freq, gain, ftype=1):
+    return {"filter_type": ftype, "frequency": freq, "gain_db": gain,
+            "q": 1.0, "mute": False, "solo": False}
+bands_a = [band(1000.0 * (1.2 ** i), 12.0 if i == 0 else 0.0) for i in range(10)]
+bands_b = [band(1000.0 * (1.2 ** i), -6.0 if i == 0 else 0.0) for i in range(10)]
+for name, bands in (("livetest_A", bands_a), ("livetest_B", bands_b)):
+    with open(f"{pdir}/{name}.json", "w") as f:
+        json.dump({"version": 1, "preamp_db": 0.0, "bands": bands}, f)
+print("seeded")
+EOF
+  python3 - "$LINKS_FILE" "$INIT_SINK" "$SINK_B" <<'EOF'
+import json, sys
+path, sink_a, sink_b = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.load(open(path))
+except Exception:
+    cfg = {"version": 2}
+cfg.setdefault("links", {})[sink_a] = "livetest_A"
+if sink_b:
+    cfg["links"][sink_b] = "livetest_B"
+json.dump(cfg, open(path, "w"), indent=2)
+print("linked")
+EOF
+}
+
+# RMS of a few seconds captured straight from a device EQ's OUTPUT node.
+# Unlike the analyzer (which taps the room mix incl. the user's own music),
+# this carries only what this run routed -- deterministic by construction.
+eq_output_rms() {
+  local eq_out="$1" f=/tmp/mini-eq-live-lv.raw
+  rm -f "$f"
+  timeout 8 pw-record --target="$eq_out" "$f" >/dev/null 2>&1
+  [ -s "$f" ] || return 1
+  python3 -c "
+import struct, math, sys
+d = open('$f', 'rb').read()
+s = struct.unpack('<%dh' % (len(d) // 2), d)
+print('%.1f' % math.sqrt(sum(x * x for x in s) / len(s)))
+"
+}
+
+# Max analyzer bin, or empty when no emission arrives.
+max_level() {
+  local levels
+  levels="$(read_levels)"
+  [ -z "$levels" ] && return 1
+  python3 -c "print(max(map(float, '''$levels'''.split())))"
+}
+
+# Block until the analyzer reports a live (non-floor) spectrum, so level
+# comparisons never race capture negotiation (which can take a while after
+# a monitor start/retarget on a loaded box).
+wait_for_levels() {
+  local i got
+  for i in $(seq 1 12); do
+    got="$(read_levels)" || got=""
+    if [ -n "$got" ] && python3 -c "import sys; sys.exit(0 if max(map(float, '''$got'''.split())) > 0.01 else 1)"; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+# The tone's current target serial (empty when WP moved it or it died).
+tone_target_now() {
+  pwstate | python3 -c "
+import json,sys
+for s in json.load(sys.stdin)['streams']:
+    if str(s['id']) == '$TONE_ID':
+        print(s['target_object']); break
+"
+}
+
+# True while the tone node is actively running with data (present and
+# targeted is not enough -- a stalled pw-play looks identical downstream).
+tone_flowing() {
+  pw-top -b -n 3 2>/dev/null | grep -E "^ *R +$TONE_ID +[1-9]" | grep -q .
+}
+
+# Re-assert the tone is routed into the given eq serial (WirePlumber
+# sometimes re-homes streams mid-test); re-route once if it strayed.
+ensure_tone_routed() {
+  local want="$1"
+  if [ "$(tone_target_now)" != "$want" ]; then
+    $DBUS call SetRoutingEnabled b:false >/dev/null
+    sleep 2
+    $DBUS call SetRoutingEnabled b:true >/dev/null
+    sleep 3
+  fi
+  test "$(tone_target_now)" = "$want"
+}
+
 # --- T2: switch on --------------------------------------------------------------
 echo "--- T2: EQ on routes the tone through mini_eq_sink"
 $DBUS call SetRoutingEnabled b:true >/dev/null
@@ -243,6 +356,38 @@ check "eq_enabled=false reported" test "$(state_val eq_enabled)" = "false"
 $DBUS call SetEqEnabled b:true >/dev/null
 sleep 2
 check "eq_enabled=true reported" test "$(state_val eq_enabled)" = "true"
+
+# --- T3b: audibility (wet vs bypass on a boosted curve) -------------------------
+# Loads livetest_A (+12 dB at the tone's 1000 Hz) and asserts the measured
+# spectrum actually moves between wet and bypass. This is the only check that
+# proves the DSP processes audio -- routing checks alone cannot (a dead chain
+# with live links looks identical). Guarded by ensure_tone_routed: WP
+# sometimes re-homes the tone mid-test, which would fake a difference.
+echo "--- T3b: EQ is audible (wet vs bypass levels)"
+# Don't restart a running monitor: stop+start tears down the capture and its
+# port re-linking outlasts the level-read window, emptying every assertion.
+if [ "$(state_val analyzer_enabled)" != "true" ]; then
+  $DBUS call SetMonitorEnabled b:true >/dev/null
+  sleep 2
+fi
+seed_output_presets
+$DBUS call SetPreset s:livetest_A >/dev/null
+sleep 3
+EQ_SERIAL="$(pwstate | python3 -c 'import json,sys; m=json.load(sys.stdin)["minieq"]; print(m["serial"] if m else "")')"
+check "tone routed for level check" ensure_tone_routed "$EQ_SERIAL"
+check "tone actually flowing (not stalled)" tone_flowing
+EQ_OUT="$(python3 -c "import re;print('mini_eq_sink_'+re.sub(r'[^A-Za-z0-9_.-]','_','$INIT_SINK').strip('_.-')+'_output')")"
+sleep 3
+WET_RMS="$(eq_output_rms "$EQ_OUT")" || WET_RMS=""
+check "wet chain output audible" python3 -c "assert float('$WET_RMS') > 100.0, 'chain silent while routed: $WET_RMS'"
+$DBUS call SetEqEnabled b:false >/dev/null
+sleep 3
+DRY_RMS="$(eq_output_rms "$EQ_OUT")" || DRY_RMS=""
+check "dry chain output audible (bypass passes audio)" python3 -c "assert float('$DRY_RMS') > 100.0, 'bypass silent: $DRY_RMS'"
+check "wet hotter than bypass (+12 dB curve)" python3 -c "assert float('$WET_RMS') > float('$DRY_RMS') * 1.5, 'wet=$WET_RMS dry=$DRY_RMS'"
+echo "  wet=$WET_RMS dry=$DRY_RMS"
+$DBUS call SetEqEnabled b:true >/dev/null
+sleep 2
 
 # --- T4: output mode --------------------------------------------------------------
 echo "--- T4: output mode round-trip"
@@ -273,39 +418,6 @@ fi
 # --- T6: sticky chain + per-output presets --------------------------------------
 # Setup: two distinguishable presets, each linked to one output. Backs up the
 # user's links file and preset dir additions; cleanup() restores both.
-# Real preset storage is ~/.config/mini-eq/output (preset_storage_dir);
-# ~/.config/mini-eq/presets is stale legacy and invisible to the app.
-PRESET_DIR="$HOME/.config/mini-eq/output"
-LINKS_FILE="$HOME/.config/mini-eq/output-presets.json"
-LINKS_BAK=/tmp/mini-eq-live-links.bak.json
-seed_output_presets() {
-  cp "$LINKS_FILE" "$LINKS_BAK" 2>/dev/null || echo '{"version":2}' > "$LINKS_BAK"
-  python3 - "$INIT_SINK" "$SINK_B" "$PRESET_DIR" <<'EOF'
-import json, sys
-sink_a, sink_b, pdir = sys.argv[1], sys.argv[2], sys.argv[3]
-def band(freq, gain, ftype=1):
-    return {"filter_type": ftype, "frequency": freq, "gain_db": gain,
-            "q": 1.0, "mute": False, "solo": False}
-bands_a = [band(1000.0 * (1.2 ** i), 6.0 if i == 0 else 0.0) for i in range(10)]
-bands_b = [band(1000.0 * (1.2 ** i), -6.0 if i == 0 else 0.0) for i in range(10)]
-for name, bands in (("livetest_A", bands_a), ("livetest_B", bands_b)):
-    with open(f"{pdir}/{name}.json", "w") as f:
-        json.dump({"version": 1, "preamp_db": 0.0, "bands": bands}, f)
-print("seeded")
-EOF
-  python3 - "$LINKS_FILE" "$INIT_SINK" "$SINK_B" <<'EOF'
-import json, sys
-path, sink_a, sink_b = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    cfg = json.load(open(path))
-except Exception:
-    cfg = {"version": 2}
-cfg.setdefault("links", {})[sink_a] = "livetest_A"
-cfg["links"][sink_b] = "livetest_B"
-json.dump(cfg, open(path, "w"), indent=2)
-print("linked")
-EOF
-}
 if [ -n "$SINK_B" ]; then
   echo "--- T6: per-device EQ independence (Selected)"
   seed_output_presets

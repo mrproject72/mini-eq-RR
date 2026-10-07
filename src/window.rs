@@ -1434,8 +1434,8 @@ impl MiniEqWindow {
                 // no device was pinned manually.
                 if let Some(be) = backend_for_select.borrow_mut().as_mut() {
                     if be.monitor_enabled() && crate::core::output_monitor_sink().is_none() {
-                        match be.retarget_monitor(&chosen) {
-                            Ok(()) => summary_for_select.set_text("On \u{00b7} Live (retargeted)"),
+                        match be.retarget_monitor_if_different(&chosen) {
+                            Ok(_) => summary_for_select.set_text("On \u{00b7} Live (retargeted)"),
                             Err(e) => log::warn!("Monitor retarget failed: {e}"),
                         }
                     }
@@ -1613,7 +1613,7 @@ impl MiniEqWindow {
                         if be.monitor_enabled()
                             && crate::core::output_monitor_sink().is_none()
                         {
-                            if let Err(e) = be.retarget_monitor(&dev) {
+                            if let Err(e) = be.retarget_monitor_if_different(&dev) {
                                 log::warn!("EQ on: monitor retarget failed: {e}");
                             }
                         }
@@ -2063,8 +2063,8 @@ impl MiniEqWindow {
                     if let Some(be) = backend_for_notify.borrow_mut().as_mut() {
                         let target = be.resolve_monitor_target(None);
                         if !target.is_empty() && be.monitor_enabled() {
-                            match be.retarget_monitor(&target) {
-                                Ok(()) => summary_for_notify.set_text("On \u{00b7} Live (follow)"),
+                            match be.retarget_monitor_if_different(&target) {
+                                Ok(_) => summary_for_notify.set_text("On \u{00b7} Live (follow)"),
                                 Err(e) => log::warn!("Monitor retarget failed: {e}"),
                             }
                         }
@@ -2098,8 +2098,8 @@ impl MiniEqWindow {
                 }
                 if let Some(be) = backend_for_notify.borrow_mut().as_mut() {
                     if be.monitor_enabled() {
-                        match be.retarget_monitor(&name) {
-                            Ok(()) => {
+                        match be.retarget_monitor_if_different(&name) {
+                            Ok(_) => {
                                 summary_for_notify.set_text(&format!("On \u{00b7} Live ({name})"));
                             }
                             Err(e) => log::warn!("Monitor retarget to {name} failed: {e}"),
@@ -2522,8 +2522,8 @@ fn apply_remote_command(
             }
             if let Some(be) = backend.borrow_mut().as_mut() {
                 if be.monitor_enabled() && crate::core::output_monitor_sink().is_none() {
-                    match be.retarget_monitor(&chosen) {
-                        Ok(()) => monitor_summary.set_text("On \u{00b7} Live (retargeted)"),
+                    match be.retarget_monitor_if_different(&chosen) {
+                        Ok(_) => monitor_summary.set_text("On \u{00b7} Live (retargeted)"),
                         Err(e) => log::warn!("D-Bus: monitor retarget failed: {e}"),
                     }
                 }
@@ -2551,7 +2551,7 @@ fn apply_remote_command(
                 if let Some(be) = backend.borrow_mut().as_mut() {
                     let target = be.resolve_monitor_target(None);
                     if !target.is_empty() && be.monitor_enabled() {
-                        if let Err(e) = be.retarget_monitor(&target) {
+                        if let Err(e) = be.retarget_monitor_if_different(&target) {
                             log::warn!("D-Bus: monitor retarget failed: {e}");
                         }
                     }
@@ -2563,8 +2563,8 @@ fn apply_remote_command(
                 }
                 if let Some(be) = backend.borrow_mut().as_mut() {
                     if be.monitor_enabled() {
-                        match be.retarget_monitor(name) {
-                            Ok(()) => {
+                        match be.retarget_monitor_if_different(name) {
+                            Ok(_) => {
                                 monitor_summary.set_text(&format!("On \u{00b7} Live ({name})"))
                             }
                             Err(e) => log::warn!("D-Bus: monitor retarget failed: {e}"),

@@ -364,10 +364,12 @@ impl RoutingEngine {
     pub fn set_current_sink(&mut self, sink_name: &str) {
         self.current_sink = Some(sink_name.to_string());
         // Record the chain's physical destination for the monitor resolve
-        // path. The virtual sink (the streams' entry point, set by
-        // auto-route) is deliberately NOT recorded: it would send the monitor
-        // to `mini_eq_sink` itself instead of the device being equalised.
-        if sink_name != VIRTUAL_SINK_BASE {
+        // path. ANY of our virtual sinks (legacy or per-device) is the
+        // streams' entry point, not the device being equalised -- recording
+        // one sends the monitor to `mini_eq_sink*` itself instead of the
+        // device. No physical sink starts with our prefix (pinned by unit
+        // test), so the prefix check is the correct guard.
+        if !sink_name.starts_with(VIRTUAL_SINK_BASE) {
             self.chain_output_sink = Some(sink_name.to_string());
         }
         info!("Current sink set to: {}", sink_name);

@@ -80,6 +80,11 @@ pub struct PipeWireBackend {
     /// negotiation. Driven forward by `pump_monitor_link` from the update
     /// loop so the GTK UI never blocks on the (multi-second) link wait.
     pending_monitor_target: Option<String>,
+    /// Sink the monitor is capturing (or heading to, while linking is
+    /// pending). Lets callers skip a retarget to the device already tapped:
+    /// stop+start capture restarts negotiation and the spectrum goes dark
+    /// for seconds, so a no-op retarget is user-visible churn.
+    monitor_target: Option<String>,
 }
 
 /// `SPA_PROP_params` — the `SPA_PROP_START_Other` (0x80000) entry that carries
@@ -192,6 +197,7 @@ impl PipeWireBackend {
             _registry_listener: None,
             analyzer,
             pending_monitor_target: None,
+            monitor_target: None,
         };
 
         let registry_listener = backend.setup_registry_listener()?;
@@ -439,6 +445,7 @@ impl PipeWireBackend {
         info!("Starting output monitor of {target_sink_name}");
         self.analyzer.start_capture(target_sink_name, None)?;
         self.pending_monitor_target = Some(target_sink_name.to_string());
+        self.monitor_target = Some(target_sink_name.to_string());
         Ok(())
     }
 
@@ -566,9 +573,32 @@ impl PipeWireBackend {
         self.start_monitor(new_sink)
     }
 
+    /// Retarget unless already tapping `new_sink`. A stop+start restarts
+    /// capture negotiation and the spectrum goes dark for seconds, so the
+    /// EQ-on handler (which fires on every enable, usually onto the device
+    /// already tapped) must not churn it. Returns true when it retargeted.
+    pub fn retarget_monitor_if_different(&mut self, new_sink: &str) -> Result<bool, Error> {
+        if self.monitor_target.as_deref() == Some(new_sink) && self.monitor_enabled() {
+            log::debug!("Monitor retarget to {new_sink} skipped (already tapped)");
+            return Ok(false);
+        }
+        self.retarget_monitor(new_sink)?;
+        Ok(true)
+    }
+
+    /// Sink the monitor is capturing (or heading to). `None` when off.
+    pub fn monitor_target_name(&self) -> Option<String> {
+        if self.monitor_enabled() {
+            self.monitor_target.clone()
+        } else {
+            None
+        }
+    }
+
     /// Stop the output monitor.
     pub fn stop_monitor(&mut self) {
         self.pending_monitor_target = None;
+        self.monitor_target = None;
         self.analyzer.stop_capture();
     }
 
