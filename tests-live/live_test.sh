@@ -152,6 +152,9 @@ with wave.open(path, "wb") as w:
 EOF
 
 BEFORE_STREAMS="$(pwstate | python3 -c 'import json,sys; print(" ".join(str(s["id"]) for s in json.load(sys.stdin)["streams"]))')"
+# EQ sink serials owned by anyone else (e.g. a manually tested instance):
+# the quit check must only assert that THIS run leaked nothing.
+EQ_SERIALS_BEFORE="$(pwstate | python3 -c 'import json,sys; print(" ".join(v["serial"] for v in json.load(sys.stdin)["eq_sinks"].values()))')"
 
 # --- 2. launch app under Xvfb -------------------------------------------------
 Xvfb $DISPLAY_NUM >/tmp/mini-eq-live-xvfb.log 2>&1 &
@@ -396,7 +399,12 @@ check "app exited on Quit" bash -c "! kill -0 $APP_PID 2>/dev/null"
 APP_PID="" # already gone; don't double-kill in cleanup
 sleep 2
 AFTER="$(pwstate)"
-check "mini_eq_sink destroyed" bash -c "echo '$AFTER' | python3 -c 'import json,sys; assert json.load(sys.stdin)[\"minieq\"] is None'"
+check "this run leaked no EQ chains" python3 -c "
+import json,sys
+before = set('$EQ_SERIALS_BEFORE'.split())
+after = {v['serial'] for v in json.load(sys.stdin)['eq_sinks'].values()}
+leaked = after - before
+assert not leaked, f'chains left behind: {leaked}'" <<< "$AFTER"
 TGT_END="$(echo "$AFTER" | python3 -c "
 import json,sys
 m = [s['target_object'] for s in json.load(sys.stdin)['streams'] if str(s['id'])=='$TONE_ID']
