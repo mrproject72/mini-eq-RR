@@ -56,6 +56,37 @@ running chain, simultaneously.
 5. Remove single-chain leftovers (`engine_sink`, `chain_output_sink`,
    `current_sink` singletons where superseded).
 
+## Routing semantics vs upstream (confirmed 2026-10-07 — do not "fix")
+
+Upstream (`bhack/mini-eq`, `pipewire_stream_router.py`) has exactly one
+routing behavior and no modes: route every non-internal stream whose target
+is empty or on the processing path (virtual sink + output device) into the
+single virtual sink; skip anything explicitly aimed elsewhere; restore
+recorded origins on the way out.
+
+Our two modes relate to it like this — this split is deliberate:
+
+- **Reroute ≡ upstream.** Take every eligible stream (same foreign-target
+  exclusion, same recorded-origin restore) into one chain. The only
+  structural difference is *which* chain: the selected device's, since a
+  singleton no longer exists. If Reroute ever diverges from upstream's
+  take-all-eligible rule, that is a bug.
+- **Selected = per-device independence (upstream never had this).** Each
+  chain has its own settings and its own streams; nothing is touched or
+  moved by selecting, switching, or enabling EQ on another device. Concretely:
+  - a stream is taken into device X's chain only if effectively aimed at X
+    (explicit target on X, or default playback while X is the default);
+  - target-less playback while X is *not* the default is left alone (upstream
+    would have taken it into its single chain — we don't, because there is
+    no single chain to take it into);
+  - an explicit target on the system default counts as default-routed
+    (WirePlumber writes explicit targets even for default playback).
+- Enabling EQ on a device with nothing in scope is a no-op plus a toast
+  ("nothing to equalize"), never silent.
+
+Pinned by: `mode_scope_predicate` + `scope_allows_effective_default` unit
+tests, and the `tests-live` Reroute round-trip / per-device isolation checks.
+
 ## Test strategy
 
 - Unit: naming/sanitize; pod encoding (existing); rescope pure parts.
