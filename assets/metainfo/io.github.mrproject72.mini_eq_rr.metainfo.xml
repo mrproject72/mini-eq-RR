@@ -54,7 +54,29 @@
 
   <content_rating type="oars-1.1"/>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/mrproject72/mini-eq-RR/main/screenshot/Screenshot%20From%202026-09-18%2021-27-35.png</image>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/mrproject72/mini-eq-RR/main/screenshot/Screenshot%20From%202026-09-18%2021-29-43.png</image>
+    </screenshot>
+  </screenshots>
+
   <releases>
+    <release version="0.11.0" date="2026-10-07">
+      <description>
+        <p>
+          One independent EQ chain per output device: each device keeps its
+          own on/off state, curve and preset, and switching devices never
+          moves audio. Selected mode only takes streams effectively aimed at
+          the chosen device (explicit targets on the system default count),
+          warns loudly when nothing matches, and Reroute keeps upstream
+          take-all behavior. New D-Bus controls, a live end-to-end test
+          suite, and a Flatpak manifest with CI builds.
+        </p>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-10-04">
       <description>
         <p>
