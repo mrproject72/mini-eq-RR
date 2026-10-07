@@ -17,6 +17,16 @@ use crate::window_state;
 use crate::window_utility::UtilityPane;
 use crate::window_utils;
 
+/// Display label for a sink node name ("Built-in Audio" rather than
+/// `alsa_output.pci-...`), falling back to the node name when unknown.
+fn pretty_device_label(be: &PipeWireBackend, sink: &str) -> String {
+    be.list_output_sinks()
+        .into_iter()
+        .find(|s| s.name == sink)
+        .map(|s| crate::routing::display_label(&s.description, &s.name))
+        .unwrap_or_else(|| sink.to_string())
+}
+
 /// The curve a device starts with when its EQ is enabled for the first
 /// time this session: its linked preset when one is set in the config
 /// (fallback names included there), else a neutral curve.
@@ -1530,6 +1540,7 @@ impl MiniEqWindow {
             let mode_reroute_for_switch = mode_reroute.clone();
             let engine_sink_for_switch = engine_sink.clone();
             let device_pending_for_switch = device_pending.clone();
+            let toast_for_switch = toast_overlay.clone();
             // Handler id kept for the D-Bus drain (see bypass above):
             // `set_active` emits `state-set`, so the drain blocks this while
             // syncing the widget and performs the routing itself.
@@ -1581,8 +1592,20 @@ impl MiniEqWindow {
                         }
                         be.set_current_sink(&dev);
                         let eq_name = crate::core::eq_virtual_sink_for(&dev);
-                        if let Err(e) = be.auto_route_to_sink(&eq_name) {
-                            log::warn!("EQ on: auto-route failed: {e}");
+                        match be.auto_route_to_sink(&eq_name) {
+                            Ok(()) => {
+                                // Loud when nothing matched: EQ on with zero
+                                // routed streams is exactly the "EQ does
+                                // nothing" report. The routing layer already
+                                // WARNs; mirror it where the user looks.
+                                if be.last_routed_count() == 0 {
+                                    toast_for_switch.add_toast(adw::Toast::new(&format!(
+                                        "EQ is on, but no audio is playing to {} — nothing to equalize",
+                                        pretty_device_label(be, &dev)
+                                    )));
+                                }
+                            }
+                            Err(e) => log::warn!("EQ on: auto-route failed: {e}"),
                         }
                         device_pending_for_switch.borrow_mut().insert(dev.clone());
                         // Keep the monitor on this device while following

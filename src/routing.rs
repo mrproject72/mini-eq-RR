@@ -123,6 +123,10 @@ pub struct RoutingEngine {
     /// than always re-routing everything.
     output_mode: crate::core::OutputRoutingMode,
     current_sink: Option<String>,
+    /// Streams routed by the most recent auto-route call (see
+    /// `last_routed_count`). Plain integer: only ever touched on the GTK
+    /// thread via `&mut self` routing calls.
+    last_routed_count: usize,
     /// Virtual sink node names of live per-device EQ chains
     /// (`core::eq_virtual_sink_for`), registered by the backend as chains
     /// are created/destroyed. Lets scope/allowed logic cover every device
@@ -220,6 +224,7 @@ impl RoutingEngine {
             routed: false,
             current_sink: None,
             chain_output_sink: None,
+            last_routed_count: 0,
             eq_sinks: HashMap::new(),
             output_mode: crate::core::OutputRoutingMode::Selected,
             virtual_sink_name: format!("{}.source", VIRTUAL_SINK_BASE),
@@ -517,8 +522,11 @@ impl RoutingEngine {
     /// - **Reroute**: everything is in scope, including streams with a foreign
     ///   target. This is the explicit opt-out from the foreign-target rule.
     ///
-    /// The blocklist is applied before this predicate, so it is only ever asked
-    /// about a stream that survived it.
+    /// NOTE: the no-explicit-target arm assumes the caller already resolved
+    /// "default" to the chosen device (see `is_in_scope`, which maps an
+    /// explicit target on the system default back to default-routed first).
+    /// Calling this directly with a raw target over-admits target-less
+    /// streams when the chosen device is not the default.
     pub fn target_in_scope(
         target_object: Option<&str>,
         sink_serial: &str,
@@ -544,17 +552,43 @@ impl RoutingEngine {
     /// WirePlumber matches on in `target.object`. Comparing against the serial
     /// rather than the node name is what makes "this stream is already going to
     /// the device I picked" true.
+    /// Scope rule with an explicit system default: pure and unit-tested.
+    ///
+    /// `target` is the stream's `target.object` (None/empty = WirePlumber's
+    /// choice), `sink_serial` the chosen sink, `default_serial` the system
+    /// default sink if known. An explicit target on the default counts as
+    /// default-routed (WirePlumber writes explicit targets even for default
+    /// playback); default playback is in scope iff the chosen sink IS the
+    /// default. Anything explicitly aimed elsewhere must match the chosen
+    /// sink. Reroute takes everything.
+    fn scope_allows(
+        target: Option<&str>,
+        sink_serial: &str,
+        default_serial: Option<&str>,
+        mode: crate::core::OutputRoutingMode,
+    ) -> bool {
+        if mode == crate::core::OutputRoutingMode::Reroute {
+            return true;
+        }
+        let on_default = match target {
+            None | Some("") => true,
+            Some(t) => default_serial.is_some_and(|d| d == t),
+        };
+        if on_default {
+            return default_serial.is_some_and(|d| d == sink_serial);
+        }
+        target.is_some_and(|t| t == sink_serial)
+    }
+
     fn is_in_scope(
         &self,
         stream: &StreamNode,
         sink_serial: &str,
+        default_serial: Option<&str>,
         mode: crate::core::OutputRoutingMode,
     ) -> bool {
-        Self::target_in_scope(
-            self.stream_target(stream.id).target_object.as_deref(),
-            sink_serial,
-            mode,
-        )
+        let target = self.stream_target(stream.id).target_object;
+        Self::scope_allows(target.as_deref(), sink_serial, default_serial, mode)
     }
 
     /// Streams we may route: not ours, not blocklisted, and not already
@@ -660,6 +694,14 @@ impl RoutingEngine {
             .find_node_target(sink_name)
             .map(|(_, serial)| serial)
             .unwrap_or_default();
+        // Resolved once per computation (not per stream): an explicit target
+        // on this serial counts as default-routed in `is_in_scope`.
+        let default_serial: Option<String> = self
+            .default_audio_sink
+            .borrow()
+            .clone()
+            .and_then(|n| self.find_node_target(&n))
+            .map(|(_, serial)| serial);
         if std::env::var("MINI_EQ_DEBUG_ROUTING").is_ok() {
             info!("routable filter: allowed targets = {allowed:?}");
             for s in self.list_stream_nodes() {
@@ -688,7 +730,12 @@ impl RoutingEngine {
                                 "ROUTABLE (stale target, sink gone)"
                             }
                             _ => {
-                                if self.is_in_scope(&s, &sink_serial, mode) {
+                                if self.is_in_scope(
+                                    &s,
+                                    &sink_serial,
+                                    default_serial.as_deref(),
+                                    mode,
+                                ) {
                                     "ROUTABLE"
                                 } else {
                                     "skip (out of scope)"
@@ -719,7 +766,7 @@ impl RoutingEngine {
                     _ => true,
                 }
             })
-            .filter(|s| self.is_in_scope(s, &sink_serial, mode))
+            .filter(|s| self.is_in_scope(s, &sink_serial, default_serial.as_deref(), mode))
             .collect()
     }
 
@@ -1251,15 +1298,30 @@ impl RoutingEngine {
         self.set_current_sink(sink_name);
         self.auto_route = true;
         self.routed = true;
+        self.last_routed_count = routed;
 
         if skipped_dont_move > 0 {
             info!("Left {} stream(s) alone: node.dont-move", skipped_dont_move);
+        }
+        if routed == 0 {
+            // Loud on purpose: EQ on with nothing routed is exactly the
+            // "EQ doesn't do anything" report, and every quieter signal was
+            // missed. The window mirrors this as a toast.
+            warn!(
+                "Auto-routing to {sink_name}: no streams in scope -- nothing will play through the EQ"
+            );
         }
         info!(
             "Auto-routing complete: {} stream(s) -> {}",
             routed, sink_name
         );
         Ok(())
+    }
+
+    /// Streams routed by the most recent `auto_route_to_sink*` call. The
+    /// window uses it for the "EQ on but nothing to equalize" toast.
+    pub fn last_routed_count(&self) -> usize {
+        self.last_routed_count
     }
 
     /// Clear the `target.node`/`target.object` metadata for all playback
@@ -2113,6 +2175,84 @@ mod tests {
         assert!(RoutingEngine::target_in_scope(
             None,
             "AAA",
+            OutputRoutingMode::Reroute
+        ));
+    }
+
+    /// Effective-default scope: an explicit target on the system default
+    /// counts as default-routed (WirePlumber writes explicit targets even
+    /// for default playback). Default playback is in scope iff the chosen
+    /// sink IS the default; anything explicitly elsewhere must match.
+    #[test]
+    fn scope_allows_effective_default() {
+        use crate::core::OutputRoutingMode;
+        use RoutingEngine as R;
+
+        // Chosen == default: target-less and explicit-default both in.
+        assert!(R::scope_allows(
+            None,
+            "D",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        assert!(R::scope_allows(
+            Some(""),
+            "D",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        assert!(R::scope_allows(
+            Some("D"),
+            "D",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        // Chosen != default: default playback (either form) stays out, so
+        // enabling EQ on another device never steals it.
+        assert!(!R::scope_allows(
+            None,
+            "B",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        assert!(!R::scope_allows(
+            Some("D"),
+            "B",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        // Explicitly aimed at the chosen device: in, whatever the default.
+        assert!(R::scope_allows(
+            Some("B"),
+            "B",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        // Explicitly elsewhere: out.
+        assert!(!R::scope_allows(
+            Some("C"),
+            "B",
+            Some("D"),
+            OutputRoutingMode::Selected
+        ));
+        // Unknown default: only exact matches (never steal blindly).
+        assert!(!R::scope_allows(
+            None,
+            "B",
+            None,
+            OutputRoutingMode::Selected
+        ));
+        assert!(R::scope_allows(
+            Some("B"),
+            "B",
+            None,
+            OutputRoutingMode::Selected
+        ));
+        // Reroute still takes everything.
+        assert!(R::scope_allows(
+            Some("C"),
+            "B",
+            Some("D"),
             OutputRoutingMode::Reroute
         ));
     }

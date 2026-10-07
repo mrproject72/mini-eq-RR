@@ -725,6 +725,12 @@ impl PipeWireBackend {
         self.routing.auto_route_to_sink(sink_name)
     }
 
+    /// Streams routed by the most recent auto-route call. See
+    /// [`RoutingEngine::last_routed_count`].
+    pub fn last_routed_count(&self) -> usize {
+        self.routing.last_routed_count()
+    }
+
     /// Reconcile routed streams with the current output device/mode after a
     /// device switch or a narrowing to Selected. See
     /// [`RoutingEngine::rescope_routing`].
