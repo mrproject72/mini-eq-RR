@@ -1401,6 +1401,9 @@ impl MiniEqWindow {
                 // monitor listens.
                 follow_default_for_select.set(want_follow);
                 *engine_sink_for_select.borrow_mut() = chosen.clone();
+                if let Some(be) = backend_for_select.borrow_mut().as_mut() {
+                    be.set_selected_sink(&chosen);
+                }
                 apply_output_preset_for_sink(&chosen, &output_preset_identity, &presets_for_output);
                 if state_for_select.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str())
                 {
@@ -1523,6 +1526,18 @@ impl MiniEqWindow {
                     // Advance the pending monitor port-linking (non-blocking,
                     // bounded work per tick).
                     be.pump_monitor_link();
+                    // Event-driven adoption: the registry/metadata listeners
+                    // flag arrivals and moves; drain the flag into one pass.
+                    // Idle cost is a single flag check.
+                    if be.take_streams_dirty() {
+                        match be.adopt_new_streams() {
+                            Ok(n) if n > 0 => {
+                                log::info!("Adopted {n} new stream(s) into device chains")
+                            }
+                            Err(e) => log::warn!("Stream adoption failed: {e}"),
+                            _ => {}
+                        }
+                    }
                 }
                 ControlFlow::Continue
             });
@@ -1558,6 +1573,7 @@ impl MiniEqWindow {
                         // touched. Every other device's chain keeps running.
                         let dev = engine_sink_for_switch.borrow().clone();
                         if !dev.is_empty() {
+                            be.set_device_eq_enabled(&dev, false);
                             if let Err(e) = be.unroute_device(&dev, Some(&dev)) {
                                 log::warn!("EQ off: unroute device failed: {e}");
                             }
@@ -1591,6 +1607,9 @@ impl MiniEqWindow {
                             }
                         }
                         be.set_current_sink(&dev);
+                        // Remember the intent even with zero streams: streams
+                        // that appear later are adopted event-driven.
+                        be.set_device_eq_enabled(&dev, true);
                         let eq_name = crate::core::eq_virtual_sink_for(&dev);
                         match be.auto_route_to_sink(&eq_name) {
                             Ok(()) => {
@@ -2354,6 +2373,17 @@ impl MiniEqWindow {
             }));
         }
 
+        // The UI starts out selecting the engine device; record it so
+        // Reroute adoption knows where late streams belong from the start.
+        {
+            let selected = engine_sink.borrow().clone();
+            if !selected.is_empty()
+                && let Some(be) = backend.borrow_mut().as_mut()
+            {
+                be.set_selected_sink(&selected);
+            }
+        }
+
         Self {
             window,
             toolbar_view,
@@ -2494,6 +2524,9 @@ fn apply_remote_command(
             // audio. It only re-targets the edit context (faders/preamp pick
             // up that device's last curve) and where the monitor listens.
             *engine_sink.borrow_mut() = chosen.clone();
+            if let Some(be) = backend.borrow_mut().as_mut() {
+                be.set_selected_sink(&chosen);
+            }
             apply_output_preset_for_sink(&chosen, output_preset_identity, presets);
             if app_state.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str()) {
                 *app_state.output_sink.lock().unwrap() = Some(chosen.clone());

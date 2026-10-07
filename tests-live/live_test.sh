@@ -70,6 +70,7 @@ cleanup() {
     kill -0 "$APP_PID" 2>/dev/null && kill "$APP_PID" 2>/dev/null
   fi
   [ -n "$TONE_PID" ] && kill "$TONE_PID" 2>/dev/null
+  [ -n "${TONE2_PID:-}" ] && kill "$TONE2_PID" 2>/dev/null
   [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null
   rm -f "$WAV"
   # Restore the user's preset links + drop seeded test presets.
@@ -460,6 +461,42 @@ if [ -n "$SINK_B" ]; then
   $DBUS call SetOutputSink "s:$INIT_SINK" >/dev/null
   sleep 2
   check "back on A for teardown" test "$(state_val output_sink)" = "$INIT_SINK"
+
+  # --- T6c: late streams are adopted without a toggle -----------------------
+  # The reported bug: EQ on for B while B is empty, then a stream starts on
+  # B and is never processed. Adoption is event-driven (registry/metadata
+  # listeners + pump-tick drain), so no toggle may be needed.
+  echo "--- T6c: stream started after EQ-on is adopted on B"
+  BEFORE2="$(pwstate | python3 -c 'import json,sys; print(" ".join(str(s["id"]) for s in json.load(sys.stdin)["streams"]))')"
+  pw-play --target="$SINK_B" "$WAV" >/tmp/mini-eq-live-tone2.log 2>&1 &
+  TONE2_PID=$!
+  sleep 3
+  TONE2_ID="$(pwstate | python3 -c "
+import json,sys
+before = set('$BEFORE2'.split())
+for s in json.load(sys.stdin)['streams']:
+    if str(s['id']) not in before and ('pw-play' in s['name'] or 'pw-play' in s['app']):
+        print(s['id']); break
+")"
+  if [ -z "$TONE2_ID" ]; then
+    echo "ABORT: second tone stream not found"
+    exit 99
+  fi
+  echo "second tone stream id: $TONE2_ID"
+  TONE2_OK=0
+  for _ in $(seq 1 30); do
+    TGT2="$(pwstate | python3 -c "
+import json,sys
+for s in json.load(sys.stdin)['streams']:
+    if str(s['id']) == '$TONE2_ID':
+        print(s['target_object']); break
+")"
+    if [ "$TGT2" = "$EQ_B_SERIAL" ]; then TONE2_OK=1; break; fi
+    sleep 0.5
+  done
+  check "late stream on B adopted into eq(B) without toggle" test "$TONE2_OK" = "1"
+  echo "  tone2 target_object='$TGT2' (eqB $EQ_B_SERIAL)"
+  check "first tone undisturbed on eq(A)" test "$(stream_target_object)" = "$EQ_A_SERIAL"
 else
   echo "SKIP: device-switch tests (only one sink)"
 fi

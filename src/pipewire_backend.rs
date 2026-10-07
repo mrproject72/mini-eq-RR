@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -212,12 +212,27 @@ impl PipeWireBackend {
     fn setup_registry_listener(&self) -> Result<pipewire::registry::Listener, Error> {
         let registry = self.core.get_registry_rc()?;
         let device_chains = self.device_chains.clone();
+        let streams_dirty = self.routing.streams_dirty_flag();
         let registry_for_cb = registry.clone();
         let listener = registry.add_listener_local();
         let listener = listener.global(move |global| {
             debug!("Registry global: id={} type={:?}", global.id, global.type_);
             if global.type_.to_str() != pipewire::types::ObjectType::Node.to_str() {
                 return;
+            }
+            // A playback stream appeared (or vanished and re-appeared):
+            // streams that show up after EQ was enabled need adopting.
+            // Flag-only here -- the pump tick drains it into one adoption
+            // pass, so arrival bursts cost a single scan, not one per node.
+            // (Our own analyzer capture is Stream/Input and never matches.)
+            if global
+                .props
+                .as_ref()
+                .and_then(|p| p.get("media.class"))
+                .unwrap_or("")
+                == "Stream/Output/Audio"
+            {
+                streams_dirty.set(true);
             }
             // Per-device chains: capture the live node proxy for whichever
             // chain owns this virtual sink name (all of ours start with the
@@ -740,6 +755,35 @@ impl PipeWireBackend {
     /// Per-device stream count > 0 helper (header switch state).
     pub fn has_routed_streams_for(&self, physical_sink: &str) -> bool {
         self.routing.has_routed_streams_for(physical_sink)
+    }
+
+    /// Record that this device's EQ was switched on/off by the user.
+    /// Drives event-driven adoption of late streams (see
+    /// [`RoutingEngine::adopt_new_streams`]).
+    pub fn set_device_eq_enabled(&mut self, physical_sink: &str, on: bool) {
+        self.routing.set_device_eq_wanted(physical_sink, on);
+    }
+
+    /// Record the UI-selected output device (Reroute target for late streams).
+    pub fn set_selected_sink(&mut self, physical_sink: &str) {
+        self.routing.set_selected_sink(physical_sink);
+    }
+
+    /// Route streams that appeared since the last pass into the right device
+    /// chains. Called from the pump tick after the streams-dirty flag trips;
+    /// a no-op (one cheap flag check + set lookups) when nothing changed.
+    pub fn adopt_new_streams(&mut self) -> Result<usize, Error> {
+        self.routing.adopt_new_streams()
+    }
+
+    /// Take the streams-dirty flag set by the registry/metadata listeners.
+    pub fn take_streams_dirty(&self) -> bool {
+        self.routing.take_streams_dirty()
+    }
+
+    /// Shared handle for the streams-dirty flag, for the registry listener.
+    pub fn streams_dirty_flag(&self) -> Rc<Cell<bool>> {
+        self.routing.streams_dirty_flag()
     }
 
     /// Per-device unroute (EQ off for that device).

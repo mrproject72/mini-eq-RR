@@ -123,6 +123,23 @@ pub struct RoutingEngine {
     /// than always re-routing everything.
     output_mode: crate::core::OutputRoutingMode,
     current_sink: Option<String>,
+    /// Physical sinks the user switched EQ on for (per-device on/off).
+    /// A device stays here until its EQ is switched off, even with zero
+    /// streams: streams that appear later are adopted event-driven (see
+    /// `streams_dirty` / `adopt_new_streams`). Without this, enabling EQ on
+    /// an empty device silently did nothing forever -- the reported "EQ on
+    /// but the late stream is not processed" bug.
+    eq_wanted: HashSet<String>,
+    /// Physical sink currently selected in the UI. Under Reroute, late
+    /// streams go into this device's chain.
+    selected_sink: Option<String>,
+    /// Set when streams may need (re-)adoption: a playback node appears in
+    /// the registry, or a `target.node`/`target.object` property changes
+    /// (user moved a stream in a mixer, WirePlumber re-homed one, or we
+    /// wrote one ourselves). The window's pump tick drains it into a single
+    /// `adopt_new_streams` pass -- event-driven, zero cost when idle, no
+    /// polling timer anywhere.
+    streams_dirty: Rc<Cell<bool>>,
     /// Streams routed by the most recent auto-route call (see
     /// `last_routed_count`). Plain integer: only ever touched on the GTK
     /// thread via `&mut self` routing calls.
@@ -224,6 +241,9 @@ impl RoutingEngine {
             routed: false,
             current_sink: None,
             chain_output_sink: None,
+            eq_wanted: HashSet::new(),
+            selected_sink: None,
+            streams_dirty: Rc::new(Cell::new(false)),
             last_routed_count: 0,
             eq_sinks: HashMap::new(),
             output_mode: crate::core::OutputRoutingMode::Selected,
@@ -391,6 +411,36 @@ impl RoutingEngine {
     /// The physical sink a registered EQ virtual sink plays to.
     pub fn physical_for_eq_sink(&self, eq_sink_name: &str) -> Option<String> {
         self.eq_sinks.get(eq_sink_name).cloned()
+    }
+
+    /// Shared handle for the streams-dirty flag (see field docs). The backend
+    /// hands a clone to the registry listener so node arrivals mark it.
+    pub fn streams_dirty_flag(&self) -> Rc<Cell<bool>> {
+        self.streams_dirty.clone()
+    }
+
+    /// Mark streams for a scope re-check on the next pump tick.
+    pub fn mark_streams_dirty(&self) {
+        self.streams_dirty.set(true);
+    }
+
+    /// Take the streams-dirty flag (true when a re-check is due).
+    pub fn take_streams_dirty(&self) -> bool {
+        self.streams_dirty.replace(false)
+    }
+
+    /// Record that this device's EQ was switched on/off by the user.
+    pub fn set_device_eq_wanted(&mut self, physical_sink: &str, on: bool) {
+        if on {
+            self.eq_wanted.insert(physical_sink.to_string());
+        } else {
+            self.eq_wanted.remove(physical_sink);
+        }
+    }
+
+    /// Record the UI-selected output device (Reroute target for late streams).
+    pub fn set_selected_sink(&mut self, physical_sink: &str) {
+        self.selected_sink = Some(physical_sink.to_string());
     }
 
     /// Drop a per-device virtual sink from the known set.
@@ -979,8 +1029,11 @@ impl RoutingEngine {
         // 3. Adopt unrecorded streams explicitly aimed at the new device --
         //    and target-less ones when the new device IS the default.
         //    `dont-move` is respected exactly like the initial auto-route.
+        //    Live links backstop metadata (direct node.target links leave no
+        //    metadata trace).
         {
             let md = self.default_metadata.as_ref().unwrap();
+            let link_targets = self.stream_link_targets();
             for s in self.list_stream_nodes() {
                 if self.is_internal_stream(&s)
                     || s.dont_move
@@ -993,7 +1046,10 @@ impl RoutingEngine {
                 let ours = !cur_obj.is_empty() && cur_obj == chosen_serial;
                 let follows_default =
                     cur_obj.is_empty() && default_serial.as_deref() == Some(chosen_serial.as_str());
-                if ours || follows_default {
+                let linked_here = link_targets
+                    .get(&s.id)
+                    .is_some_and(|v| v.iter().any(|n| n == physical_name));
+                if ours || follows_default || linked_here {
                     md.set_property(
                         s.id,
                         "target.node",
@@ -1119,6 +1175,174 @@ impl RoutingEngine {
         }
         info!("UnrouteDevice({physical_sink}): {restored} restored, {to_fallback} to fallback");
         Ok(())
+    }
+
+    /// Route streams that appeared after EQ was enabled into the right
+    /// device chain, without touching anything else.
+    ///
+    /// This is the event-driven counterpart of the initial auto-route: the
+    /// registry/metadata listeners set `streams_dirty` whenever nodes arrive
+    /// or targets move, and the pump tick drains it here. Only UNRECORDED
+    /// streams are candidates, so already-routed (or deliberately moved)
+    /// streams are never yanked between chains by a background pass.
+    ///
+    /// - Selected: a stream joins the chain of the device it is effectively
+    ///   aimed at (explicit target, or the default for target-less streams),
+    ///   and only when that device's EQ is wanted.
+    /// - Reroute: everything unrecorded joins the SELECTED device's chain,
+    ///   and only while routing is active at all (`routed`).
+    pub fn adopt_new_streams(&mut self) -> Result<usize, Error> {
+        if self.output_mode == crate::core::OutputRoutingMode::Reroute {
+            if !self.routed {
+                return Ok(0);
+            }
+            let Some(sel) = self.selected_sink.clone() else {
+                return Ok(0);
+            };
+            return self.adopt_unrecorded_into(&sel, true);
+        }
+        let wanted: Vec<String> = self.eq_wanted.iter().cloned().collect();
+        let mut total = 0usize;
+        for dev in wanted {
+            total += self.adopt_unrecorded_into(&dev, false)?;
+        }
+        Ok(total)
+    }
+
+    /// Map each playback stream to the sink node names it is actually linked
+    /// into, from live Link objects.
+    ///
+    /// Ground truth of audio flow, complementing the `default` metadata:
+    /// direct `node.target` links (e.g. `pw-play --target`) never produce
+    /// metadata entries, and metadata can hold stale serials -- while links
+    /// show where sound really goes. One registry pass; used as a fallback
+    /// signal by adoption when metadata says nothing.
+    fn stream_link_targets(&self) -> HashMap<u32, Vec<String>> {
+        let links: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let links_clone = links.clone();
+        let names: Rc<RefCell<HashMap<u32, String>>> = Rc::new(RefCell::new(HashMap::new()));
+        let names_clone = names.clone();
+        let registry = match self.core.get_registry() {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ == ObjectType::Link {
+                    if let Some(props) = &global.props {
+                        let get = |k: &str| props.get(k).unwrap_or("").to_string();
+                        if let (Some(out), Some(inp)) = (
+                            get("link.output.node").parse::<u32>().ok(),
+                            get("link.input.node").parse::<u32>().ok(),
+                        ) {
+                            links_clone.borrow_mut().push((out, inp));
+                        }
+                    }
+                } else if global.type_ == ObjectType::Node {
+                    if let Some(props) = &global.props {
+                        if props.get("media.class").unwrap_or("") == "Audio/Sink" {
+                            if let Some(name) = props.get("node.name") {
+                                names_clone.borrow_mut().insert(global.id, name.to_string());
+                            }
+                        }
+                    }
+                }
+            })
+            .register();
+        let _ = self.roundtrip();
+        let names = names.borrow();
+        let mut map: HashMap<u32, Vec<String>> = HashMap::new();
+        for (out, inp) in links.borrow().iter() {
+            if let Some(sink) = names.get(inp) {
+                map.entry(*out).or_default().push(sink.clone());
+            }
+        }
+        map
+    }
+
+    /// Route unrecorded, non-internal streams into `physical_sink`'s chain.
+    /// With `take_all` (Reroute) every unrecorded stream qualifies; otherwise
+    /// only streams effectively aimed at the device. Streams already carrying
+    /// a record are left alone even if they would qualify -- they belong to
+    /// whoever routed them.
+    fn adopt_unrecorded_into(
+        &mut self,
+        physical_sink: &str,
+        take_all: bool,
+    ) -> Result<usize, Error> {
+        let eq = crate::core::eq_virtual_sink_for(physical_sink);
+        let Some((virt_id, virt_serial)) = self.find_node_target(&eq) else {
+            return Ok(0);
+        };
+        let chosen_serial: Option<String> = self
+            .find_node_target(physical_sink)
+            .map(|(_, serial)| serial);
+        let Some(chosen_serial) = chosen_serial else {
+            return Ok(0);
+        };
+        let default_serial: Option<String> = self
+            .default_audio_sink
+            .borrow()
+            .clone()
+            .and_then(|n| self.find_node_target(&n))
+            .map(|(_, serial)| serial);
+        self.ensure_default_metadata()?;
+        let mut adopted = 0usize;
+        let mut wrote = false;
+        {
+            let md = self.default_metadata.as_ref().unwrap();
+            // Live link topology as a fallback signal: direct `node.target`
+            // links (e.g. `pw-play --target`) never produce metadata entries,
+            // so a stream audibly playing on this device would otherwise be
+            // invisible here.
+            let link_targets = self.stream_link_targets();
+            for s in self.list_stream_nodes() {
+                if self.is_internal_stream(&s)
+                    || s.dont_move
+                    || self.routed_targets.lock().unwrap().contains_key(&s.id)
+                {
+                    continue;
+                }
+                let linked_here = link_targets
+                    .get(&s.id)
+                    .is_some_and(|v| v.iter().any(|n| n == physical_sink));
+                let linked_into_own_eq = link_targets
+                    .get(&s.id)
+                    .is_some_and(|v| v.iter().any(|n| n == &eq));
+                let qualifies = if take_all {
+                    true
+                } else {
+                    let cur = self.stream_target(s.id);
+                    match cur.target_object.as_deref() {
+                        None | Some("") => {
+                            default_serial.as_deref() == Some(chosen_serial.as_str())
+                        }
+                        Some(t) => t == chosen_serial,
+                    }
+                };
+                if !qualifies && !linked_here && !linked_into_own_eq {
+                    continue;
+                }
+                let cur = self.stream_target(s.id);
+                md.set_property(
+                    s.id,
+                    "target.node",
+                    Some("Spa:Id"),
+                    Some(&virt_id.to_string()),
+                );
+                md.set_property(s.id, "target.object", Some("Spa:Id"), Some(&virt_serial));
+                self.routed_targets.lock().unwrap().insert(s.id, cur);
+                info!("Adopted stream '{}' ({}) into {eq}", s.node_name, s.id);
+                adopted += 1;
+                wrote = true;
+            }
+        }
+        if wrote {
+            *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial));
+            self.roundtrip()?;
+        }
+        Ok(adopted)
     }
 
     /// Put the routed streams back on their own targets WITHOUT forgetting that
@@ -1639,6 +1863,7 @@ impl RoutingEngine {
         let changed_c = self.default_sink_changed.clone();
         let listeners_c = self.metadata_listeners.clone();
         let cache_c = self.target_cache.clone();
+        let dirty_c = self.streams_dirty.clone();
         let _listener = registry
             .add_listener_local()
             .global(move |g| {
@@ -1657,6 +1882,7 @@ impl RoutingEngine {
                         let cfg_l = cfg_c.clone();
                         let cache_l = cache_c.clone();
                         let changed_l = changed_c.clone();
+                        let dirty_l = dirty_c.clone();
                         let _pl = md
                             .add_listener_local()
                             .property(move |subject, key, type_, value| {
@@ -1678,6 +1904,12 @@ impl RoutingEngine {
                                             value.map(|v| v.to_string()),
                                         ),
                                     );
+                                    // A stream moved (by us, the user in a
+                                    // mixer, or WirePlumber): re-check scope on
+                                    // the next pump tick. Our own writes set it
+                                    // too; the follow-up scan then finds
+                                    // nothing new, which is cheap.
+                                    dirty_l.set(true);
                                 }
                                 match key {
                                     Some("default.audio.sink") => {

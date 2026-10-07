@@ -266,8 +266,12 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
                         }
                         if auto_route {
                             let eq = mini_eq_rr::core::eq_virtual_sink_for(&sink);
-                            if let Err(e) = backend.auto_route_to_sink(&eq) {
-                                log::warn!("Failed to auto-route: {}", e);
+                            match backend.auto_route_to_sink(&eq) {
+                                Ok(()) => {
+                                    backend.set_device_eq_enabled(&sink, true);
+                                    backend.set_selected_sink(&sink);
+                                }
+                                Err(e) => log::warn!("Failed to auto-route: {}", e),
                             }
                         }
                     }
