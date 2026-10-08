@@ -1299,6 +1299,19 @@ impl RoutingEngine {
                     _ => device_default.clone(),
                 };
                 if self.unlink_stream_to_device(id, &device_name) {
+                    // Device links are live: destroy the stream's links into
+                    // the EQ (matched against the live graph; the tracking
+                    // entry is about to go, so drop_fallback_links_for_eq
+                    // would miss them) -- else the stream doubles into both
+                    // paths.
+                    let link_details = self.stream_link_details();
+                    if let Some(links) = link_details.get(&id) {
+                        for (lid, sink) in links {
+                            if sink == &eq {
+                                Self::destroy_link_object(*lid);
+                            }
+                        }
+                    }
                     info!(
                         "UnrouteDevice: stream {id} restored into {device_name} via fallback links"
                     );
