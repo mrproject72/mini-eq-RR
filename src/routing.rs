@@ -1270,6 +1270,46 @@ impl RoutingEngine {
         // Streams leaving this device's ownership must not keep fallback
         // links feeding its chain: drop ours for this EQ only, so sibling
         // device chains keep playing. Pending verifications for it die too.
+        // BUT the restore metadata writes above are discarded by a sandboxed
+        // daemon, so a stream held by a fallback link into this EQ would go
+        // pathless the moment its link is dropped. Restore each held stream
+        // with real port links into its recorded original device (or the
+        // device being unrouted) FIRST -- link before drop, so the stream is
+        // never pathless -- and forget the entry only when the links are
+        // live. A failed restore keeps the link (and the entry): the heal
+        // pass retries, and a pathless stream is worse than a bypassed one.
+        {
+            let device_default = fallback_sink
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| physical_sink.to_string());
+            let held: Vec<u32> = self
+                .fallback_links
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, eq_name)| eq_name.as_str() == eq)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in held {
+                let device_name = match recorded.get(&id) {
+                    Some(r) if r.target_node_type.as_deref() != Some("Spa:Id") => r
+                        .target_node
+                        .clone()
+                        .unwrap_or_else(|| device_default.clone()),
+                    _ => device_default.clone(),
+                };
+                if self.unlink_stream_to_device(id, &device_name) {
+                    info!(
+                        "UnrouteDevice: stream {id} restored into {device_name} via fallback links"
+                    );
+                    self.fallback_links.lock().unwrap().remove(&id);
+                } else {
+                    warn!(
+                        "UnrouteDevice: stream {id} could not be restored into {device_name}; keeping its fallback link"
+                    );
+                }
+            }
+        }
         self.drop_fallback_links_for_eq(&eq);
         self.clear_pending_for_eq(&eq);
         if self.routed_targets.lock().unwrap().is_empty() {
@@ -1347,6 +1387,88 @@ impl RoutingEngine {
     /// output to a sink input.
     fn port_channel(name: &str) -> &str {
         name.rsplit('_').next().unwrap_or(name)
+    }
+
+    /// Pair `out_id`'s output ports to `in_id`'s input ports by channel
+    /// suffix (FL->FL, FR->FR); a lone output fans out to every input (mono
+    /// upmix). Returns global (out-port, in-port) id pairs.
+    fn pair_stream_ports(&self, out_id: u32, in_id: u32) -> Vec<(u32, u32)> {
+        let ports = self.stream_audio_ports();
+        let outs: Vec<(u32, String)> = ports
+            .get(&out_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "out")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ins: Vec<(u32, String)> = ports
+            .get(&in_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "in")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut used_in: HashSet<u32> = HashSet::new();
+        for (oid, oname) in &outs {
+            if let Some((iid, _)) = ins.iter().find(|(iid, iname)| {
+                !used_in.contains(iid) && Self::port_channel(iname) == Self::port_channel(oname)
+            }) {
+                pairs.push((*oid, *iid));
+                used_in.insert(*iid);
+            }
+        }
+        if pairs.is_empty() && outs.len() == 1 {
+            for (iid, _) in &ins {
+                pairs.push((outs[0].0, *iid));
+            }
+        }
+        pairs
+    }
+
+    /// `pw-link` ref list for port pairs: global port ids, not `node:port`
+    /// names -- duplicate stream names (two players, two test tones) make
+    /// names ambiguous, ids exact.
+    fn port_id_refs(pairs: &[(u32, u32)]) -> Vec<String> {
+        let mut refs: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+        for (oport, iport) in pairs {
+            refs.push(oport.to_string());
+            refs.push(iport.to_string());
+        }
+        refs
+    }
+
+    /// Restore a fallback-held stream into `device` with real port links
+    /// (the sandboxed daemon discards restore metadata writes), verifying
+    /// the links are live before the caller drops the EQ link. Link-first
+    /// discipline: the stream is never pathless. Returns true when links
+    /// into `device` are observably live.
+    fn unlink_stream_to_device(&self, stream_id: u32, device: &str) -> bool {
+        if !self.list_stream_nodes().iter().any(|s| s.id == stream_id) {
+            return false;
+        }
+        let Some(dev_id) = self.find_node_id_by_name(device) else {
+            warn!("UnrouteDevice: device {device} not found for stream {stream_id}");
+            return false;
+        };
+        let pairs = self.pair_stream_ports(stream_id, dev_id);
+        if pairs.is_empty() {
+            warn!("UnrouteDevice: no channel pairing between stream {stream_id} and {device}");
+            return false;
+        }
+        let refs = Self::port_id_refs(&pairs);
+        if !Self::run_pw_link_refs(&refs) {
+            return false;
+        }
+        // Verify before the caller drops the EQ link: a "success" exit with
+        // no live links into the device means the stream would go silent.
+        self.stream_link_details()
+            .get(&stream_id)
+            .is_some_and(|v| v.iter().any(|(_, n)| n == device))
     }
 
     /// Map each playback stream to the sink node names it is actually linked
@@ -1656,42 +1778,7 @@ impl RoutingEngine {
         if !self.list_stream_nodes().iter().any(|s| s.id == stream_id) {
             return false;
         };
-        let ports = self.stream_audio_ports();
-        let outs: Vec<(u32, String)> = ports
-            .get(&stream_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, _, d)| d == "out")
-                    .map(|(id, n, _)| (*id, n.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let ins: Vec<(u32, String)> = ports
-            .get(&virt_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, _, d)| d == "in")
-                    .map(|(id, n, _)| (*id, n.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Pair outputs to inputs by channel suffix (FL->FL, FR->FR); a lone
-        // output fans out to every input (mono upmix).
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
-        let mut used_in: HashSet<u32> = HashSet::new();
-        for (oid, oname) in &outs {
-            if let Some((iid, _)) = ins.iter().find(|(iid, iname)| {
-                !used_in.contains(iid) && Self::port_channel(iname) == Self::port_channel(oname)
-            }) {
-                pairs.push((*oid, *iid));
-                used_in.insert(*iid);
-            }
-        }
-        if pairs.is_empty() && outs.len() == 1 {
-            for (iid, _) in &ins {
-                pairs.push((outs[0].0, *iid));
-            }
-        }
+        let pairs = self.pair_stream_ports(stream_id, virt_id);
         if pairs.is_empty() {
             warn!("Stream {stream_id}: no channel pairing between stream and EQ ports");
             return false;
@@ -1699,13 +1786,7 @@ impl RoutingEngine {
         warn!(
             "Stream {stream_id}: metadata write did not take (sandboxed daemon?) -- linking into {eq_name} directly"
         );
-        // Global port ids, not `node:port` names: duplicate stream names
-        // (two players, two test tones) make names ambiguous, ids exact.
-        let mut refs: Vec<String> = Vec::with_capacity(pairs.len() * 2);
-        for (oport, iport) in &pairs {
-            refs.push(oport.to_string());
-            refs.push(iport.to_string());
-        }
+        let refs = Self::port_id_refs(&pairs);
         if !Self::run_pw_link_refs(&refs) {
             return false;
         }
