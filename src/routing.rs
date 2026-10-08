@@ -209,12 +209,16 @@ pub struct RoutingEngine {
     /// Streams whose metadata write is awaiting read-back confirmation:
     /// stream id -> (EQ node id, EQ serial, EQ name, act no earlier than).
     /// Our own write's property echo has been observed to arrive after the
-    /// write's roundtrip completed, so acting on the first mismatch links
-    /// spuriously (and severs WirePlumber's in-flight path). Entries are
-    /// re-checked on the pump tick and only linked once the deadline passes
-    /// unmatched. Cleared together with `fallback_links` on every release
-    /// path -- a handed-back stream must never be linked afterwards.
+    /// write's roundtrip completed, so acting on the first mismatch linked
+    /// spuriously (and severed the session manager's in-flight path). Entries
+    /// are re-checked on the pump tick and only linked once the deadline
+    /// passes unmatched. Cleared together with `fallback_links` on every
+    /// release path -- a handed-back stream must never be linked afterwards.
     pending_verify: Vec<(u32, u32, String, String, std::time::Instant)>,
+    /// Last full heal pass. Heal does registry snapshots, so it runs at most
+    /// ~1/s even though the pump tick calls it every 10 ms; the orphan-drop
+    /// stays unthrottled (one lock check).
+    last_heal: Rc<Cell<Option<std::time::Instant>>>,
     /// `(node id, object serial)` the EQ was last routed to. Lets `unroute_all`
     /// tell "nothing is on the EQ any more" from "streams are still there" by
     /// reading their targets, so a repeated call is a no-op instead of another
@@ -275,6 +279,7 @@ impl RoutingEngine {
             routed_targets: Arc::new(Mutex::new(HashMap::new())),
             fallback_links: Arc::new(Mutex::new(HashMap::new())),
             pending_verify: Vec::new(),
+            last_heal: Rc::new(Cell::new(None)),
             last_route_target: Arc::new(Mutex::new(None)),
         }
     }
@@ -1302,6 +1307,118 @@ impl RoutingEngine {
         Ok(total)
     }
 
+    /// Audio ports per node: node id -> (port global id, port name, direction).
+    /// One registry pass; loop-thread only like the other snapshots.
+    fn stream_audio_ports(&self) -> HashMap<u32, Vec<(u32, String, String)>> {
+        let ports: Rc<RefCell<HashMap<u32, Vec<(u32, String, String)>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let ports_clone = ports.clone();
+        let registry = match self.core.get_registry() {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ == ObjectType::Port {
+                    if let Some(props) = &global.props {
+                        let get = |k: &str| props.get(k).unwrap_or("").to_string();
+                        if let Ok(node) = get("node.id").parse::<u32>() {
+                            ports_clone.borrow_mut().entry(node).or_default().push((
+                                global.id,
+                                get("port.name"),
+                                get("port.direction"),
+                            ));
+                        }
+                    }
+                }
+            })
+            .register();
+        let _ = self.roundtrip();
+        ports.borrow().clone()
+    }
+
+    /// Channel key of a port name (`output_FL` -> `FL`): what pairs a stream
+    /// output to a sink input.
+    fn port_channel(name: &str) -> &str {
+        name.rsplit('_').next().unwrap_or(name)
+    }
+
+    /// Wire real port links stream -> EQ sink, pairing output to input ports
+    /// by channel (FL->FL, FR->FR). Node-level auto-mapping (`link.output.node`
+    /// alone) demonstrably creates nothing usable here -- the daemon silently
+    /// drops it -- while explicit port links (the same `pw-link` builds) go
+    /// active and persist, including from inside the sandbox. A single
+    /// unmatched output (mono) fans out to every input (standard upmix).
+    fn link_stream_to_sink(&self, stream_id: u32, eq_id: u32) -> Result<Vec<u32>, Error> {
+        let ports = self.stream_audio_ports();
+        let outs: Vec<(u32, String)> = ports
+            .get(&stream_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "out")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ins: Vec<(u32, String)> = ports
+            .get(&eq_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "in")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if outs.is_empty() || ins.is_empty() {
+            warn!("Stream {stream_id}: no output/input ports to link (stream or EQ ports missing)");
+            return Err(Error::CreationFailed);
+        }
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut used_in: HashSet<u32> = HashSet::new();
+        for (oid, oname) in &outs {
+            if let Some((iid, _)) = ins.iter().find(|(iid, iname)| {
+                !used_in.contains(iid) && Self::port_channel(iname) == Self::port_channel(oname)
+            }) {
+                pairs.push((*oid, *iid));
+                used_in.insert(*iid);
+            }
+        }
+        if pairs.is_empty() && outs.len() == 1 {
+            // Mono into stereo: fan out to every input.
+            for (iid, _) in &ins {
+                pairs.push((outs[0].0, *iid));
+            }
+        }
+        if pairs.is_empty() {
+            warn!("Stream {stream_id}: no channel pairing between stream and EQ ports");
+            return Err(Error::CreationFailed);
+        }
+        let mut created = Vec::with_capacity(pairs.len());
+        for (oport, iport) in pairs {
+            let link_props = properties! {
+                "link.output.node" => stream_id.to_string().as_str(),
+                "link.output.port" => oport.to_string().as_str(),
+                "link.input.node" => eq_id.to_string().as_str(),
+                "link.input.port" => iport.to_string().as_str(),
+            };
+            let link = self
+                .core
+                .create_object::<Link>("link-factory", &link_props)
+                .inspect_err(|e| warn!("link-factory create failed: {}", e))?;
+            let lid = link.upcast().id();
+            self.links.lock().unwrap().push(RouteInfo {
+                route_id: stream_id,
+                source_node: stream_id,
+                target_node: eq_id,
+                link_id: lid,
+            });
+            info!("Created link {lid} ({stream_id}:{oport} -> {eq_id}:{iport})");
+            created.push(lid);
+        }
+        Ok(created)
+    }
+
     /// Map each playback stream to the sink node names it is actually linked
     /// into, from live Link objects.
     ///
@@ -1563,8 +1680,8 @@ impl RoutingEngine {
         warn!(
             "Stream {stream_id}: metadata write did not take (sandboxed daemon?) -- linking into {eq_name} directly"
         );
-        match self.link_nodes(stream_id, virt_id) {
-            Ok(lid) => {
+        match self.link_stream_to_sink(stream_id, virt_id) {
+            Ok(lids) => {
                 // (Re)point the entry at this chain: a stream re-adopted
                 // elsewhere drops its old entry at prune time, but be
                 // explicit -- a stale name would misroute teardown.
@@ -1574,9 +1691,9 @@ impl RoutingEngine {
                     .entry(stream_id)
                     .and_modify(|e| {
                         e.0 = eq_name.to_string();
-                        e.1.push(lid);
+                        e.1.extend(lids.iter().cloned());
                     })
-                    .or_insert_with(|| (eq_name.to_string(), vec![lid]));
+                    .or_insert_with(|| (eq_name.to_string(), lids));
             }
             Err(e) => {
                 warn!("Stream {stream_id}: fallback link into {eq_name} failed: {e}");
@@ -1625,10 +1742,21 @@ impl RoutingEngine {
     /// fallback links exist -- one lock check. Called on the adoption pump so
     /// it runs exactly when the graph moved.
     fn heal_fallback_links(&self) {
-        // Orphans first: links for streams nobody owns must go before any
-        // keep/drop decision below, or they self-perpetuate (live links look
-        // healthy to the checks that follow).
+        // Orphans first, always: links for streams nobody owns must go before
+        // any keep/drop decision below, or they self-perpetuate (live links
+        // look healthy to the checks that follow).
         self.drop_orphan_fallback_links();
+        // Then throttle the snapshot work: the pump tick calls every 10 ms,
+        // but a full registry pass that often is pure burn.
+        let now = std::time::Instant::now();
+        if self
+            .last_heal
+            .get()
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_heal.set(Some(now));
         let owned: Vec<(u32, String)> = self
             .fallback_links
             .lock()
