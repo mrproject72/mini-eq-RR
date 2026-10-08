@@ -139,6 +139,7 @@ impl OutputRoutingMode {
 /// `Selected` and a missing `monitor` as `Follow`, and it drops the legacy
 /// `"default"` link key (written by the old Link button) on the next write --
 /// that key is the fallback, never a device.
+#[derive(Debug, Clone)]
 pub struct OutputPresetConfig {
     pub links: std::collections::HashMap<String, String>,
     pub default_preset: Option<String>,
@@ -1650,7 +1651,31 @@ pub fn set_output_monitor_sink(sink: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub fn load_output_preset_config() -> anyhow::Result<OutputPresetConfig> {
-    load_output_preset_config_at(&output_preset_links_path())
+    // mtime-guarded process-wide cache: the 33 ms UI tick reads this file
+    // twice per frame (`output_preset_for_sink` for D-Bus state,
+    // `output_monitor_sink` for the monitor target) -- 60 open+parse cycles
+    // a second of a file that only changes on explicit user action. The
+    // cache turns those into one `stat` each; any mtime change (our own
+    // writes, hand edits, a second instance) reloads transparently, so no
+    // explicit invalidation is needed and staleness is impossible.
+    static CACHE: std::sync::Mutex<Option<(std::time::SystemTime, OutputPresetConfig)>> =
+        std::sync::Mutex::new(None);
+    let path = output_preset_links_path();
+    if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+        let mut cache = CACHE.lock().unwrap();
+        if let Some((cached_mtime, cached)) = cache.clone() {
+            if cached_mtime == mtime {
+                return Ok(cached);
+            }
+        }
+        let cfg = load_output_preset_config_at(&path)?;
+        *cache = Some((mtime, cfg.clone()));
+        return Ok(cfg);
+    }
+    // No file (fresh install): don't cache the absence; the default is cheap
+    // to build and the file can appear at any moment (first link write).
+    *CACHE.lock().unwrap() = None;
+    Ok(OutputPresetConfig::default())
 }
 
 /// Path-injectable variant of [`load_output_preset_config`].

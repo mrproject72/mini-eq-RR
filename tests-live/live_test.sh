@@ -34,7 +34,8 @@ BUS=io.github.mrproject72.mini_eq_rr
 DBUS="python3 tests-live/dbus.py"
 PW="python3 tests-live/pw_state.py"
 DISPLAY_NUM=:99
-WAV=/tmp/mini-eq-live-test-tone.wav
+mkdir -p tmp/live 2>/dev/null
+WAV=tmp/live/test-tone.wav
 TONE_PID=""
 APP_PID=""
 XVFB_PID=""
@@ -73,6 +74,7 @@ cleanup() {
   [ -n "${TONE2_PID:-}" ] && kill "$TONE2_PID" 2>/dev/null
   [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null
   rm -f "$WAV"
+  rm -f tmp/live/xvfb.log tmp/live/app.log tmp/live/tone.log tmp/live/tone2.log tmp/live/lv.raw
   # Restore the user's preset links + drop seeded test presets.
   # Defaults guard early aborts (set -u) before T6 assigns these.
   if [ -f "${LINKS_BAK:-}" ]; then
@@ -160,10 +162,10 @@ BEFORE_STREAMS="$(pwstate | python3 -c 'import json,sys; print(" ".join(str(s["i
 EQ_SERIALS_BEFORE="$(pwstate | python3 -c 'import json,sys; print(" ".join(v["serial"] for v in json.load(sys.stdin)["eq_sinks"].values()))')"
 
 # --- 2. launch app under Xvfb -------------------------------------------------
-Xvfb $DISPLAY_NUM >/tmp/mini-eq-live-xvfb.log 2>&1 &
+Xvfb $DISPLAY_NUM >tmp/live/xvfb.log 2>&1 &
 XVFB_PID=$!
 sleep 1
-DISPLAY=$DISPLAY_NUM RUST_LOG=${APP_LOG_LEVEL:-} MINI_EQ_DEBUG_ROUTING=${APP_DEBUG_ROUTING:-} "$APP" >/tmp/mini-eq-live-app.log 2>&1 &
+DISPLAY=$DISPLAY_NUM RUST_LOG=${APP_LOG_LEVEL:-} MINI_EQ_DEBUG_ROUTING=${APP_DEBUG_ROUTING:-} "$APP" >tmp/live/app.log 2>&1 &
 APP_PID=$!
 
 echo -n "waiting for D-Bus service..."
@@ -172,7 +174,7 @@ for _ in $(seq 1 60); do
   if getstate | grep -q "^output_sink="; then ok=1; break; fi
   sleep 0.5
 done
-[ "$ok" = 1 ] || { echo " app never appeared on D-Bus. log tail:"; tail -20 /tmp/mini-eq-live-app.log; exit 99; }
+[ "$ok" = 1 ] || { echo " app never appeared on D-Bus. log tail:"; tail -20 tmp/live/app.log; exit 99; }
 echo " up."
 
 INIT_MODE="$(state_val output_mode)"
@@ -185,7 +187,7 @@ INIT_SINK="$(state_val output_sink)"
 # would otherwise restore an old target (observed: headset serial from a
 # previous run), making scope assertions nondeterministic. Pinning the tone
 # to the startup sink mirrors a user playing on their default device.
-pw-play --target="$INIT_SINK" "$WAV" >/tmp/mini-eq-live-tone.log 2>&1 &
+pw-play --target="$INIT_SINK" "$WAV" >tmp/live/tone.log 2>&1 &
 TONE_PID=$!
 sleep 3
 TONE_ID="$(pwstate | python3 -c "
@@ -238,7 +240,7 @@ echo "  second sink: ${SINK_B:-(none available)}"
 # ~/.config/mini-eq/presets is stale legacy and invisible to the app.
 PRESET_DIR="$HOME/.config/mini-eq/output"
 LINKS_FILE="$HOME/.config/mini-eq/output-presets.json"
-LINKS_BAK=/tmp/mini-eq-live-links.bak.json
+LINKS_BAK=tmp/live/links.bak.json
 seed_output_presets() {
   # Back up once: this runs twice per run (T3b + T6) and the second backup
   # must not capture the first seeding, or cleanup restores seeded links.
@@ -277,7 +279,7 @@ EOF
 # Unlike the analyzer (which taps the room mix incl. the user's own music),
 # this carries only what this run routed -- deterministic by construction.
 eq_output_rms() {
-  local eq_out="$1" f=/tmp/mini-eq-live-lv.raw
+  local eq_out="$1" f=tmp/live/lv.raw
   rm -f "$f"
   timeout 8 pw-record --target="$eq_out" "$f" >/dev/null 2>&1
   [ -s "$f" ] || return 1
@@ -348,6 +350,12 @@ check "routed=true after on" wait_for 15 routed-true \
   '[ "$(echo "$S" | grep "^routed=" | cut -d= -f2)" = "true" ]'
 check "tone target is mini_eq_sink" wait_for 15 tone-routed \
   "[ \"\$(echo \"\$P\" | python3 -c \"import json,sys; print([s['target_object'] for s in json.load(sys.stdin)['streams'] if str(s['id'])=='$TONE_ID'][0])\")\" = \"$MINIEQ_SERIAL\" ]"
+# Verified flow, not intent: read-back count of streams observably inside an
+# EQ sink (metadata target or live links). Catches the sandbox lie where
+# `routed=true` while nothing actually flows through the EQ.
+check "eq_flowing=true with tone routed" wait_for 15 flow-true \
+  '[ "$(echo "$S" | grep "^eq_flowing=" | cut -d= -f2)" = "true" ]'
+check "flowing_streams>=1 with tone routed" test "$(state_val flowing_streams | awk '{print $NF}')" -ge 1
 
 # --- T3: A/B --------------------------------------------------------------------
 echo "--- T3: A/B bypass"
@@ -468,7 +476,7 @@ if [ -n "$SINK_B" ]; then
   # listeners + pump-tick drain), so no toggle may be needed.
   echo "--- T6c: stream started after EQ-on is adopted on B"
   BEFORE2="$(pwstate | python3 -c 'import json,sys; print(" ".join(str(s["id"]) for s in json.load(sys.stdin)["streams"]))')"
-  pw-play --target="$SINK_B" "$WAV" >/tmp/mini-eq-live-tone2.log 2>&1 &
+  pw-play --target="$SINK_B" "$WAV" >tmp/live/tone2.log 2>&1 &
   TONE2_PID=$!
   sleep 3
   TONE2_ID="$(pwstate | python3 -c "
@@ -514,6 +522,24 @@ serials = {str(o['info']['props'].get('object.serial', '')) for o in p
              if o.get('type', '').endswith('PipeWire:Interface:Node')}
 assert '$TGT_OFF' == '' or '$TGT_OFF' in serials, 'dangling target $TGT_OFF'"
 check "routed=false after off" test "$(state_val routed)" = "false"
+# Published on the throttled ~500 ms flow cadence, so poll rather than
+# asserting the instant sample (which may predate the unroute). Note the
+# switch is per-device by design: turning A off leaves B's chain (and tone2)
+# playing through its EQ, so flows persist globally until B goes off too.
+if [ -n "$SINK_B" ]; then
+  check "eq_flowing still true (B unaffected)" wait_for 15 flow-still \
+    '[ "$(echo "$S" | grep "^eq_flowing=" | cut -d= -f2)" = "true" ]'
+  $DBUS call SetOutputSink "s:$SINK_B" >/dev/null
+  sleep 2
+  $DBUS call SetRoutingEnabled b:false >/dev/null
+  check "eq_flowing=false once B off too" wait_for 15 flow-false \
+    '[ "$(echo "$S" | grep "^eq_flowing=" | cut -d= -f2)" = "false" ]'
+  $DBUS call SetOutputSink "s:$INIT_SINK" >/dev/null
+  sleep 2
+else
+  check "eq_flowing=false after off" wait_for 15 flow-false \
+    '[ "$(echo "$S" | grep "^eq_flowing=" | cut -d= -f2)" = "false" ]'
+fi
 echo "  tone target_object='$TGT_OFF' (minieq was $MINIEQ_SERIAL)"
 
 # on again after device hops (the reported 'loses monitor/EQ' scenario)

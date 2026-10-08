@@ -217,6 +217,11 @@ pub struct EqGraphState {
     /// Whether the monitor is running, so the background can caption itself
     /// "Monitor" and draw the dBFS scale only when there is a spectrum.
     pub analyzer_active: bool,
+    /// Set once the first frame has been queued. Lets `update` tell "nothing
+    /// changed since startup" (skip everything) apart from "nothing changed
+    /// since the last painted frame" -- without it, a first frame identical
+    /// to the defaults would never paint and the graph would stay blank.
+    painted: bool,
 }
 
 impl EqGraphState {
@@ -230,6 +235,7 @@ impl EqGraphState {
             eq_enabled: true,
             analyzer_display_gain_db: 0.0,
             analyzer_active: false,
+            painted: false,
         }
     }
 }
@@ -374,6 +380,31 @@ impl EqGraph {
         analyzer_display_gain_db: f64,
         analyzer_active: bool,
     ) {
+        // Paint on demand: the 33 ms tick calls this unconditionally, and a
+        // full 4-layer Cairo repaint 30x/s of pixel-identical content was the
+        // entire idle CPU footprint (~7% of one core, measured). Redraw only
+        // the layers whose inputs actually moved since the last painted frame:
+        // background follows monitor state/gain, response follows the curve,
+        // analyzer follows the spectrum, overlay follows the curve (dots).
+        // Bitwise float compare is deliberate: untouched widgets re-read
+        // identical values, and decayed silence converges to exact zeros, so
+        // a static graph settles into zero repaints. Any real motion (music,
+        // drag, toggle) changes bits and repaints exactly as before.
+        let (background_changed, response_changed, analyzer_changed, first) = {
+            let s = self.state.borrow();
+            (
+                s.analyzer_active != analyzer_active
+                    || s.analyzer_display_gain_db != analyzer_display_gain_db,
+                s.preamp_db != preamp_db
+                    || s.bands.as_slice() != bands
+                    || s.eq_enabled != eq_enabled,
+                s.analyzer_levels.as_slice() != analyzer_levels,
+                !s.painted,
+            )
+        };
+        if !(first || background_changed || response_changed || analyzer_changed) {
+            return;
+        }
         {
             let mut s = self.state.borrow_mut();
             s.preamp_db = preamp_db;
@@ -382,16 +413,23 @@ impl EqGraph {
             s.eq_enabled = eq_enabled;
             s.analyzer_display_gain_db = analyzer_display_gain_db;
             s.analyzer_active = analyzer_active;
+            s.painted = true;
         }
         // Queue the specific drawing areas directly. `overlay.queue_draw()`
         // does not reliably re-invoke the child `DrawingArea` draw funcs in
         // GTK4, which left the response curve frozen after the first paint.
         // The background is included because the analyzer's dBFS scale and the
         // "Monitor" caption follow the monitor state and the display gain.
-        self.background_area.queue_draw();
-        self.response_area.queue_draw();
-        self.analyzer_area.queue_draw();
-        self.overlay.queue_draw();
+        if background_changed || first {
+            self.background_area.queue_draw();
+        }
+        if response_changed || first {
+            self.response_area.queue_draw();
+            self.overlay.queue_draw();
+        }
+        if analyzer_changed || first {
+            self.analyzer_area.queue_draw();
+        }
     }
 
     pub fn set_selected_band(&mut self, band_index: Option<usize>) {

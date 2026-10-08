@@ -98,6 +98,12 @@ pub trait MiniEqAppHandler: Send + Sync + 'static {
     }
     fn eq_enabled(&self) -> bool;
     fn routed(&self) -> bool;
+    /// Read-back count of streams verifiably flowing into our EQ sinks (as
+    /// opposed to `routed`, which is the machinery on/off). Defaults to 0 so
+    /// read-only consumers of the trait are unaffected.
+    fn flowing_count(&self) -> usize {
+        0
+    }
     fn output_sink(&self) -> Option<String>;
 
     /// Which streams the EQ reaches: `selected` or `reroute`. Orthogonal to
@@ -186,6 +192,18 @@ pub fn build_state(handler: &dyn MiniEqAppHandler) -> HashMap<String, glib::Vari
         glib::Variant::from(handler.eq_enabled()),
     );
     state.insert("routed".to_string(), glib::Variant::from(handler.routed()));
+    // Verified audio flow, not intent: true while at least one stream is
+    // observably inside an EQ sink (metadata target or live links). In a
+    // sandbox that discards reroute writes this stays false while `routed`
+    // is true -- the "EQ on but nothing happens" state.
+    state.insert(
+        "eq_flowing".to_string(),
+        glib::Variant::from(handler.flowing_count() > 0),
+    );
+    state.insert(
+        "flowing_streams".to_string(),
+        glib::Variant::from(handler.flowing_count() as u32),
+    );
     state.insert(
         "preset_name".to_string(),
         glib::Variant::from(handler.current_preset_name().unwrap_or_default()),

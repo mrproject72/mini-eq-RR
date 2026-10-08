@@ -80,6 +80,10 @@ pub struct AppState {
     monitor_sink: Mutex<Option<String>>,
     /// The preset linked to the current output device, if any.
     output_preset: Mutex<Option<String>>,
+    /// Read-back count of streams verifiably inside our EQ sinks, published
+    /// by the window (throttled -- several registry passes per computation).
+    /// `GetState` reports it as `eq_flowing` / `flowing_streams`.
+    flowing_count: Mutex<usize>,
 
     /// Throttle state for `AnalyzerLevelsChanged`.
     last_analyzer_emit: Mutex<Option<std::time::Instant>>,
@@ -110,6 +114,7 @@ impl AppState {
             output_mode: Mutex::new(crate::core::OutputRoutingMode::Selected),
             monitor_sink: Mutex::new(None),
             output_preset: Mutex::new(None),
+            flowing_count: Mutex::new(0),
             last_analyzer_emit: Mutex::new(None),
             pending: Mutex::new(VecDeque::new()),
             connection: Mutex::new(None),
@@ -195,6 +200,7 @@ impl AppState {
         output_preset: Option<String>,
         monitor_sink: Option<String>,
         output_sink: Option<String>,
+        flowing_count: usize,
     ) {
         *Self::lock(&self.analyzer_levels) = levels;
         *Self::lock(&self.analyzer_display_gain_db) = display_gain_db;
@@ -207,6 +213,7 @@ impl AppState {
         if output_sink.is_some() {
             *Self::lock(&self.output_sink) = output_sink;
         }
+        *Self::lock(&self.flowing_count) = flowing_count;
     }
 
     /// Record that the UI started tearing down, so in-flight D-Bus calls stop
@@ -227,6 +234,10 @@ impl MiniEqAppHandler for AppState {
 
     fn routed(&self) -> bool {
         *Self::lock(&self.routed)
+    }
+
+    fn flowing_count(&self) -> usize {
+        *Self::lock(&self.flowing_count)
     }
 
     fn output_sink(&self) -> Option<String> {
@@ -427,6 +438,7 @@ mod tests {
             None,
             None,
             Some("sink-a".to_string()),
+            2,
         );
 
         assert_eq!(state.analyzer_levels(), vec![0.25; 4]);
@@ -435,6 +447,7 @@ mod tests {
         assert!(state.running());
         assert!(state.analyzer_enabled());
         assert_eq!(state.output_sink().as_deref(), Some("sink-a"));
+        assert_eq!(state.flowing_count(), 2);
     }
 
     /// GetState's output_sink tracks the published engine sink, and a
@@ -462,6 +475,7 @@ mod tests {
             None,
             None,
             Some("sink-a".to_string()),
+            0,
         );
         assert_eq!(state.output_sink().as_deref(), Some("sink-a"));
     }
@@ -490,6 +504,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         assert!(!state.maybe_emit_analyzer_levels_changed());
     }

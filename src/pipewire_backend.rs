@@ -217,7 +217,17 @@ impl PipeWireBackend {
         let listener = registry.add_listener_local();
         let listener = listener.global(move |global| {
             debug!("Registry global: id={} type={:?}", global.id, global.type_);
+            // A link appeared: topology moved without any node arriving --
+            // typically the session manager wiring a just-created stream to
+            // its target AFTER our arrival-triggered adoption pass already
+            // ran (and skipped it for having no target and no links yet).
+            // Re-flag so the pump tick re-runs adoption and sees the links.
+            // Recorded streams are skipped by the pass itself, so link churn
+            // costs one cheap scan, not a re-route.
             if global.type_.to_str() != pipewire::types::ObjectType::Node.to_str() {
+                if global.type_.to_str() == pipewire::types::ObjectType::Link.to_str() {
+                    streams_dirty.set(true);
+                }
                 return;
             }
             // A playback stream appeared (or vanished and re-appeared):
@@ -746,6 +756,13 @@ impl PipeWireBackend {
         self.routing.has_routed_streams()
     }
 
+    /// Read-back count of streams actually flowing into our EQ sinks (see
+    /// [`RoutingEngine::flowing_count`]). Throttle callers: several registry
+    /// passes per call.
+    pub fn flowing_count(&self) -> usize {
+        self.routing.flowing_count()
+    }
+
     /// Scoped reconcile for one device's chain (used when the routing mode
     /// narrows to Selected).
     pub fn rescope_device(&mut self, physical_sink: &str) -> Result<(usize, usize), Error> {
@@ -779,6 +796,13 @@ impl PipeWireBackend {
     /// Take the streams-dirty flag set by the registry/metadata listeners.
     pub fn take_streams_dirty(&self) -> bool {
         self.routing.take_streams_dirty()
+    }
+
+    /// Re-check deferred route verifications (no-op when none pending).
+    /// Called on every pump tick -- not just dirty ones -- so a stream whose
+    /// property echo lagged is revisited without needing a new event.
+    pub fn process_pending_verifies(&mut self) {
+        self.routing.process_pending_verifies()
     }
 
     /// Shared handle for the streams-dirty flag, for the registry listener.

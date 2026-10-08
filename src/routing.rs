@@ -197,6 +197,24 @@ pub struct RoutingEngine {
     /// the properties instead leaves the destination to WirePlumber's policy,
     /// which re-resolves from scratch and takes a visible moment of silence.
     routed_targets: Arc<Mutex<HashMap<u32, StreamTarget>>>,
+    /// Link ids this process created as a metadata-write fallback: stream id
+    /// -> (EQ sink node name, our link ids into it). Metadata writes are
+    /// silently discarded for sandboxed clients, so without real links the
+    /// adoption would be bookkeeping only. Destroyed when the stream is
+    /// handed back, unrouted, or the chain rebuilds (the daemon drops links
+    /// to dead nodes itself, but the map must not outlive the streams). The
+    /// EQ name travels with the entry so per-device teardown only touches
+    /// its own chain's links.
+    fallback_links: Arc<Mutex<HashMap<u32, (String, Vec<u32>)>>>,
+    /// Streams whose metadata write is awaiting read-back confirmation:
+    /// stream id -> (EQ node id, EQ serial, EQ name, act no earlier than).
+    /// Our own write's property echo has been observed to arrive after the
+    /// write's roundtrip completed, so acting on the first mismatch links
+    /// spuriously (and severs WirePlumber's in-flight path). Entries are
+    /// re-checked on the pump tick and only linked once the deadline passes
+    /// unmatched. Cleared together with `fallback_links` on every release
+    /// path -- a handed-back stream must never be linked afterwards.
+    pending_verify: Vec<(u32, u32, String, String, std::time::Instant)>,
     /// `(node id, object serial)` the EQ was last routed to. Lets `unroute_all`
     /// tell "nothing is on the EQ any more" from "streams are still there" by
     /// reading their targets, so a repeated call is a no-op instead of another
@@ -255,6 +273,8 @@ impl RoutingEngine {
             metadata_listeners: Rc::new(RefCell::new(Vec::new())),
             target_cache: Arc::new(Mutex::new(HashMap::new())),
             routed_targets: Arc::new(Mutex::new(HashMap::new())),
+            fallback_links: Arc::new(Mutex::new(HashMap::new())),
+            pending_verify: Vec::new(),
             last_route_target: Arc::new(Mutex::new(None)),
         }
     }
@@ -972,6 +992,8 @@ impl RoutingEngine {
         let mut pruned = 0usize;
         let mut adopted = 0usize;
         let mut wrote = false;
+        let mut pruned_ids: Vec<u32> = Vec::new();
+        let mut verified_ids: Vec<u32> = Vec::new();
         self.ensure_default_metadata()?;
         // 1. Hand back recorded streams that are effectively aimed elsewhere.
         // 2. (Re-)route recorded in-scope streams that are not currently on
@@ -997,6 +1019,7 @@ impl RoutingEngine {
                         self.routed_targets.lock().unwrap().remove(id);
                         info!("Rescope: handed stream {id} back (aimed elsewhere)");
                         pruned += 1;
+                        pruned_ids.push(*id);
                         wrote = true;
                     }
                     _ => {
@@ -1020,6 +1043,7 @@ impl RoutingEngine {
                             );
                             info!("Rescope: re-routed stream {id} into the EQ");
                             adopted += 1;
+                            verified_ids.push(*id);
                             wrote = true;
                         }
                     }
@@ -1044,12 +1068,19 @@ impl RoutingEngine {
                 let cur = self.stream_target(s.id);
                 let cur_obj = cur.target_object.as_deref().unwrap_or("");
                 let ours = !cur_obj.is_empty() && cur_obj == chosen_serial;
-                let follows_default =
-                    cur_obj.is_empty() && default_serial.as_deref() == Some(chosen_serial.as_str());
                 let linked_here = link_targets
                     .get(&s.id)
                     .is_some_and(|v| v.iter().any(|n| n == physical_name));
-                if ours || follows_default || linked_here {
+                let linked_into_own_eq = link_targets
+                    .get(&s.id)
+                    .is_some_and(|v| v.iter().any(|n| n == eq_sink_name));
+                // Explicit matches and live links decide; a bare
+                // follows-default with neither is a brand-new stream whose
+                // target has not arrived yet (see adopt_unrecorded_into) --
+                // leave it for the pump-driven adoption pass, which fires on
+                // the metadata/link arrival. Claiming it here would record it
+                // for the wrong chain with no later rescope to fix it.
+                if ours || linked_here || linked_into_own_eq {
                     md.set_property(
                         s.id,
                         "target.node",
@@ -1060,14 +1091,24 @@ impl RoutingEngine {
                     self.routed_targets.lock().unwrap().insert(s.id, cur);
                     info!("Rescope: adopted stream '{}' ({})", s.node_name, s.id);
                     adopted += 1;
+                    verified_ids.push(s.id);
                     wrote = true;
                 }
             }
         }
-        *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial));
+        *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial.clone()));
         if wrote {
             self.roundtrip()?;
         }
+        // Handed-back streams must not keep fallback links feeding the old
+        // chain; (re-)routed ones get read-back verification with link
+        // fallback where the metadata write did not take.
+        self.drop_fallback_links(&pruned_ids);
+        self.clear_pending_for(&pruned_ids);
+        // Deferred read-back verification (see `defer_verify`): acting on
+        // the first mismatch linked spuriously on broadcast lag.
+        self.defer_verify(&verified_ids, virt_id, &virt_serial, eq_sink_name);
+        self.heal_fallback_links();
         if pruned > 0 || adopted > 0 {
             info!("Rescope complete: {pruned} handed back, {adopted} (re-)routed");
         }
@@ -1086,6 +1127,53 @@ impl RoutingEngine {
             !self.is_internal_stream(s)
                 && self.stream_target(s.id).target_object.as_deref() == Some(serial.as_str())
         })
+    }
+
+    /// Number of non-internal playback streams verifiably flowing into one
+    /// of our EQ sinks right now -- by `target.object` metadata OR by live
+    /// links into the sink node.
+    ///
+    /// Unlike `last_routed_count` (intent: what the last route pass asked
+    /// for) and `is_routed` (machinery on/off), this is read-back truth: in
+    /// a sandbox that silently discards metadata writes it stays 0 while the
+    /// streams audibly bypass the EQ, which is exactly the "EQ on but
+    /// nothing happens" state the old flag could not distinguish. Surfaced
+    /// as GetState `eq_flowing` / `flowing_streams`.
+    ///
+    /// Deliberately heavier than the flag reads (a few registry passes), so
+    /// callers must throttle it -- the window recomputes at most every
+    /// ~500 ms, never on the 33 ms tick directly.
+    pub fn flowing_count(&self) -> usize {
+        let eq_names = self.owned_eq_sink_names();
+        let mut serials = Vec::with_capacity(eq_names.len());
+        for name in &eq_names {
+            if let Some((_, serial)) = self.find_node_target(name) {
+                serials.push(serial);
+            }
+        }
+        if serials.is_empty() {
+            return 0;
+        }
+        let link_targets = self.stream_link_targets();
+        self.list_stream_nodes()
+            .iter()
+            .filter(|s| {
+                if self.is_internal_stream(s) {
+                    return false;
+                }
+                if self
+                    .stream_target(s.id)
+                    .target_object
+                    .as_deref()
+                    .is_some_and(|t| serials.iter().any(|x| x == t))
+                {
+                    return true;
+                }
+                link_targets
+                    .get(&s.id)
+                    .is_some_and(|v| v.iter().any(|n| eq_names.iter().any(|e| e == n)))
+            })
+            .count()
     }
 
     /// Hand back every stream pointed into `physical_sink`'s EQ chain.
@@ -1169,6 +1257,11 @@ impl RoutingEngine {
         if wrote {
             self.roundtrip()?;
         }
+        // Streams leaving this device's ownership must not keep fallback
+        // links feeding its chain: drop ours for this EQ only, so sibling
+        // device chains keep playing. Pending verifications for it die too.
+        self.drop_fallback_links_for_eq(&eq);
+        self.clear_pending_for_eq(&eq);
         if self.routed_targets.lock().unwrap().is_empty() {
             self.routed = false;
             *self.last_route_target.lock().unwrap() = None;
@@ -1218,7 +1311,17 @@ impl RoutingEngine {
     /// show where sound really goes. One registry pass; used as a fallback
     /// signal by adoption when metadata says nothing.
     fn stream_link_targets(&self) -> HashMap<u32, Vec<String>> {
-        let links: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        self.stream_link_details()
+            .into_iter()
+            .map(|(s, v)| (s, v.into_iter().map(|(_, name)| name).collect()))
+            .collect()
+    }
+
+    /// Same as [`Self::stream_link_targets`] but keeping each link's id, so
+    /// the fallback can destroy the competing direct links it supersedes.
+    /// Map: stream node id -> (link id, sink node name).
+    fn stream_link_details(&self) -> HashMap<u32, Vec<(u32, String)>> {
+        let links: Rc<RefCell<Vec<(u32, u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let links_clone = links.clone();
         let names: Rc<RefCell<HashMap<u32, String>>> = Rc::new(RefCell::new(HashMap::new()));
         let names_clone = names.clone();
@@ -1236,7 +1339,7 @@ impl RoutingEngine {
                             get("link.output.node").parse::<u32>().ok(),
                             get("link.input.node").parse::<u32>().ok(),
                         ) {
-                            links_clone.borrow_mut().push((out, inp));
+                            links_clone.borrow_mut().push((global.id, out, inp));
                         }
                     }
                 } else if global.type_ == ObjectType::Node {
@@ -1252,13 +1355,343 @@ impl RoutingEngine {
             .register();
         let _ = self.roundtrip();
         let names = names.borrow();
-        let mut map: HashMap<u32, Vec<String>> = HashMap::new();
-        for (out, inp) in links.borrow().iter() {
+        let mut map: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        for (lid, out, inp) in links.borrow().iter() {
             if let Some(sink) = names.get(inp) {
-                map.entry(*out).or_default().push(sink.clone());
+                map.entry(*out).or_default().push((*lid, sink.clone()));
             }
         }
         map
+    }
+
+    /// Destroy a link object by id via `pw-cli`. Used for our own fallback
+    /// links on teardown and for the competing direct links a fallback
+    /// supersedes. Best effort with loud logging: failure here means double
+    /// audio (fallback + direct) or a leak, both of which must be visible.
+    /// Returns true when the daemon accepted the destroy.
+    fn destroy_link_object(link_id: u32) -> bool {
+        let id = link_id.to_string();
+        let out = std::process::Command::new("pw-cli")
+            .args(["destroy", id.as_str()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                info!("Destroyed link {link_id}");
+                true
+            }
+            Ok(o) => {
+                warn!(
+                    "pw-cli destroy {link_id} failed: {} {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                warn!("pw-cli destroy {link_id} could not spawn: {e}");
+                false
+            }
+        }
+    }
+
+    /// Destroy our fallback links for `stream_ids` and forget them. Called
+    /// whenever streams leave our ownership (hand-back, unroute, rebuild):
+    /// a surviving fallback link would keep feeding a dead chain or double
+    /// the audio once metadata routing works again.
+    fn drop_fallback_links(&self, stream_ids: &[u32]) {
+        let mut map = self.fallback_links.lock().unwrap();
+        for id in stream_ids {
+            if let Some((_, lids)) = map.remove(id) {
+                for lid in lids {
+                    Self::destroy_link_object(lid);
+                }
+            }
+        }
+    }
+
+    /// Drop fallback links for streams nobody owns any more (left
+    /// `routed_targets` without teardown). Without this, orphan links keep
+    /// feeding audio through a dead chain forever: the heal pass sees live
+    /// links and keeps them, and nothing else revisits them. Called from the
+    /// heal path itself, so orphans converge to silence-free teardown.
+    fn drop_orphan_fallback_links(&self) {
+        let owned: Vec<u32> = self
+            .fallback_links
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        if owned.is_empty() {
+            return;
+        }
+        let recorded = self.routed_targets.lock().unwrap();
+        let orphans: Vec<u32> = owned
+            .into_iter()
+            .filter(|id| !recorded.contains_key(id))
+            .collect();
+        drop(recorded);
+        self.drop_fallback_links(&orphans);
+    }
+
+    /// [`Self::drop_fallback_links`], restricted to entries feeding
+    /// `eq_name`: per-device teardown must not touch sibling chains.
+    fn drop_fallback_links_for_eq(&self, eq_name: &str) {
+        let ids: Vec<u32> = self
+            .fallback_links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (name, _))| name == eq_name)
+            .map(|(id, _)| *id)
+            .collect();
+        self.drop_fallback_links(&ids);
+    }
+
+    /// True when `stream_id` is observably on the EQ: metadata target matches
+    /// `virt_serial`, or live links feed `eq_name`. Shared by verification
+    /// and healing so both agree on what "landed" means.
+    fn stream_on_eq(
+        &self,
+        stream_id: u32,
+        virt_serial: &str,
+        eq_name: &str,
+        link_details: &HashMap<u32, Vec<(u32, String)>>,
+    ) -> bool {
+        self.stream_target(stream_id).target_object.as_deref() == Some(virt_serial)
+            || link_details
+                .get(&stream_id)
+                .is_some_and(|v| v.iter().any(|(_, n)| n == eq_name))
+    }
+
+    /// Grace period between a metadata write and link-fallback action.
+    /// Our own write's property echo has been observed to arrive after the
+    /// write's roundtrip completed; acting on the first mismatch linked
+    /// spuriously and severed the session manager's in-flight path. Waiting
+    /// costs nothing: audio already flows via the metadata path where it
+    /// works, and the fallback only matters where it never will.
+    const PENDING_VERIFY_GRACE: Duration = Duration::from_millis(1500);
+
+    /// Queue `stream_ids` for read-back verification instead of verifying
+    /// inline (see [`Self::process_pending_verifies`]). Replaces any pending
+    /// entry for the same stream, so re-routes refresh the deadline instead
+    /// of stacking.
+    fn defer_verify(&mut self, stream_ids: &[u32], virt_id: u32, virt_serial: &str, eq_name: &str) {
+        let deadline = std::time::Instant::now() + Self::PENDING_VERIFY_GRACE;
+        self.pending_verify
+            .retain(|(id, _, _, _, _)| !stream_ids.contains(id));
+        for id in stream_ids {
+            self.pending_verify.push((
+                *id,
+                virt_id,
+                virt_serial.to_string(),
+                eq_name.to_string(),
+                deadline,
+            ));
+        }
+    }
+
+    /// Forget pending verifications for `stream_ids` (call on every release
+    /// path: a handed-back stream must never be linked afterwards).
+    fn clear_pending_for(&mut self, stream_ids: &[u32]) {
+        if !stream_ids.is_empty() {
+            self.pending_verify
+                .retain(|(id, _, _, _, _)| !stream_ids.contains(id));
+        }
+    }
+
+    /// Forget pending verifications feeding `eq_name` (per-device teardown).
+    fn clear_pending_for_eq(&mut self, eq_name: &str) {
+        self.pending_verify.retain(|(_, _, _, eq, _)| eq != eq_name);
+    }
+
+    /// Drain due pending verifications: re-check each stream, link the ones
+    /// still unmatched past their deadline, drop the landed ones. Called on
+    /// every pump tick (cheap early-out when empty) so no event is needed to
+    /// revisit a stream whose broadcast lagged.
+    pub fn process_pending_verifies(&mut self) {
+        if self.pending_verify.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let link_details = self.stream_link_details();
+        let alive: HashSet<u32> = self.list_stream_nodes().iter().map(|s| s.id).collect();
+        // Take (not retain) so the re-checks below can borrow freely.
+        let pending = std::mem::take(&mut self.pending_verify);
+        let mut due: Vec<(u32, u32, String, String)> = Vec::new();
+        for (id, virt_id, serial, eq, deadline) in pending {
+            if !alive.contains(&id) {
+                continue;
+            }
+            if self.stream_on_eq(id, &serial, &eq, &link_details) {
+                self.drop_fallback_links(&[id]);
+                continue;
+            }
+            if now >= deadline {
+                due.push((id, virt_id, serial, eq));
+            } else {
+                self.pending_verify
+                    .push((id, virt_id, serial, eq, deadline));
+            }
+        }
+        for (id, virt_id, serial, eq) in &due {
+            self.link_stream_fallback(*id, *virt_id, serial, eq);
+        }
+        self.heal_fallback_links();
+    }
+
+    /// Wire real port links stream -> EQ sink and sever the competing direct
+    /// links, recording ours for teardown. Returns true when our path is in
+    /// place. Link first, sever second: the stream must never be pathless in
+    /// between.
+    fn link_stream_fallback(
+        &self,
+        stream_id: u32,
+        virt_id: u32,
+        virt_serial: &str,
+        eq_name: &str,
+    ) -> bool {
+        // Re-check under the current graph: a concurrent session-manager
+        // move may have landed the stream while we were queuing.
+        let link_details = self.stream_link_details();
+        if self.stream_on_eq(stream_id, virt_serial, eq_name, &link_details) {
+            self.drop_fallback_links(&[stream_id]);
+            return true;
+        }
+        warn!(
+            "Stream {stream_id}: metadata write did not take (sandboxed daemon?) -- linking into {eq_name} directly"
+        );
+        match self.link_nodes(stream_id, virt_id) {
+            Ok(lid) => {
+                // (Re)point the entry at this chain: a stream re-adopted
+                // elsewhere drops its old entry at prune time, but be
+                // explicit -- a stale name would misroute teardown.
+                self.fallback_links
+                    .lock()
+                    .unwrap()
+                    .entry(stream_id)
+                    .and_modify(|e| {
+                        e.0 = eq_name.to_string();
+                        e.1.push(lid);
+                    })
+                    .or_insert_with(|| (eq_name.to_string(), vec![lid]));
+            }
+            Err(e) => {
+                warn!("Stream {stream_id}: fallback link into {eq_name} failed: {e}");
+                return false;
+            }
+        }
+        self.sever_direct_links(stream_id, &link_details);
+        true
+    }
+
+    /// Destroy live links from `stream_id` straight into non-EQ sinks. Only
+    /// ever called for streams we own (recorded in `routed_targets`) right
+    /// after wiring our own path in, so the stream cannot play around the EQ
+    /// -- and, with our link in place first, cannot go silent either. Links
+    /// the session manager rebuilds later are re-severed by
+    /// [`Self::heal_fallback_links`].
+    fn sever_direct_links(&self, stream_id: u32, link_details: &HashMap<u32, Vec<(u32, String)>>) {
+        let Some(links) = link_details.get(&stream_id) else {
+            return;
+        };
+        for (lid, sink) in links {
+            if sink.starts_with(VIRTUAL_SINK_BASE) {
+                continue;
+            }
+            warn!(
+                "Stream {stream_id}: severing direct link {lid} -> {sink} (superseded by EQ path)"
+            );
+            Self::destroy_link_object(*lid);
+        }
+    }
+
+    /// Our EQ sink node names: the legacy base plus one per wanted device.
+    /// Used to recognise our own side of live links (see
+    /// `heal_fallback_links` and `flowing_count`).
+    fn owned_eq_sink_names(&self) -> Vec<String> {
+        let mut names = vec![VIRTUAL_SINK_BASE.to_string()];
+        for dev in &self.eq_wanted {
+            names.push(crate::core::eq_virtual_sink_for(dev));
+        }
+        names
+    }
+
+    /// Re-check streams we hold via fallback links: destroy our links where
+    /// metadata has since won (avoids doubling on a slow session manager),
+    /// and re-sever direct links the session manager rebuilt. No-op when no
+    /// fallback links exist -- one lock check. Called on the adoption pump so
+    /// it runs exactly when the graph moved.
+    fn heal_fallback_links(&self) {
+        // Orphans first: links for streams nobody owns must go before any
+        // keep/drop decision below, or they self-perpetuate (live links look
+        // healthy to the checks that follow).
+        self.drop_orphan_fallback_links();
+        let owned: Vec<(u32, String)> = self
+            .fallback_links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, (eq, _))| (*id, eq.clone()))
+            .collect();
+        if owned.is_empty() {
+            return;
+        }
+        let link_details = self.stream_link_details();
+        let alive: HashSet<u32> = self.list_stream_nodes().iter().map(|s| s.id).collect();
+        for (id, eq_name) in owned {
+            if !alive.contains(&id) {
+                // Stream is gone; the daemon dropped its links already.
+                self.fallback_links.lock().unwrap().remove(&id);
+                continue;
+            }
+            // EQ-specific serial only: the broad processing-path set also
+            // contains physical/default serials, and matching those once
+            // dropped good fallback links for a stream merely sitting on its
+            // original device ("metadata path live" lie -> silence).
+            let eq_serial = self.find_node_target(&eq_name).map(|(_, s)| s);
+            let meta_on_eq = eq_serial.as_deref().is_some_and(|serial| {
+                self.stream_target(id).target_object.as_deref() == Some(serial)
+            });
+            let ours: Vec<u32> = self
+                .fallback_links
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|(_, lids)| lids.clone())
+                .unwrap_or_default();
+            let wp_linked = link_details.get(&id).is_some_and(|v| {
+                v.iter()
+                    .any(|(lid, n)| n == &eq_name && !ours.contains(lid))
+            });
+            if meta_on_eq && wp_linked {
+                // Independent path live: ours must go, or the stream doubles.
+                info!(
+                    "Stream {id}: session-manager path live, dropping fallback links (no-double)"
+                );
+                self.drop_fallback_links(&[id]);
+            } else if meta_on_eq || wp_linked {
+                // Converging (metadata ahead of links or vice versa): hold
+                // our path until BOTH agree, so there is never a gap.
+                // Re-sever anything rebuilt direct meanwhile.
+                self.sever_direct_links(id, &link_details);
+            } else {
+                // Our links died and metadata never took (chain rebuild,
+                // daemon dropped them, or the verify raced a slow broadcast
+                // and never linked). Re-wire rather than forget: the stream
+                // is still recorded as ours, so adoption would skip it and
+                // it would sit pathless forever.
+                if let Some((virt_id, serial)) = self.find_node_target(&eq_name) {
+                    self.link_stream_fallback(id, virt_id, &serial, &eq_name);
+                } else {
+                    // Chain itself is gone; forget the entry (teardown for
+                    // dead chains runs on the rebuild path).
+                    self.fallback_links.lock().unwrap().remove(&id);
+                }
+            }
+        }
     }
 
     /// Route unrecorded, non-internal streams into `physical_sink`'s chain.
@@ -1281,14 +1714,9 @@ impl RoutingEngine {
         let Some(chosen_serial) = chosen_serial else {
             return Ok(0);
         };
-        let default_serial: Option<String> = self
-            .default_audio_sink
-            .borrow()
-            .clone()
-            .and_then(|n| self.find_node_target(&n))
-            .map(|(_, serial)| serial);
         self.ensure_default_metadata()?;
         let mut adopted = 0usize;
+        let mut adopted_ids: Vec<u32> = Vec::new();
         let mut wrote = false;
         {
             let md = self.default_metadata.as_ref().unwrap();
@@ -1315,9 +1743,18 @@ impl RoutingEngine {
                 } else {
                     let cur = self.stream_target(s.id);
                     match cur.target_object.as_deref() {
-                        None | Some("") => {
-                            default_serial.as_deref() == Some(chosen_serial.as_str())
-                        }
+                        // No metadata target: only adopt on link evidence.
+                        // The old `default == chosen` arm also fired for
+                        // brand-new streams whose metadata simply had not
+                        // arrived yet (pw-play et al. set node properties
+                        // first, metadata follows), arming them for the
+                        // default device before their real target was known
+                        // -- and recording them, so the correct chain skipped
+                        // them forever (late-stream race). A still-linkless
+                        // paused stream waits too; its first links re-flag
+                        // dirty and the next pass decides with full
+                        // information. Reroute takes everything regardless.
+                        None | Some("") => linked_here || linked_into_own_eq,
                         Some(t) => t == chosen_serial,
                     }
                 };
@@ -1335,13 +1772,19 @@ impl RoutingEngine {
                 self.routed_targets.lock().unwrap().insert(s.id, cur);
                 info!("Adopted stream '{}' ({}) into {eq}", s.node_name, s.id);
                 adopted += 1;
+                adopted_ids.push(s.id);
                 wrote = true;
             }
         }
         if wrote {
-            *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial));
+            *self.last_route_target.lock().unwrap() = Some((virt_id, virt_serial.clone()));
             self.roundtrip()?;
         }
+        // Read-back verification with link fallback (no-op where metadata
+        // took), plus healing for streams adopted on earlier passes.
+        // Deferred read-back verification (see `defer_verify`).
+        self.defer_verify(&adopted_ids, virt_id, &virt_serial, &eq);
+        self.heal_fallback_links();
         Ok(adopted)
     }
 
@@ -1397,6 +1840,11 @@ impl RoutingEngine {
             self.roundtrip()?;
             info!("Suspended routing for {moved} stream(s) across the engine rebuild");
         }
+        // The rebuild destroys the EQ nodes, and the daemon drops every link
+        // into them -- including our fallbacks. Forget the ids now; the
+        // re-route after the rebuild re-verifies each stream from scratch.
+        self.fallback_links.lock().unwrap().clear();
+        self.pending_verify.clear();
         Ok(())
     }
 
@@ -1468,6 +1916,7 @@ impl RoutingEngine {
             }
         }
         let mut routed = 0usize;
+        let mut routed_ids: Vec<u32> = Vec::new();
         let mut skipped_dont_move = 0usize;
         for node in &streams {
             let node_id = &node.id;
@@ -1516,10 +1965,17 @@ impl RoutingEngine {
                         name, node_id, sink_name, sink_id, sink_serial
                     );
                     routed += 1;
+                    routed_ids.push(*node_id);
                 }
                 Err(e) => warn!("Failed to route '{}' ({}): {}", name, node_id, e),
             }
         }
+
+        // Read-back verification with link fallback where the metadata write
+        // did not take (sandboxed daemon). No-op where it did.
+        // Deferred read-back verification (see `defer_verify`).
+        self.defer_verify(&routed_ids, sink_id, &sink_serial, sink_name);
+        self.heal_fallback_links();
 
         self.set_current_sink(sink_name);
         self.auto_route = true;
@@ -1681,6 +2137,15 @@ impl RoutingEngine {
         self.routed_targets.lock().unwrap().clear();
         *self.last_route_target.lock().unwrap() = None;
         self.routed = false;
+        // Every chain is down: no stream may keep a fallback link anywhere,
+        // and no pending verification may fire afterwards. Drop the whole
+        // map, not just restored ids: entries for vanished streams would
+        // otherwise orphan (nobody owns them any more, so heal would keep
+        // their links forever).
+        let released: Vec<u32> = restored_ids.into_iter().collect();
+        self.drop_fallback_links(&released);
+        self.pending_verify.clear();
+        self.fallback_links.lock().unwrap().clear();
         info!(
             "Unroute complete: {restored} stream(s) restored to their own target, {moved} to the fallback"
         );

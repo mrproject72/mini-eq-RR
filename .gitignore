@@ -1,2 +1,5 @@
 /target
 deps/
+
+# Live-test scratch dir (tests-live/live_test.sh writes tmp/live/ and cleans it).
+tmp/

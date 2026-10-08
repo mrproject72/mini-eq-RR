@@ -897,6 +897,12 @@ impl MiniEqWindow {
             let monitor_frozen_tick = monitor_frozen.clone();
             let monitor_display_gain_tick = monitor_display_gain.clone();
             let held_levels: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+            // Throttle for the verified-flow count published to D-Bus: the
+            // computation costs several registry passes, so it runs at most
+            // every 15th tick (~500 ms) and the cached value is published in
+            // between. Same cadence class as the 500 ms device watcher.
+            let flow_tick: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
+            let flow_cached: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
             // Auto-write-back debounce: the instant of the last edit that moved
             // the curve away from the linked preset. Cleared when the curve
             // comes back in sync, so a drag rewrites once ~1.5 s after it
@@ -1027,6 +1033,20 @@ impl MiniEqWindow {
                 let output_preset_for_state =
                     crate::core::output_preset_for_sink(&engine_sink.borrow());
                 let monitor_sink_for_state = crate::core::output_monitor_sink();
+                // Verified audio flow for GetState (`eq_flowing` /
+                // `flowing_streams`): several registry passes per computation,
+                // so recompute at most every 15th tick (~500 ms) and publish
+                // the cached value in between.
+                flow_tick.set(flow_tick.get().wrapping_add(1));
+                if flow_tick.get() % 15 == 0 {
+                    flow_cached.set(
+                        backend
+                            .borrow()
+                            .as_ref()
+                            .map(|be| be.flowing_count())
+                            .unwrap_or(0),
+                    );
+                }
                 app_state_handle.publish(
                     levels.clone(),
                     monitor_display_gain_tick.value(),
@@ -1047,6 +1067,7 @@ impl MiniEqWindow {
                     // The chain's true destination, every tick: a refused or
                     // failed output switch must never linger in GetState.
                     Some(engine_sink.borrow().clone()).filter(|s| !s.is_empty()),
+                    flow_cached.get(),
                 );
                 // Rate-limited inside AppState (upstream parity: 100 ms). Only
                 // while the monitor is running, matching upstream, which stops
@@ -1168,8 +1189,14 @@ impl MiniEqWindow {
                         if let Some(loud) = be.monitor_loudness() {
                             let lufs = loud.shortterm_lufs;
                             if lufs.is_finite() {
-                                monitor_loudness_value.set_text(&format!("{lufs:.1} LUFS"));
-                                monitor_summary.set_text(&format!("On \u{00b7} {lufs:.1} LUFS"));
+                                // set_text 30x/s with an identical string still
+                                // invalidates the label: only touch the widgets
+                                // when the displayed value actually moved.
+                                let lufs_text = format!("{lufs:.1} LUFS");
+                                if monitor_loudness_value.text() != lufs_text {
+                                    monitor_loudness_value.set_text(&lufs_text);
+                                    monitor_summary.set_text(&format!("On \u{00b7} {lufs_text}"));
+                                }
                             }
                         }
                     }
@@ -1526,6 +1553,11 @@ impl MiniEqWindow {
                     // Advance the pending monitor port-linking (non-blocking,
                     // bounded work per tick).
                     be.pump_monitor_link();
+                    // Deferred route verifications run on EVERY pump tick, not
+                    // just dirty ones: a stream whose property echo lagged the
+                    // write needs revisiting without waiting for a new event.
+                    // Early-out when nothing is pending.
+                    be.process_pending_verifies();
                     // Event-driven adoption: the registry/metadata listeners
                     // flag arrivals and moves; drain the flag into one pass.
                     // Idle cost is a single flag check.
