@@ -14,7 +14,6 @@ finish-args:
   - --device=dri
   - --filesystem=xdg-config/mini-eq
   - --filesystem=xdg-cache/mini-eq
-  - --filesystem=xdg-doc
   - --filesystem=xdg-run/pipewire-0:ro
   - --talk-name=org.freedesktop.Flatpak
   - --talk-name=io.github.mrproject72.mini_eq_rr
