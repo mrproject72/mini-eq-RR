@@ -197,15 +197,20 @@ pub struct RoutingEngine {
     /// the properties instead leaves the destination to WirePlumber's policy,
     /// which re-resolves from scratch and takes a visible moment of silence.
     routed_targets: Arc<Mutex<HashMap<u32, StreamTarget>>>,
-    /// Link ids this process created as a metadata-write fallback: stream id
-    /// -> (EQ sink node name, our link ids into it). Metadata writes are
-    /// silently discarded for sandboxed clients, so without real links the
-    /// adoption would be bookkeeping only. Destroyed when the stream is
-    /// handed back, unrouted, or the chain rebuilds (the daemon drops links
-    /// to dead nodes itself, but the map must not outlive the streams). The
-    /// EQ name travels with the entry so per-device teardown only touches
-    /// its own chain's links.
-    fallback_links: Arc<Mutex<HashMap<u32, (String, Vec<u32>)>>>,
+    /// Which of our EQ sinks a stream is link-held into (stream id -> EQ
+    /// sink node name). Metadata writes are silently discarded for sandboxed
+    /// clients, so without real links the adoption would be bookkeeping only.
+    /// Links are created with the `pw-link` tool (port-explicit refs, the
+    /// same mechanism as the monitor taps): in-process link-factory objects
+    /// for stream ports demonstrably never instantiate server-side, while
+    /// `pw-link` links go active and persist for 30+ minutes, including from
+    /// inside the sandbox. Destroyed when the stream is handed back,
+    /// unrouted, or the chain rebuilds. The EQ name travels with the entry
+    /// so per-device teardown only touches its own chain's links. Link ids
+    /// are deliberately NOT tracked: teardown destroys whatever is live for
+    /// the stream into that EQ (ours -- the session manager never links
+    /// there while our metadata is absent).
+    fallback_links: Arc<Mutex<HashMap<u32, String>>>,
     /// Streams whose metadata write is awaiting read-back confirmation:
     /// stream id -> (EQ node id, EQ serial, EQ name, act no earlier than).
     /// Our own write's property echo has been observed to arrive after the
@@ -1344,81 +1349,6 @@ impl RoutingEngine {
         name.rsplit('_').next().unwrap_or(name)
     }
 
-    /// Wire real port links stream -> EQ sink, pairing output to input ports
-    /// by channel (FL->FL, FR->FR). Node-level auto-mapping (`link.output.node`
-    /// alone) demonstrably creates nothing usable here -- the daemon silently
-    /// drops it -- while explicit port links (the same `pw-link` builds) go
-    /// active and persist, including from inside the sandbox. A single
-    /// unmatched output (mono) fans out to every input (standard upmix).
-    fn link_stream_to_sink(&self, stream_id: u32, eq_id: u32) -> Result<Vec<u32>, Error> {
-        let ports = self.stream_audio_ports();
-        let outs: Vec<(u32, String)> = ports
-            .get(&stream_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, _, d)| d == "out")
-                    .map(|(id, n, _)| (*id, n.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let ins: Vec<(u32, String)> = ports
-            .get(&eq_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, _, d)| d == "in")
-                    .map(|(id, n, _)| (*id, n.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if outs.is_empty() || ins.is_empty() {
-            warn!("Stream {stream_id}: no output/input ports to link (stream or EQ ports missing)");
-            return Err(Error::CreationFailed);
-        }
-        let mut pairs: Vec<(u32, u32)> = Vec::new();
-        let mut used_in: HashSet<u32> = HashSet::new();
-        for (oid, oname) in &outs {
-            if let Some((iid, _)) = ins.iter().find(|(iid, iname)| {
-                !used_in.contains(iid) && Self::port_channel(iname) == Self::port_channel(oname)
-            }) {
-                pairs.push((*oid, *iid));
-                used_in.insert(*iid);
-            }
-        }
-        if pairs.is_empty() && outs.len() == 1 {
-            // Mono into stereo: fan out to every input.
-            for (iid, _) in &ins {
-                pairs.push((outs[0].0, *iid));
-            }
-        }
-        if pairs.is_empty() {
-            warn!("Stream {stream_id}: no channel pairing between stream and EQ ports");
-            return Err(Error::CreationFailed);
-        }
-        let mut created = Vec::with_capacity(pairs.len());
-        for (oport, iport) in pairs {
-            let link_props = properties! {
-                "link.output.node" => stream_id.to_string().as_str(),
-                "link.output.port" => oport.to_string().as_str(),
-                "link.input.node" => eq_id.to_string().as_str(),
-                "link.input.port" => iport.to_string().as_str(),
-            };
-            let link = self
-                .core
-                .create_object::<Link>("link-factory", &link_props)
-                .inspect_err(|e| warn!("link-factory create failed: {}", e))?;
-            let lid = link.upcast().id();
-            self.links.lock().unwrap().push(RouteInfo {
-                route_id: stream_id,
-                source_node: stream_id,
-                target_node: eq_id,
-                link_id: lid,
-            });
-            info!("Created link {lid} ({stream_id}:{oport} -> {eq_id}:{iport})");
-            created.push(lid);
-        }
-        Ok(created)
-    }
-
     /// Map each playback stream to the sink node names it is actually linked
     /// into, from live Link objects.
     ///
@@ -1516,13 +1446,23 @@ impl RoutingEngine {
     /// Destroy our fallback links for `stream_ids` and forget them. Called
     /// whenever streams leave our ownership (hand-back, unroute, rebuild):
     /// a surviving fallback link would keep feeding a dead chain or double
-    /// the audio once metadata routing works again.
+    /// the audio once metadata routing works again. Destroys whatever is
+    /// live for the stream into its recorded EQ (no id tracking: ids go
+    /// stale across daemon restarts, live-matching does not).
     fn drop_fallback_links(&self, stream_ids: &[u32]) {
+        if stream_ids.is_empty() {
+            return;
+        }
         let mut map = self.fallback_links.lock().unwrap();
+        let link_details = self.stream_link_details();
         for id in stream_ids {
-            if let Some((_, lids)) = map.remove(id) {
-                for lid in lids {
-                    Self::destroy_link_object(lid);
+            if let Some(eq) = map.remove(id) {
+                if let Some(links) = link_details.get(id) {
+                    for (lid, sink) in links {
+                        if sink == &eq {
+                            Self::destroy_link_object(*lid);
+                        }
+                    }
                 }
             }
         }
@@ -1561,7 +1501,7 @@ impl RoutingEngine {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, (name, _))| name == eq_name)
+            .filter(|(_, name)| *name == eq_name)
             .map(|(id, _)| *id)
             .collect();
         self.drop_fallback_links(&ids);
@@ -1663,6 +1603,42 @@ impl RoutingEngine {
     /// links, recording ours for teardown. Returns true when our path is in
     /// place. Link first, sever second: the stream must never be pathless in
     /// between.
+    /// Spawn `pw-link` with port refs, waiting up to 10 s. Mirrors the
+    /// monitor-tap path (same proven mechanism): in-process link-factory
+    /// objects for stream ports never instantiate server-side, while
+    /// `pw-link` links go active and persist, including from the sandbox.
+    fn run_pw_link_refs(refs: &[String]) -> bool {
+        let out = std::process::Command::new("pw-link")
+            .args(refs)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                info!("pw-link linked {}", refs.join(" "));
+                true
+            }
+            Ok(o) => {
+                warn!(
+                    "pw-link {} failed: {} {}",
+                    refs.join(" "),
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(e) => {
+                warn!("pw-link could not spawn: {e}");
+                false
+            }
+        }
+    }
+
+    /// Wire real port links stream -> EQ sink via `pw-link` (see
+    /// [`Self::run_pw_link_refs` for why not link-factory]) and sever the
+    /// competing direct links. Records the EQ name for teardown. Returns
+    /// true when links into the EQ are observably live afterwards.
+    /// Link first, sever second: the stream is never pathless in between.
     fn link_stream_fallback(
         &self,
         stream_id: u32,
@@ -1677,29 +1653,78 @@ impl RoutingEngine {
             self.drop_fallback_links(&[stream_id]);
             return true;
         }
+        if !self.list_stream_nodes().iter().any(|s| s.id == stream_id) {
+            return false;
+        };
+        let ports = self.stream_audio_ports();
+        let outs: Vec<(u32, String)> = ports
+            .get(&stream_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "out")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ins: Vec<(u32, String)> = ports
+            .get(&virt_id)
+            .map(|v| {
+                v.iter()
+                    .filter(|(_, _, d)| d == "in")
+                    .map(|(id, n, _)| (*id, n.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Pair outputs to inputs by channel suffix (FL->FL, FR->FR); a lone
+        // output fans out to every input (mono upmix).
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut used_in: HashSet<u32> = HashSet::new();
+        for (oid, oname) in &outs {
+            if let Some((iid, _)) = ins.iter().find(|(iid, iname)| {
+                !used_in.contains(iid) && Self::port_channel(iname) == Self::port_channel(oname)
+            }) {
+                pairs.push((*oid, *iid));
+                used_in.insert(*iid);
+            }
+        }
+        if pairs.is_empty() && outs.len() == 1 {
+            for (iid, _) in &ins {
+                pairs.push((outs[0].0, *iid));
+            }
+        }
+        if pairs.is_empty() {
+            warn!("Stream {stream_id}: no channel pairing between stream and EQ ports");
+            return false;
+        }
         warn!(
             "Stream {stream_id}: metadata write did not take (sandboxed daemon?) -- linking into {eq_name} directly"
         );
-        match self.link_stream_to_sink(stream_id, virt_id) {
-            Ok(lids) => {
-                // (Re)point the entry at this chain: a stream re-adopted
-                // elsewhere drops its old entry at prune time, but be
-                // explicit -- a stale name would misroute teardown.
-                self.fallback_links
-                    .lock()
-                    .unwrap()
-                    .entry(stream_id)
-                    .and_modify(|e| {
-                        e.0 = eq_name.to_string();
-                        e.1.extend(lids.iter().cloned());
-                    })
-                    .or_insert_with(|| (eq_name.to_string(), lids));
-            }
-            Err(e) => {
-                warn!("Stream {stream_id}: fallback link into {eq_name} failed: {e}");
-                return false;
-            }
+        // Global port ids, not `node:port` names: duplicate stream names
+        // (two players, two test tones) make names ambiguous, ids exact.
+        let mut refs: Vec<String> = Vec::with_capacity(pairs.len() * 2);
+        for (oport, iport) in &pairs {
+            refs.push(oport.to_string());
+            refs.push(iport.to_string());
         }
+        if !Self::run_pw_link_refs(&refs) {
+            return false;
+        }
+        // Verify: only record (and only sever) when the links are live.
+        // A "success" exit with no links means the daemon is humouring us.
+        let link_details = self.stream_link_details();
+        if !link_details
+            .get(&stream_id)
+            .is_some_and(|v| v.iter().any(|(_, n)| n == eq_name))
+        {
+            warn!(
+                "Stream {stream_id}: pw-link reported success but no links into {eq_name} appeared"
+            );
+            return false;
+        }
+        self.fallback_links
+            .lock()
+            .unwrap()
+            .insert(stream_id, eq_name.to_string());
         self.sever_direct_links(stream_id, &link_details);
         true
     }
@@ -1762,7 +1787,7 @@ impl RoutingEngine {
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, (eq, _))| (*id, eq.clone()))
+            .map(|(id, eq)| (*id, eq.clone()))
             .collect();
         if owned.is_empty() {
             return;
@@ -1779,45 +1804,44 @@ impl RoutingEngine {
             // contains physical/default serials, and matching those once
             // dropped good fallback links for a stream merely sitting on its
             // original device ("metadata path live" lie -> silence).
-            let eq_serial = self.find_node_target(&eq_name).map(|(_, s)| s);
-            let meta_on_eq = eq_serial.as_deref().is_some_and(|serial| {
-                self.stream_target(id).target_object.as_deref() == Some(serial)
+            let eq_target = self.find_node_target(&eq_name);
+            let meta_on_eq = eq_target.as_ref().is_some_and(|(_, serial)| {
+                self.stream_target(id).target_object.as_deref() == Some(serial.as_str())
             });
-            let ours: Vec<u32> = self
-                .fallback_links
-                .lock()
-                .unwrap()
+            let linked_to_us = link_details
                 .get(&id)
-                .map(|(_, lids)| lids.clone())
-                .unwrap_or_default();
-            let wp_linked = link_details.get(&id).is_some_and(|v| {
-                v.iter()
-                    .any(|(lid, n)| n == &eq_name && !ours.contains(lid))
-            });
-            if meta_on_eq && wp_linked {
-                // Independent path live: ours must go, or the stream doubles.
-                info!(
-                    "Stream {id}: session-manager path live, dropping fallback links (no-double)"
-                );
-                self.drop_fallback_links(&[id]);
-            } else if meta_on_eq || wp_linked {
-                // Converging (metadata ahead of links or vice versa): hold
-                // our path until BOTH agree, so there is never a gap.
-                // Re-sever anything rebuilt direct meanwhile.
+                .is_some_and(|v| v.iter().any(|(_, n)| n == &eq_name));
+            if meta_on_eq {
+                // Metadata path live: exactly one path may feed the EQ, so
+                // destroy whatever links the stream holds into it and forget
+                // the entry. Where metadata works the session manager
+                // re-establishes its own links from the target within a
+                // tick (one brief handoff blip, only in the race where we
+                // linked first); where it never takes (sandbox) this branch
+                // never fires. Either way no double, no orphan.
+                if let Some(links) = link_details.get(&id) {
+                    for (lid, sink) in links {
+                        if sink == &eq_name {
+                            Self::destroy_link_object(*lid);
+                        }
+                    }
+                }
+                self.fallback_links.lock().unwrap().remove(&id);
+            } else if linked_to_us {
+                // Link-held with metadata still elsewhere (sandbox steady
+                // state): re-sever anything rebuilt direct.
                 self.sever_direct_links(id, &link_details);
-            } else {
+            } else if let Some((virt_id, serial)) = eq_target {
                 // Our links died and metadata never took (chain rebuild,
                 // daemon dropped them, or the verify raced a slow broadcast
                 // and never linked). Re-wire rather than forget: the stream
                 // is still recorded as ours, so adoption would skip it and
                 // it would sit pathless forever.
-                if let Some((virt_id, serial)) = self.find_node_target(&eq_name) {
-                    self.link_stream_fallback(id, virt_id, &serial, &eq_name);
-                } else {
-                    // Chain itself is gone; forget the entry (teardown for
-                    // dead chains runs on the rebuild path).
-                    self.fallback_links.lock().unwrap().remove(&id);
-                }
+                self.link_stream_fallback(id, virt_id, &serial, &eq_name);
+            } else {
+                // Chain itself is gone; forget the entry (teardown for
+                // dead chains runs on the rebuild path).
+                self.fallback_links.lock().unwrap().remove(&id);
             }
         }
     }
