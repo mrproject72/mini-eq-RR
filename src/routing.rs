@@ -468,6 +468,13 @@ impl RoutingEngine {
         }
     }
 
+    /// Whether this device's EQ is switched on -- the per-device A/B state
+    /// the tick pushes to the chain (the switch itself is the selected
+    /// device's state, so a global push would bypass every other device).
+    pub fn is_device_eq_enabled(&self, physical_sink: &str) -> bool {
+        self.eq_wanted.contains(physical_sink)
+    }
+
     /// Record the UI-selected output device (Reroute target for late streams).
     pub fn set_selected_sink(&mut self, physical_sink: &str) {
         self.selected_sink = Some(physical_sink.to_string());
@@ -666,11 +673,40 @@ impl RoutingEngine {
         &self,
         stream: &StreamNode,
         sink_serial: &str,
+        sink_name: &str,
         default_serial: Option<&str>,
+        default_name: Option<&str>,
         mode: crate::core::OutputRoutingMode,
     ) -> bool {
         let target = self.stream_target(stream.id).target_object;
-        Self::scope_allows(target.as_deref(), sink_serial, default_serial, mode)
+        if !Self::scope_allows(target.as_deref(), sink_serial, default_serial, mode) {
+            return false;
+        }
+        // `pw-play --target=X` and friends set the target in node properties,
+        // not metadata: such a stream reads as target=None and the check
+        // above treats it as default-aimed, sweeping it into this device's
+        // chain even when it is audibly playing on ANOTHER device (the
+        // two-device test: the Logitech-aimed tone landed in the default
+        // device's EQ). Live link evidence decides: a link into a sink that
+        // is neither this scope, the default it feeds, nor our own machinery
+        // puts the stream out of scope here. Selected only -- Reroute takes
+        // everything regardless of where a stream is linked.
+        if mode == crate::core::OutputRoutingMode::Selected
+            && target.as_deref().is_none_or(str::is_empty)
+        {
+            let linked_elsewhere = self.stream_link_targets().get(&stream.id).is_some_and(|v| {
+                v.iter().any(|n| {
+                    n != sink_name
+                        && Some(n.as_str()) != default_name
+                        && !n.starts_with(crate::core::VIRTUAL_SINK_BASE)
+                        && !n.starts_with("mini-eq-analyzer")
+                })
+            });
+            if linked_elsewhere {
+                return false;
+            }
+        }
+        true
     }
 
     /// Streams we may route: not ours, not blocklisted, and not already
@@ -784,6 +820,9 @@ impl RoutingEngine {
             .clone()
             .and_then(|n| self.find_node_target(&n))
             .map(|(_, serial)| serial);
+        // The default device's NAME, for link-evidence comparisons in
+        // `is_in_scope` (link targets are node names, not serials).
+        let default_name: Option<String> = self.default_audio_sink.borrow().clone();
         if std::env::var("MINI_EQ_DEBUG_ROUTING").is_ok() {
             info!("routable filter: allowed targets = {allowed:?}");
             for s in self.list_stream_nodes() {
@@ -815,7 +854,9 @@ impl RoutingEngine {
                                 if self.is_in_scope(
                                     &s,
                                     &sink_serial,
+                                    sink_name,
                                     default_serial.as_deref(),
+                                    default_name.as_deref(),
                                     mode,
                                 ) {
                                     "ROUTABLE"
@@ -848,7 +889,16 @@ impl RoutingEngine {
                     _ => true,
                 }
             })
-            .filter(|s| self.is_in_scope(s, &sink_serial, default_serial.as_deref(), mode))
+            .filter(|s| {
+                self.is_in_scope(
+                    s,
+                    &sink_serial,
+                    sink_name,
+                    default_serial.as_deref(),
+                    default_name.as_deref(),
+                    mode,
+                )
+            })
             .collect()
     }
 

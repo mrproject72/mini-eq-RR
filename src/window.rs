@@ -1280,6 +1280,14 @@ impl MiniEqWindow {
                                 be.set_device_bands(dev, bands.clone());
                                 be.set_device_preamp(dev, preamp_db);
                             }
+                            // The GLOBAL A/B bypass state (upstream
+                            // semantics): the A/B switch is one switch for
+                            // all chains, while the route switch is the
+                            // per-device engage/disengage. Pushing the
+                            // per-device route state here would make the A/B
+                            // switch inert; pushing the A/B state per-device
+                            // would bypass other devices' chains when it is
+                            // global by design.
                             match be.device_push_live(dev, eq_enabled) {
                                 Ok(true) => {
                                     pending.remove(dev);
@@ -1626,17 +1634,22 @@ impl MiniEqWindow {
                     be.set_output_mode(mode);
                     let dev = engine_sink_for_switch.borrow().clone();
                     if !dev.is_empty() {
-                        // Chain for THIS device, created on first enable. Its
-                        // starting curve comes from the device's linked preset
-                        // (or the fallback/neutral default), never from another
-                        // device's curve.
+                        // The device's linked curve applies on EVERY
+                        // route-on, not only at chain creation: a chain
+                        // created at startup (persisted eq_enabled) runs the
+                        // neutral default, and its linked preset would never
+                        // load (the two-device test: one device played flat
+                        // while the other device's curve was audible).
+                        let (bands, preamp) = device_initial_curve(&dev);
                         if !be.has_device_chain(&dev) {
-                            let (bands, preamp) = device_initial_curve(&dev);
                             if let Err(e) = be.ensure_device_chain(&dev, bands) {
                                 log::warn!("EQ on: failed to start EQ for {dev}: {e}");
                             } else {
                                 be.set_device_preamp(&dev, preamp);
                             }
+                        } else {
+                            be.set_device_bands(&dev, bands);
+                            be.set_device_preamp(&dev, preamp);
                         }
                         be.set_current_sink(&dev);
                         // Remember the intent even with zero streams: streams
