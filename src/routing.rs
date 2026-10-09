@@ -1493,18 +1493,6 @@ impl RoutingEngine {
         pairs
     }
 
-    /// `pw-link` ref list for port pairs: global port ids, not `node:port`
-    /// names -- duplicate stream names (two players, two test tones) make
-    /// names ambiguous, ids exact.
-    fn port_id_refs(pairs: &[(u32, u32)]) -> Vec<String> {
-        let mut refs: Vec<String> = Vec::with_capacity(pairs.len() * 2);
-        for (oport, iport) in pairs {
-            refs.push(oport.to_string());
-            refs.push(iport.to_string());
-        }
-        refs
-    }
-
     /// Restore a fallback-held stream into `device` with real port links
     /// (the sandboxed daemon discards restore metadata writes), verifying
     /// the links are live before the caller drops the EQ link. Link-first
@@ -1523,15 +1511,28 @@ impl RoutingEngine {
             warn!("UnrouteDevice: no channel pairing between stream {stream_id} and {device}");
             return false;
         }
-        let refs = Self::port_id_refs(&pairs);
-        if !Self::run_pw_link_refs(&refs) {
-            return false;
+        // One pw-link invocation PER PAIR (see link_stream_fallback): all
+        // pairs on one command line create only the first -- mono audio.
+        for (oport, iport) in &pairs {
+            if !Self::run_pw_link_refs(&["-w".to_string(), oport.to_string(), iport.to_string()]) {
+                return false;
+            }
         }
         // Verify before the caller drops the EQ link: a "success" exit with
-        // no live links into the device means the stream would go silent.
-        self.stream_link_details()
+        // fewer live links than pairs means the stream would collapse.
+        let live = self
+            .stream_link_details()
             .get(&stream_id)
-            .is_some_and(|v| v.iter().any(|(_, n)| n == device))
+            .map(|v| v.iter().filter(|(_, n)| n == device).count())
+            .unwrap_or(0);
+        if live < pairs.len() {
+            warn!(
+                "UnrouteDevice: pw-link reported success but {live}/{} links into {device} appeared",
+                pairs.len()
+            );
+            return false;
+        }
+        true
     }
 
     /// Map each playback stream to the sink node names it is actually linked
@@ -1849,19 +1850,39 @@ impl RoutingEngine {
         warn!(
             "Stream {stream_id}: metadata write did not take (sandboxed daemon?) -- linking into {eq_name} directly"
         );
-        let refs = Self::port_id_refs(&pairs);
-        if !Self::run_pw_link_refs(&refs) {
-            return false;
+        // One pw-link invocation PER PAIR: pw-link connects exactly one
+        // output/input pair per run -- all pairs on one command line create
+        // only the first (the two-device verification: Waterfox's FR channel
+        // never linked and the stream played mono). Global port ids, not
+        // `node:port` names: duplicate stream names make names ambiguous.
+        for (oport, iport) in &pairs {
+            if !Self::run_pw_link_refs(&["-w".to_string(), oport.to_string(), iport.to_string()]) {
+                // Partial channels = mono/collapsed audio: destroy whatever
+                // landed (the heal also cleans orphans) and leave the stream
+                // on its device, where it is at least stereo.
+                let link_details = self.stream_link_details();
+                if let Some(links) = link_details.get(&stream_id) {
+                    for (lid, sink) in links {
+                        if sink == eq_name {
+                            Self::destroy_link_object(*lid);
+                        }
+                    }
+                }
+                return false;
+            }
         }
-        // Verify: only record (and only sever) when the links are live.
-        // A "success" exit with no links means the daemon is humouring us.
+        // Verify server-side before recording (and severing): a "success"
+        // exit with fewer live links than pairs means the daemon is
+        // humouring us.
         let link_details = self.stream_link_details();
-        if !link_details
+        let live = link_details
             .get(&stream_id)
-            .is_some_and(|v| v.iter().any(|(_, n)| n == eq_name))
-        {
+            .map(|v| v.iter().filter(|(_, n)| n == eq_name).count())
+            .unwrap_or(0);
+        if live < pairs.len() {
             warn!(
-                "Stream {stream_id}: pw-link reported success but no links into {eq_name} appeared"
+                "Stream {stream_id}: pw-link reported success but {live}/{} links into {eq_name} appeared",
+                pairs.len()
             );
             return false;
         }
