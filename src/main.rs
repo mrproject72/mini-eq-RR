@@ -57,6 +57,24 @@ enum Commands {
 // (see `AppState` there for the command queue that bridges the `Send` D-Bus
 // vtable to the main-thread GTK objects)
 fn main() {
+    // Capture panics into the log before the default hook: the GTK event
+    // closures abort the process on unwind, so without this a crash in a
+    // draw/drag callback leaves no trace beyond a vanished process.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("PANIC: {info}");
+        if let Some(loc) = info.location() {
+            log::error!(
+                "PANIC at {}:{}:{} (thread: {:?})",
+                loc.file(),
+                loc.line(),
+                loc.column(),
+                std::thread::current().name().unwrap_or("<unnamed>")
+            );
+        }
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
 
     // One-shot subcommands and `--check-deps` do not touch PipeWire, so they run
