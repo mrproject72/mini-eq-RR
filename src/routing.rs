@@ -468,9 +468,9 @@ impl RoutingEngine {
         }
     }
 
-    /// Whether this device's EQ is switched on -- the per-device A/B state
-    /// the tick pushes to the chain (the switch itself is the selected
-    /// device's state, so a global push would bypass every other device).
+    /// Whether this device's EQ is switched on -- the per-device state the
+    /// chain rebuild follows (a rebuilt chain re-routes only when its device
+    /// was on), and the per-device A/B source.
     pub fn is_device_eq_enabled(&self, physical_sink: &str) -> bool {
         self.eq_wanted.contains(physical_sink)
     }

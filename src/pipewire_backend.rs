@@ -320,7 +320,7 @@ impl PipeWireBackend {
             &virtual_sink,
             &filter_output,
             physical_sink,
-            false,
+            true,
         );
         let c_name = CString::new(filter_chain::FILTER_CHAIN_MODULE_NAME)
             .map_err(|_| Error::CreationFailed)?;
@@ -435,12 +435,13 @@ impl PipeWireBackend {
             Some(n) => n,
             None => return Ok(false),
         };
-        let controls = filter_chain::bq_raw_control_values(
-            &chain.bands,
-            chain.preamp_gain,
-            eq_enabled,
-            crate::core::SAMPLE_RATE,
-        );
+        // The native-biquad control set (Freq/Q/Gain per `_filter` node +
+        // the mixer Gain 1/2 crossfade + the preamp's raw b0..a2) — the
+        // upstream production strategy. The bq_raw band set (raw
+        // coefficients) was tried and its live pushes never landed in the
+        // flatpak sandbox; the native variant's do.
+        let controls =
+            filter_chain::native_biquad_control_values(&chain.bands, chain.preamp_gain, eq_enabled);
         if controls.is_empty() {
             return Ok(true);
         }
@@ -779,6 +780,46 @@ impl PipeWireBackend {
     /// [`RoutingEngine::adopt_new_streams`]).
     pub fn set_device_eq_enabled(&mut self, physical_sink: &str, on: bool) {
         self.routing.set_device_eq_wanted(physical_sink, on);
+    }
+
+    /// Whether this device's EQ is switched on (per-device A/B state).
+    pub fn is_device_eq_enabled(&self, physical_sink: &str) -> bool {
+        self.routing.is_device_eq_enabled(physical_sink)
+    }
+
+    /// Rebuild one device's chain with new bands: the native-biquad labels
+    /// are graph topology, so a filter-type/preset change cannot be pushed
+    /// live (the live controls carry Freq/Q/Gain and the mixer crossfade,
+    /// not the label) -- the upstream `restart_engine` semantics, per
+    /// device. Streams are restored before the chain dies and re-routed
+    /// after, so the audio never plays around the EQ and never goes silent.
+    /// Ordinary frequency/Q/gain edits stay live (the caller decides).
+    pub fn rebuild_device_chain(
+        &mut self,
+        physical_sink: &str,
+        bands: Vec<EqBand>,
+    ) -> Result<bool, Error> {
+        if physical_sink.is_empty() {
+            return Err(Error::CreationFailed);
+        }
+        let was_wanted = self.routing.is_device_eq_enabled(physical_sink);
+        if self.device_chains.borrow().contains_key(physical_sink) {
+            // Hand the streams back first: the chain's death drops every
+            // link into it, and a deliberate restore is faster and more
+            // predictable than WirePlumber's recovery. The device's EQ off
+            // for the hand-off only; the wanted set is restored below.
+            let _ = self.unroute_device(physical_sink, Some(physical_sink));
+            self.drop_device_chain(physical_sink);
+        }
+        let created = self.ensure_device_chain(physical_sink, bands)?;
+        if was_wanted && created {
+            self.set_device_eq_enabled(physical_sink, true);
+            let eq = crate::core::eq_virtual_sink_for(physical_sink);
+            if let Err(e) = self.auto_route_to_sink(&eq) {
+                log::warn!("Chain rebuild: re-route failed: {e}");
+            }
+        }
+        Ok(created)
     }
 
     /// Record the UI-selected output device (Reroute target for late streams).

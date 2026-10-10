@@ -1281,9 +1281,39 @@ impl MiniEqWindow {
                                 bands.len(),
                                 bands.iter().map(|b| b.gain_db).collect::<Vec<_>>()
                             );
+                            // Only the SELECTED device's edits are the band
+                            // payload: the faders show its curve, and pushing
+                            // it to any other device's chain would cross
+                            // curves.
                             if *dev == selected && !selected.is_empty() {
-                                be.set_device_bands(dev, bands.clone());
-                                be.set_device_preamp(dev, preamp_db);
+                                // Native-biquad labels are graph topology, not
+                                // mutable controls: a filter-type (or preset that
+                                // changes types) cannot ride a live push -- the
+                                // pushed controls carry Freq/Q/Gain and the mixer
+                                // crossfade, never the label. Rebuild the chain
+                                // once per type change (the upstream
+                                // restart_engine semantics, per device);
+                                // ordinary frequency/Q/gain edits stay live.
+                                let types_differ = be
+                                    .device_bands(dev)
+                                    .map(|cur| {
+                                        cur.len() != bands.len()
+                                            || cur
+                                                .iter()
+                                                .zip(&bands)
+                                                .any(|(a, b)| a.filter_type != b.filter_type)
+                                    })
+                                    .unwrap_or(false);
+                                if types_differ {
+                                    if let Err(e) = be.rebuild_device_chain(dev, bands.clone()) {
+                                        log::warn!(
+                                            "EQ on: chain rebuild for type change failed: {e}"
+                                        );
+                                    }
+                                } else {
+                                    be.set_device_bands(dev, bands.clone());
+                                    be.set_device_preamp(dev, preamp_db);
+                                }
                             }
                             // The GLOBAL A/B bypass state (upstream
                             // semantics): the A/B switch is one switch for
