@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use glib::translate::IntoGlib;
+use glib::translate::ToGlibPtr;
+
 use crate::analyzer::analyzer_level_to_display_norm;
 use crate::core::{APP_ID, sanitize_preset_name};
 use crate::window_presets::list_preset_names;
@@ -300,8 +303,9 @@ pub struct MiniEqDBusControl {
     connection: Arc<Mutex<Option<gio::DBusConnection>>>,
     registration_id: Arc<Mutex<Option<gio::RegistrationId>>>,
     /// Owner id for the well-known bus name. Must be retained for as long as
-    /// the name should stay owned; dropping it releases the name.
-    bus_owner_id: Arc<Mutex<Option<gio::OwnerId>>>,
+    /// the name should stay owned; released via `g_bus_unown_name` in
+    /// [`Self::unregister`].
+    bus_owner_id: Arc<Mutex<Option<u32>>>,
 }
 
 impl MiniEqDBusControl {
@@ -358,13 +362,26 @@ impl MiniEqDBusControl {
         // the GNOME Shell extension get ServiceUnknown. This used to live only
         // in `acquire_bus_name()`, which nothing called, so the control
         // interface was unreachable in practice.
-        let owner_id = gio::bus_own_name_on_connection(
-            &connection,
-            BUS_NAME,
-            gio::BusNameOwnerFlags::REPLACE,
-            |_conn, _name| {},
-            |_conn, _name| {},
-        );
+        // Null-safe closures, NOT gio::bus_own_name_on_connection: that
+        // wrapper's name callbacks do `args[0].get::<DBusConnection>()
+        // .unwrap()` -- non-optional -- while GIO invokes the name callbacks
+        // with a NULL connection during teardown (observed on Ctrl+C: the
+        // panic killed the process before the routing restore ran). The
+        // callbacks are no-ops; only null-safety matters here.
+        let name_acquired = glib::Closure::new_local(move |args| {
+            if let Ok(Some(_conn)) = args[0].get::<Option<gio::DBusConnection>>() {}
+            None
+        });
+        let name_lost = name_acquired.clone();
+        let owner_id = unsafe {
+            gio::ffi::g_bus_own_name_on_connection_with_closures(
+                connection.to_glib_none().0,
+                BUS_NAME.to_glib_none().0,
+                gio::BusNameOwnerFlags::REPLACE.into_glib(),
+                name_acquired.to_glib_none().0,
+                name_lost.to_glib_none().0,
+            )
+        };
         *self.bus_owner_id.lock().unwrap() = Some(owner_id);
         Ok(())
     }
@@ -379,10 +396,11 @@ impl MiniEqDBusControl {
     pub fn unregister(&self) {
         // Unown the name FIRST: gio's name callbacks are invoked with a
         // null connection once the connection is torn down, and the
-        // closure's `args[0].get::<DBusConnection>().unwrap()` panics
+        // wrapper's `args[0].get::<DBusConnection>().unwrap()` panics
         // (observed on Ctrl+C mid-shutdown, killing the restore).
-        // Dropping the OwnerId unowns the name.
-        self.bus_owner_id.lock().unwrap().take();
+        if let Some(id) = self.bus_owner_id.lock().unwrap().take() {
+            unsafe { gio::ffi::g_bus_unown_name(id) };
+        }
         let conn = self.connection.lock().unwrap().clone();
         let reg_id = self.registration_id.lock().unwrap().take();
         if let Some(connection) = conn
