@@ -2456,9 +2456,51 @@ impl RoutingEngine {
         self.routed = false;
         // Every chain is down: no stream may keep a fallback link anywhere,
         // and no pending verification may fire afterwards. Drop the whole
-        // map, not just restored ids: entries for vanished streams would
-        // otherwise orphan (nobody owns them any more, so heal would keep
-        // their links forever).
+        // Sandbox: the restore metadata writes above are discarded by the
+        // daemon, so streams held by fallback links would go pathless the
+        // moment those links are dropped. Restore each held stream with real
+        // port links into its recorded original device (or the exit
+        // fallback) FIRST -- link before drop, never pathless -- then
+        // destroy the stream's links into the EQ. A failed restore keeps the
+        // link: a bypassed stream is better than a silent one on the way out.
+        {
+            let device_default = fallback_sink.unwrap_or_default().to_string();
+            let held: Vec<(u32, String)> = self
+                .fallback_links
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, eq)| (*id, eq.clone()))
+                .collect();
+            for (id, eq) in held {
+                let device_name = match self.routed_targets.lock().unwrap().get(&id) {
+                    Some(r) if r.target_node_type.as_deref() != Some("Spa:Id") => r
+                        .target_node
+                        .clone()
+                        .unwrap_or_else(|| device_default.clone()),
+                    _ => device_default.clone(),
+                };
+                if self.unlink_stream_to_device(id, &device_name) {
+                    info!("Unroute: stream {id} restored into {device_name} via fallback links");
+                    // Device links are live: destroy the stream's links into
+                    // the EQ (matched against the live graph; the map is
+                    // about to be cleared, so drop_fallback_links would
+                    // miss them) -- else the stream doubles.
+                    let link_details = self.stream_link_details();
+                    if let Some(links) = link_details.get(&id) {
+                        for (lid, sink) in links {
+                            if sink == &eq {
+                                Self::destroy_link_object(*lid);
+                            }
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Unroute: stream {id} could not be restored into {device_name}; keeping its fallback link"
+                    );
+                }
+            }
+        }
         let released: Vec<u32> = restored_ids.into_iter().collect();
         self.drop_fallback_links(&released);
         self.pending_verify.clear();
