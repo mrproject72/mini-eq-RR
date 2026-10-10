@@ -1,3 +1,32 @@
+## Session 2026-10-10 backlog (prioritised)
+
+The flatpak EQ now works end-to-end (native-biquad graph, sandbox push,
+drag editing, exit reliability). Ranked next steps:
+
+1. **Graph parity polish (steps 6-9 of
+   `docs/PLAN/graph-parity-2026-10-04.md`)** — IN PROGRESS 2026-10-10:
+   - A/B-bypass curve styling (grey/half-alpha when bypassed), gradient
+     area fill under the curve, low-alpha glow, the selected band's own
+     contribution curve
+   - Focus label under the graph (`Band 3 • 1.0k • +6.0 dB`), the
+     `N Bands` band-count chip, solo-effectiveness fader dimming
+   - Fader drag/scroll/arrow-keys select the band
+   - LUFS meter draw func in the monitor strip
+2. **Preset lifecycle completion** — save/save-as, delete, import/export
+   (rename/revert/monitoring already exist).
+3. **Controller-pattern refactor** — one authoritative band list
+   (upstream `controller.bands`) instead of the fader widgets as source +
+   the tick's snapshot; enables upstream's 16 ms per-band DSP pushes
+   during drags (ours debounces the full payload at 400 ms).
+4. **Unit-test coverage for the backend** — `pipewire_backend.rs` and
+   `routing.rs` have near-zero automated coverage; the routing edge cases
+   hit this week (stale targets, prefix-push semantics, scope rules) are
+   only protected by the gold path.
+5. **Flathub submission** under our own app ID; then the GNOME Shell
+   extension from upstream.
+6. **AGENTS.md phase status refresh** — stale: it still says the graph
+   has no drag editing and Phase 8's flatpak is pending; both done.
+
 # TODO
 
 Low-priority backlog. Nothing here blocks a release.
@@ -80,8 +109,9 @@ Building blocks already present in `routing.rs`: `find_node_id_by_name`,
 
 ## Feature gaps
 
-- **Preset lifecycle** — no revert/reapply, import/export/delete, file
-  monitoring, fallback presets, or output-preset linking.
+- **Preset lifecycle** — no save/save-as, import/export/delete, fallback
+  presets. (Revert/reapply, file monitoring, and output-preset linking
+  are implemented.)
 - **Fader bottom residual clip** at some window sizes (see Known Issues).
 - **Flatpak packaging** and **GNOME Shell extension**.
 - **Config migration** — the app ID and config directory were renamed to
