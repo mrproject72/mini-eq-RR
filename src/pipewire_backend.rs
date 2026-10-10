@@ -147,10 +147,16 @@ fn build_props_controls_pod_bytes(controls: &[(String, f64)]) -> Option<Vec<u8>>
             ok &= builder.push_struct(&mut struct_frame).is_ok();
             // Must begin with a string: parse_params breaks on the first
             // non-string field, so no count or type tag may precede the pairs.
+            // Values are SPA Float (4 bytes), NOT Double (8): the upstream
+            // binding builds `spa_pod_builder_float((float) value)` and the
+            // filter-chain's struct parser pairs (String, Float) strictly --
+            // a Double breaks the pairing and the whole param is dropped
+            // (the sandbox push was dead exactly here; the native parse was
+            // lenient enough to mask it).
             if ok {
                 for (name, value) in controls {
                     ok &= builder.add_string(name).is_ok();
-                    ok &= builder.add_double(*value).is_ok();
+                    ok &= builder.add_float(*value as f32).is_ok();
                 }
             }
             builder.pop(struct_frame.assume_init_mut());
@@ -1195,7 +1201,7 @@ mod tests {
             "first field must be a String control name, got {:?}",
             fields[0].type_()
         );
-        assert!(fields[1].is_double(), "value must be a Double");
+        assert!(fields[1].is_float(), "value must be a SPA Float (4 bytes)");
     }
 
     /// Every control name must survive serialisation, and none may be preceded
