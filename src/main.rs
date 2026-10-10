@@ -311,10 +311,20 @@ fn launch_gui(_background_mode: bool, auto_route: bool, output_sink: Option<Stri
     // routing restore. The update loop turns the flag into a clean quit.
     mini_eq_rr::exit_guard::install_signal_handlers();
 
-    let dbus_control = MiniEqDBusControl::new(app_state.clone());
+    let dbus_control = std::sync::Arc::new(MiniEqDBusControl::new(app_state.clone()));
     if let Err(e) = dbus_control.register() {
         log::warn!("Failed to register D-Bus control: {}", e);
-    } else if let Some(conn) = dbus_control
+    }
+    // The exit path (Ctrl+C, window close, kill) runs this before the
+    // window closes: unowning the bus name and unregistering the object
+    // while the main loop is alive keeps gio's name callbacks from firing
+    // on a torn-down connection (they panic on a null connection, killing
+    // the restore).
+    app_state.set_dbus_teardown(Box::new({
+        let dbus_control = dbus_control.clone();
+        move || dbus_control.unregister()
+    }));
+    if let Some(conn) = dbus_control
         .connection_handle()
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -1429,6 +1429,12 @@ impl MiniEqWindow {
                     // alone would kill the loop first and the shutdown
                     // restore cannot round-trip PipeWire without it.
                     state_for_exit.set_shutting_down(true);
+                    // Tear the D-Bus registration down BEFORE the window
+                    // closes: unown the bus name and unregister the object
+                    // while the main loop is alive, so gio's name callbacks
+                    // never fire on a torn-down connection (they panic on a
+                    // null connection, killing the restore mid-flight).
+                    state_for_exit.run_dbus_teardown();
                     window_for_exit.close();
                     app_for_exit.quit();
                     return ControlFlow::Break;
@@ -3182,6 +3188,8 @@ fn apply_remote_command(
         }
         RemoteCommand::Quit => {
             app_state.set_shutting_down(true);
+            // The same D-Bus teardown the termination path runs (see there).
+            app_state.run_dbus_teardown();
             window.close();
         }
     }

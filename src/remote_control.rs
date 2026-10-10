@@ -93,6 +93,8 @@ pub struct AppState {
 
     /// The registered D-Bus connection, so the window can emit signals.
     connection: Mutex<Option<gtk::gio::DBusConnection>>,
+    dbus_teardown: Mutex<Option<Box<dyn Fn() + Send>>>,
+    dbus_teardown_run: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -118,6 +120,8 @@ impl AppState {
             last_analyzer_emit: Mutex::new(None),
             pending: Mutex::new(VecDeque::new()),
             connection: Mutex::new(None),
+            dbus_teardown: Mutex::new(None),
+            dbus_teardown_run: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -142,6 +146,10 @@ impl AppState {
         *Self::lock(&self.connection) = Some(conn);
     }
 
+    /// Teardown callback slot: the D-Bus control registers a clean teardown
+    /// (unown the bus name, unregister the object) that the exit path runs
+    /// BEFORE the window closes -- gio's name callbacks panic on a
+    /// null connection once the connection is torn down.
     pub fn connection(&self) -> Option<gtk::gio::DBusConnection> {
         Self::lock(&self.connection).clone()
     }
@@ -220,6 +228,23 @@ impl AppState {
     /// trying to touch widgets that are going away.
     pub fn set_shutting_down(&self, value: bool) {
         *Self::lock(&self.shutting_down) = value;
+    }
+
+    /// Register the D-Bus teardown (unown + unregister) for the exit path.
+    pub fn set_dbus_teardown(&self, f: Box<dyn Fn() + Send>) {
+        *Self::lock(&self.dbus_teardown) = Some(f);
+    }
+
+    /// Run the D-Bus teardown exactly once; safe to call repeatedly.
+    pub fn run_dbus_teardown(&self) {
+        if !self
+            .dbus_teardown_run
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(f) = Self::lock(&self.dbus_teardown).take() {
+                f();
+            }
+        }
     }
 
     /// True while the UI is tearing down. The tick checks this before

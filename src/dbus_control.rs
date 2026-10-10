@@ -377,6 +377,12 @@ impl MiniEqDBusControl {
     }
 
     pub fn unregister(&self) {
+        // Unown the name FIRST: gio's name callbacks are invoked with a
+        // null connection once the connection is torn down, and the
+        // closure's `args[0].get::<DBusConnection>().unwrap()` panics
+        // (observed on Ctrl+C mid-shutdown, killing the restore).
+        // Dropping the OwnerId unowns the name.
+        self.bus_owner_id.lock().unwrap().take();
         let conn = self.connection.lock().unwrap().clone();
         let reg_id = self.registration_id.lock().unwrap().take();
         if let Some(connection) = conn
