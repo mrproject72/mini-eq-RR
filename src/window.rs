@@ -1277,8 +1277,9 @@ impl MiniEqWindow {
                         }
                         if let Some(be) = backend.borrow_mut().as_mut() {
                             log::debug!(
-                                "push loop: dev={dev} selected={selected} bands={} preamp={preamp_db}",
-                                bands.len()
+                                "push loop: dev={dev} selected={selected} bands={} gains={:?} preamp={preamp_db}",
+                                bands.len(),
+                                bands.iter().map(|b| b.gain_db).collect::<Vec<_>>()
                             );
                             if *dev == selected && !selected.is_empty() {
                                 be.set_device_bands(dev, bands.clone());
