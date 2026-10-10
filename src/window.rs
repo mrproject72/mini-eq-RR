@@ -1294,14 +1294,23 @@ impl MiniEqWindow {
                                 // once per type change (the upstream
                                 // restart_engine semantics, per device);
                                 // ordinary frequency/Q/gain edits stay live.
+                                // Compare the GRAPH LABELS, not the enum: with
+                                // Smooth on the tick's bands report the internal
+                                // `Sin` bell while the chain carries `Bell` --
+                                // both render as `bq_peaking`, so comparing
+                                // enums would rebuild on every tick and stop
+                                // the audio on every drag.
                                 let types_differ = be
                                     .device_bands(dev)
                                     .map(|cur| {
                                         cur.len() != bands.len()
-                                            || cur
-                                                .iter()
-                                                .zip(&bands)
-                                                .any(|(a, b)| a.filter_type != b.filter_type)
+                                            || cur.iter().zip(&bands).any(|(a, b)| {
+                                                crate::filter_chain::native_biquad_label(
+                                                    a.filter_type,
+                                                ) != crate::filter_chain::native_biquad_label(
+                                                    b.filter_type,
+                                                )
+                                            })
                                     })
                                     .unwrap_or(false);
                                 if types_differ {
