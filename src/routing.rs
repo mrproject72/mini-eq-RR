@@ -677,8 +677,16 @@ impl RoutingEngine {
         default_serial: Option<&str>,
         default_name: Option<&str>,
         mode: crate::core::OutputRoutingMode,
+        stale: bool,
     ) -> bool {
-        let target = self.stream_target(stream.id).target_object;
+        // A stale target (the previous instance's dead EQ sink) resolves to
+        // no-target: the sink it named is gone, the stored value is not a
+        // deliberate choice, and the stream must be findable by the enable.
+        let target = if stale {
+            None
+        } else {
+            self.stream_target(stream.id).target_object
+        };
         if !Self::scope_allows(target.as_deref(), sink_serial, default_serial, mode) {
             return false;
         }
@@ -823,6 +831,28 @@ impl RoutingEngine {
         // The default device's NAME, for link-evidence comparisons in
         // `is_in_scope` (link targets are node names, not serials).
         let default_name: Option<String> = self.default_audio_sink.borrow().clone();
+        // Streams whose metadata target names a sink that neither belongs to
+        // our processing path nor is live: a stale serial from a previous
+        // instance (killed without a restore -- the EQ sink it named is
+        // gone). WirePlumber re-homed the audio onto a real device, but the
+        // stored target still points at the dead serial, and `scope_allows`
+        // would reject the stream for every scope. Resolved to no-target in
+        // `is_in_scope` so the enable finds the stream.
+        let stale_streams: std::collections::HashSet<u32> = self
+            .list_stream_nodes()
+            .into_iter()
+            .filter(|s| {
+                self.stream_target(s.id)
+                    .target_object
+                    .as_deref()
+                    .is_some_and(|t| {
+                        !t.is_empty()
+                            && !allowed.iter().any(|a| a == t)
+                            && !live_serials.iter().any(|serial| serial == t)
+                    })
+            })
+            .map(|s| s.id)
+            .collect();
         if std::env::var("MINI_EQ_DEBUG_ROUTING").is_ok() {
             info!("routable filter: allowed targets = {allowed:?}");
             for s in self.list_stream_nodes() {
@@ -858,6 +888,7 @@ impl RoutingEngine {
                                     default_serial.as_deref(),
                                     default_name.as_deref(),
                                     mode,
+                                    stale_streams.contains(&s.id),
                                 ) {
                                     "ROUTABLE"
                                 } else {
@@ -897,6 +928,7 @@ impl RoutingEngine {
                     default_serial.as_deref(),
                     default_name.as_deref(),
                     mode,
+                    stale_streams.contains(&s.id),
                 )
             })
             .collect()
