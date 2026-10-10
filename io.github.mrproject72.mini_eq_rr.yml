@@ -140,6 +140,7 @@ modules:
       - install -Dm755 target/release/mini-eq-rr ${FLATPAK_DEST}/bin/mini-eq-rr
       - install -Dm644 assets/metainfo/io.github.mrproject72.mini_eq_rr.metainfo.xml -t ${FLATPAK_DEST}/share/metainfo
       - install -Dm644 assets/io.github.mrproject72.mini_eq_rr.desktop -t ${FLATPAK_DEST}/share/applications
+      - rm -rf ${FLATPAK_DEST}/share/icons/hicolor
       - for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do install -Dm644 assets/icons/$size/apps/io.github.mrproject72.mini_eq_rr.png ${FLATPAK_DEST}/share/icons/hicolor/$size/apps/; install -Dm644 assets/icons/$size/apps/io.github.mrproject72.mini_eq_rr-symbolic.png ${FLATPAK_DEST}/share/icons/hicolor/$size/apps/ || true; done
       - gtk-update-icon-cache --force ${FLATPAK_DEST}/share/icons/hicolor || true
     sources:
