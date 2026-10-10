@@ -5,7 +5,12 @@ use gtk4::prelude::*;
 /// Smallest the window may be shrunk to. Chosen to stay friendly to low-res
 /// displays (classic VGA) while still fitting the graph + faders and the
 /// inline utility panel without cutting content.
-pub const MIN_WINDOW_WIDTH: i32 = 640;
+/// The header toolbar's natural minimum is 644 px (the route switch + the
+/// panel buttons + the menu + the title, incl. spacing). A window minimum
+/// below that makes AdwToolbarView overflow at the smallest size
+/// ("exceeds AdwApplicationWindow width: requested 644 px, 640 px
+/// available"). 648 gives 4 px of slack over the toolbar's need.
+pub const MIN_WINDOW_WIDTH: i32 = 648;
 
 // Vertical budget, assembled from the real rows so the floor moves when the
 // layout changes instead of silently cutting content.
