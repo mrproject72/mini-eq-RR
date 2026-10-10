@@ -15,7 +15,8 @@
 # curve 2 = -12 dB @ 1 kHz (quiet). The measured RMS per device distinguishes
 # the curves, so "device 1 kept curve 1" is a measurement, not a guess.
 #
-# Usage: ./tests-live/twodev_gold_path.sh
+# Usage: ./tests-live/twodev_gold_path.sh [--flatpak]
+#   --flatpak  drive the installed Flatpak build instead of the native binary
 # Exit code: number of failed assertions (0 = all green).
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -25,8 +26,17 @@ if [ -z "${GOLD_INNER:-}" ]; then
   exec dbus-run-session -- env GOLD_INNER=1 "$0" "$@"
 fi
 
-APP=./target/release/mini-eq-rr
+FLATPAK=0
+[ "${1:-}" = "--flatpak" ] && FLATPAK=1
 DBUS="python3 tests-live/dbus.py"
+if [ "$FLATPAK" = 1 ]; then
+  APP_ID=io.github.mrproject72.mini_eq_rr
+  start_app() { setsid nohup flatpak run --env=RUST_LOG=info "$APP_ID" >"$1" 2>&1 < /dev/null & disown; }
+  kill_app() { flatpak kill "$APP_ID" >/dev/null 2>&1; kill "$APP_PID" 2>/dev/null; }
+else
+  start_app() { setsid nohup env RUST_LOG=info ./target/release/mini-eq-rr >"$1" 2>&1 < /dev/null & disown; }
+  kill_app() { kill "$APP_PID" 2>/dev/null; }
+fi
 DEV_A="alsa_output.pci-0000_04_00.6.analog-stereo"
 DEV_B="alsa_output.usb-Logitech_Inc_Logitech_H570e_Stereo_00000000-00.analog-stereo"
 SCRATCH=tmp/twodev_gold
@@ -41,14 +51,14 @@ PID_A=""; PID_B=""; APP_PID=""
 for tool in pw-play pw-dump pw-record python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing tool: $tool"; exit 99; }
 done
-[ -x "$APP" ] || { cargo build --release || exit 99; }
+[ "$FLATPAK" = 1 ] || { [ -x ./target/release/mini-eq-rr ] || { cargo build --release || exit 99; }; }
 
 cleanup() {
   if kill -0 "$APP_PID" 2>/dev/null; then
     $DBUS call SetRoutingEnabled b:false >/dev/null 2>&1
     $DBUS call Quit >/dev/null 2>&1
     sleep 2
-    kill -0 "$APP_PID" 2>/dev/null && kill "$APP_PID" 2>/dev/null
+    kill -0 "$APP_PID" 2>/dev/null && kill_app
   fi
   [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null
   [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null
@@ -159,7 +169,7 @@ sleep 5
 echo "baseline: $(stream_links)"
 
 # --- 4. app launch + device 1: select, apply curve 1, route --------------------
-setsid nohup env RUST_LOG=info "$APP" >"$SCRATCH/app.log" 2>&1 < /dev/null & disown
+start_app "$SCRATCH/app.log"
 APP_PID=$!
 sleep 6
 $DBUS call SetOutputSink "s:$DEV_A" >/dev/null
