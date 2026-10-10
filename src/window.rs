@@ -687,9 +687,12 @@ impl MiniEqWindow {
                             best = Some((band.index, dist, bx, by));
                         }
                     }
-                    let Some((index, _, px, py)) = best else {
+                    let Some((index, dist, px, py)) = best else {
                         return;
                     };
+                    log::debug!(
+                        "graph drag begin: band={index} dist={dist:.1}px dot=({px:.1},{py:.1}) click=({start_x:.1},{start_y:.1}) size=({width:.0}x{height:.0})"
+                    );
                     {
                         let mut st = drag_state.borrow_mut();
                         st.band_index = Some(index);
