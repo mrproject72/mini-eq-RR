@@ -147,10 +147,16 @@ fn build_props_controls_pod_bytes(controls: &[(String, f64)]) -> Option<Vec<u8>>
             ok &= builder.push_struct(&mut struct_frame).is_ok();
             // Must begin with a string: parse_params breaks on the first
             // non-string field, so no count or type tag may precede the pairs.
+            // Values are SPA Float (4 bytes), NOT Double (8): the upstream
+            // binding builds `spa_pod_builder_float((float) value)` and the
+            // filter-chain's struct parser pairs (String, Float) strictly --
+            // a Double breaks the pairing and the whole param is dropped
+            // (the sandbox push was dead exactly here; the native parse was
+            // lenient enough to mask it).
             if ok {
                 for (name, value) in controls {
                     ok &= builder.add_string(name).is_ok();
-                    ok &= builder.add_double(*value).is_ok();
+                    ok &= builder.add_float(*value as f32).is_ok();
                 }
             }
             builder.pop(struct_frame.assume_init_mut());
@@ -170,7 +176,20 @@ impl PipeWireBackend {
 
         let mainloop = MainLoopRc::new(None)?;
         let context = ContextRc::new(&mainloop, None)?;
-        let core = context.connect_rc(None)?;
+        // Client properties at connect, matching upstream
+        // `_new_core`: application.name + media.category = "Manager".
+        // PipeWire's access rules grant Manager-category clients full
+        // permissions on the daemon's objects; without it a sandboxed
+        // (flatpak) client is limited to r/x on the filter-chain's nodes
+        // (owned by the module's own client) and every set_param -- the
+        // entire EQ curve push -- is silently ignored.
+        let core = context.connect_rc(Some(
+            pipewire::properties::properties! {
+                crate::core::PIPEWIRE_APPLICATION_NAME_KEY => crate::core::PIPEWIRE_CLIENT_NAME,
+                crate::core::PIPEWIRE_MEDIA_CATEGORY_KEY => crate::core::PIPEWIRE_MEDIA_CATEGORY,
+            }
+            .into(),
+        ))?;
 
         info!("Connected to PipeWire server");
 
@@ -804,6 +823,17 @@ impl PipeWireBackend {
         }
         let was_wanted = self.routing.is_device_eq_enabled(physical_sink);
         if self.device_chains.borrow().contains_key(physical_sink) {
+            let cur = self.device_bands(physical_sink).unwrap_or_default();
+            log::info!(
+                "Chain rebuild for {physical_sink}: current types {:?} vs new {:?}",
+                cur.iter()
+                    .map(|b| crate::filter_chain::native_biquad_label(b.filter_type))
+                    .collect::<Vec<_>>(),
+                bands
+                    .iter()
+                    .map(|b| crate::filter_chain::native_biquad_label(b.filter_type))
+                    .collect::<Vec<_>>(),
+            );
             // Hand the streams back first: the chain's death drops every
             // link into it, and a deliberate restore is faster and more
             // predictable than WirePlumber's recovery. The device's EQ off
@@ -1195,7 +1225,7 @@ mod tests {
             "first field must be a String control name, got {:?}",
             fields[0].type_()
         );
-        assert!(fields[1].is_double(), "value must be a Double");
+        assert!(fields[1].is_float(), "value must be a SPA Float (4 bytes)");
     }
 
     /// Every control name must survive serialisation, and none may be preceded

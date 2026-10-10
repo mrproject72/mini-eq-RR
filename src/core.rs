@@ -23,6 +23,25 @@ pub fn clamp<T: PartialOrd>(value: T, lower: T, upper: T) -> T {
 
 pub const APP_NAME: &str = "Mini EQ";
 pub const OUTPUT_CLIENT_NAME: &str = "Mini EQ Output";
+
+/// The PipeWire client name the connection registers with (upstream
+/// `PIPEWIRE_CLIENT_NAME`).
+pub const PIPEWIRE_CLIENT_NAME: &str = "Mini EQ";
+
+/// The PipeWire client-property key for the application name (upstream
+/// `PIPEWIRE_APPLICATION_NAME_KEY`).
+pub const PIPEWIRE_APPLICATION_NAME_KEY: &str = "application.name";
+
+/// The PipeWire client-property key for the media category (upstream
+/// `PIPEWIRE_MEDIA_CATEGORY_KEY`).
+pub const PIPEWIRE_MEDIA_CATEGORY_KEY: &str = "media.category";
+
+/// The PipeWire media.category the connection registers with (upstream
+/// `PIPEWIRE_MEDIA_CATEGORY`). PipeWire's access rules grant
+/// Manager-category clients full permissions on the daemon's objects --
+/// without it a sandboxed (flatpak) client is limited to r/x and every
+/// `set_param` (the entire EQ curve push) is silently ignored.
+pub const PIPEWIRE_MEDIA_CATEGORY: &str = "Manager";
 pub const VIRTUAL_SINK_BASE: &str = "mini_eq_sink";
 pub const VIRTUAL_SINK_DESCRIPTION: &str = "Mini-EQ-Sink";
 pub const FILTER_OUTPUT_SUFFIX: &str = "_output";

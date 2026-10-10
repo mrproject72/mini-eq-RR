@@ -221,6 +221,14 @@ impl AppState {
     pub fn set_shutting_down(&self, value: bool) {
         *Self::lock(&self.shutting_down) = value;
     }
+
+    /// True while the UI is tearing down. The tick checks this before
+    /// event-driven adoption: the exit restore changes every stream's target,
+    /// which flags streams dirty, and re-adopting them into chains that are
+    /// about to be destroyed is exactly the shutdown disconnect.
+    pub fn shutting_down(&self) -> bool {
+        *Self::lock(&self.shutting_down)
+    }
 }
 
 impl MiniEqAppHandler for AppState {

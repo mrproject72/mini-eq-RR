@@ -1,6 +1,7 @@
 //! Main application window for mini-eq.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -320,6 +321,15 @@ impl MiniEqWindow {
         // the layout is built, so the closure captures an empty cell for now.
         let fader_registry: Rc<RefCell<Vec<Rc<RefCell<crate::band_fader::EqBandFader>>>>> =
             Rc::new(RefCell::new(Vec::new()));
+        // Per-device live-curve memory: the fader/preamp state each output
+        // device was last edited to, snapshotted on an output switch and
+        // restored when the user comes back. Without it, switching devices
+        // carries the previous device's curve into the newly selected chain
+        // (the gold-path regression): a device with no linked preset leaves
+        // the faders untouched, and the next payload push writes the other
+        // device's curve into its chain.
+        let device_curve_memory: Rc<RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         // Filled once the editor exists; the callbacks below are created first
         // so they can be handed to the editor's constructor.
         let editor_cell: Rc<RefCell<Option<Rc<BandEditor>>>> = Rc::new(RefCell::new(None));
@@ -407,6 +417,59 @@ impl MiniEqWindow {
                 }
                 refresh();
                 clamped
+            })
+        };
+
+        // Per-device curve memory plumbing: snapshot the live fader/preamp
+        // state (the outgoing device's curve) and push a remembered or
+        // preset curve back into the faders (the incoming device's own).
+        // Used by the output-device switch handlers; see
+        // `device_curve_memory`.
+        let snapshot_device_curve: Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64)> = {
+            let registry = fader_registry.clone();
+            let smooth = utility.headroom.borrow().smooth.clone();
+            let spread = utility.headroom.borrow().smooth_spread_bands.clone();
+            let headroom = utility.headroom.clone();
+            Rc::new(move || {
+                (
+                    fader_band_snapshot(&registry, smooth.get(), spread.get()),
+                    headroom.borrow().preamp_value(),
+                )
+            })
+        };
+        let restore_device_curve: Rc<dyn Fn(&[crate::core::EqBand], f64)> = {
+            let registry = fader_registry.clone();
+            let headroom = utility.headroom.clone();
+            Rc::new(move |bands, preamp| {
+                headroom.borrow().set_preamp_value(preamp);
+                let solo_active = crate::core::bands_have_solo(bands);
+                for (i, band) in bands.iter().enumerate() {
+                    let Some(fader) = registry.borrow().get(i).cloned() else {
+                        continue;
+                    };
+                    let frequency = band.frequency.clamp(
+                        crate::core::EQ_FREQUENCY_MIN_HZ,
+                        crate::core::EQ_FREQUENCY_MAX_HZ,
+                    );
+                    let q = band.q.clamp(crate::core::EQ_Q_MIN, crate::core::EQ_Q_MAX);
+                    let mut f = fader.borrow_mut();
+                    let selected = f.selected;
+                    f.set_band_state(
+                        band.gain_db,
+                        frequency,
+                        crate::window_band_fader::format_frequency_label(frequency),
+                        q,
+                        crate::window_band_fader::format_q_label(q),
+                        band.filter_type,
+                        crate::band_fader::filter_type_short_label(band.filter_type).into(),
+                        selected,
+                        band.filter_type != crate::core::FilterType::Off,
+                        band.mute,
+                        band.solo,
+                        solo_active,
+                    );
+                    f.drawing_area.queue_draw();
+                }
             })
         };
 
@@ -909,6 +972,12 @@ impl MiniEqWindow {
             // stops rather than continuously.
             let last_edit_instant: Rc<RefCell<Option<std::time::Instant>>> =
                 Rc::new(RefCell::new(None));
+            // Per-device curve memory + its snapshot/restore helpers, cloned
+            // for the tick's remote-command drain (the originals live at
+            // function scope for the switch handlers).
+            let device_curve_memory_tick = device_curve_memory.clone();
+            let snapshot_device_curve_tick = snapshot_device_curve.clone();
+            let restore_device_curve_tick = restore_device_curve.clone();
 
             glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
                 // --- Remote control (D-Bus) -----------------------------
@@ -936,6 +1005,9 @@ impl MiniEqWindow {
                         &monitor_switch_handle,
                         &monitor_summary_handle,
                         &route_state_handler_tick,
+                        &device_curve_memory_tick,
+                        &snapshot_device_curve_tick,
+                        &restore_device_curve_tick,
                     );
                 }
 
@@ -1277,9 +1349,15 @@ impl MiniEqWindow {
                         }
                         if let Some(be) = backend.borrow_mut().as_mut() {
                             log::debug!(
-                                "push loop: dev={dev} selected={selected} bands={} gains={:?} preamp={preamp_db}",
+                                "push loop: dev={dev} selected={selected} bands={} gains={:?} types={:?} preamp={preamp_db}",
                                 bands.len(),
-                                bands.iter().map(|b| b.gain_db).collect::<Vec<_>>()
+                                bands.iter().map(|b| b.gain_db).collect::<Vec<_>>(),
+                                bands
+                                    .iter()
+                                    .map(|b| crate::filter_chain::native_biquad_label(
+                                        b.filter_type
+                                    ))
+                                    .collect::<Vec<_>>(),
                             );
                             // Only the SELECTED device's edits are the band
                             // payload: the faders show its curve, and pushing
@@ -1294,14 +1372,27 @@ impl MiniEqWindow {
                                 // once per type change (the upstream
                                 // restart_engine semantics, per device);
                                 // ordinary frequency/Q/gain edits stay live.
+                                // Compare the GRAPH LABELS, not the enum: with
+                                // Smooth on the tick's bands report the internal
+                                // `Sin` bell while the chain carries `Bell` --
+                                // both render as `bq_peaking`, so comparing
+                                // enums would rebuild on every tick and stop
+                                // the audio on every drag. The graph's band
+                                // count is fixed at creation (default_bands
+                                // carries all MAX_BANDS, the tail inactive):
+                                // a payload shorter than the graph is a PREFIX
+                                // push, not a topology change.
                                 let types_differ = be
                                     .device_bands(dev)
                                     .map(|cur| {
-                                        cur.len() != bands.len()
-                                            || cur
-                                                .iter()
-                                                .zip(&bands)
-                                                .any(|(a, b)| a.filter_type != b.filter_type)
+                                        bands.len() > cur.len()
+                                            || cur.iter().zip(&bands).any(|(a, b)| {
+                                                crate::filter_chain::native_biquad_label(
+                                                    a.filter_type,
+                                                ) != crate::filter_chain::native_biquad_label(
+                                                    b.filter_type,
+                                                )
+                                            })
                                     })
                                     .unwrap_or(false);
                                 if types_differ {
@@ -1430,6 +1521,9 @@ impl MiniEqWindow {
             let presets_for_output = utility.presets.clone();
             let state_for_select = app_state.clone();
             let summary_for_select = utility.monitor.summary.clone();
+            let device_curve_memory = device_curve_memory.clone();
+            let snapshot_device_curve = snapshot_device_curve.clone();
+            let restore_device_curve = restore_device_curve.clone();
             output_dropdown.connect_notify_local(Some("selected"), move |dd, _| {
                 let idx = dd.selected() as usize;
                 // Cloned, not borrowed: the refusal path below re-enters this
@@ -1470,11 +1564,35 @@ impl MiniEqWindow {
                 // changes is the editing context (faders/preamp) and where the
                 // monitor listens.
                 follow_default_for_select.set(want_follow);
+                // Per-device curve memory: snapshot the outgoing device's
+                // live fader/preamp state, then restore the incoming
+                // device's own (its remembered edits, else its linked
+                // preset). Without this a device with no linked preset
+                // leaves the faders carrying the previous device's curve,
+                // and the next payload push writes that curve into its
+                // chain (the gold-path regression).
+                let outgoing = engine_sink_for_select.borrow().clone();
+                if !outgoing.is_empty() {
+                    let snapshot = snapshot_device_curve();
+                    device_curve_memory.borrow_mut().insert(outgoing, snapshot);
+                }
                 *engine_sink_for_select.borrow_mut() = chosen.clone();
                 if let Some(be) = backend_for_select.borrow_mut().as_mut() {
                     be.set_selected_sink(&chosen);
                 }
-                apply_output_preset_for_sink(&chosen, &output_preset_identity, &presets_for_output);
+                match device_curve_memory.borrow().get(&chosen).cloned() {
+                    Some((bands, preamp)) => {
+                        log::debug!("Output {chosen}: restored its remembered curve");
+                        restore_device_curve(&bands, preamp);
+                    }
+                    None => {
+                        apply_output_preset_for_sink(
+                            &chosen,
+                            &output_preset_identity,
+                            &presets_for_output,
+                        );
+                    }
+                }
                 if state_for_select.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str())
                 {
                     *state_for_select.output_sink.lock().unwrap() = Some(chosen.clone());
@@ -1590,6 +1708,7 @@ impl MiniEqWindow {
         // running a second OS thread.
         {
             let backend = backend.clone();
+            let app_state_for_pump = app_state.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 if let Some(be) = backend.borrow_mut().as_mut() {
                     be.pump();
@@ -1603,8 +1722,12 @@ impl MiniEqWindow {
                     be.process_pending_verifies();
                     // Event-driven adoption: the registry/metadata listeners
                     // flag arrivals and moves; drain the flag into one pass.
-                    // Idle cost is a single flag check.
-                    if be.take_streams_dirty() {
+                    // Idle cost is a single flag check. Skipped while the UI
+                    // is tearing down: the exit restore changes every
+                    // stream's target (flagging them dirty) and re-adopting
+                    // them into chains that are about to be destroyed is
+                    // exactly the shutdown disconnect.
+                    if be.take_streams_dirty() && !app_state_for_pump.shutting_down() {
                         match be.adopt_new_streams() {
                             Ok(n) if n > 0 => {
                                 log::info!("Adopted {n} new stream(s) into device chains")
@@ -2506,6 +2629,9 @@ fn apply_remote_command(
     monitor_switch: &gtk4::Switch,
     monitor_summary: &gtk4::Label,
     route_state_handler: &Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>>,
+    device_curve_memory: &Rc<RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64)>>>,
+    snapshot_device_curve: &Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64)>,
+    restore_device_curve: &Rc<dyn Fn(&[crate::core::EqBand], f64)>,
 ) {
     use crate::remote_control::RemoteCommand;
     match cmd {
@@ -2603,11 +2729,25 @@ fn apply_remote_command(
             // Same as the Output dropdown: selecting a device never moves
             // audio. It only re-targets the edit context (faders/preamp pick
             // up that device's last curve) and where the monitor listens.
+            // Per-device curve memory: snapshot the outgoing device's live
+            // curve, restore the incoming device's own (remembered edits,
+            // else its linked preset) -- the gold-path regression.
+            let outgoing = engine_sink.borrow().clone();
+            if !outgoing.is_empty() {
+                let snapshot = snapshot_device_curve();
+                device_curve_memory.borrow_mut().insert(outgoing, snapshot);
+            }
             *engine_sink.borrow_mut() = chosen.clone();
             if let Some(be) = backend.borrow_mut().as_mut() {
                 be.set_selected_sink(&chosen);
             }
-            apply_output_preset_for_sink(&chosen, output_preset_identity, presets);
+            match device_curve_memory.borrow().get(&chosen).cloned() {
+                Some((bands, preamp)) => {
+                    log::debug!("D-Bus output {chosen}: restored its remembered curve");
+                    restore_device_curve(&bands, preamp);
+                }
+                None => apply_output_preset_for_sink(&chosen, output_preset_identity, presets),
+            }
             if app_state.output_sink.lock().unwrap().as_deref() != Some(chosen.as_str()) {
                 *app_state.output_sink.lock().unwrap() = Some(chosen.clone());
                 app_state.emit_state_changed();
