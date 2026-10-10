@@ -176,7 +176,20 @@ impl PipeWireBackend {
 
         let mainloop = MainLoopRc::new(None)?;
         let context = ContextRc::new(&mainloop, None)?;
-        let core = context.connect_rc(None)?;
+        // Client properties at connect, matching upstream
+        // `_new_core`: application.name + media.category = "Manager".
+        // PipeWire's access rules grant Manager-category clients full
+        // permissions on the daemon's objects; without it a sandboxed
+        // (flatpak) client is limited to r/x on the filter-chain's nodes
+        // (owned by the module's own client) and every set_param -- the
+        // entire EQ curve push -- is silently ignored.
+        let core = context.connect_rc(Some(
+            pipewire::properties::properties! {
+                crate::core::PIPEWIRE_APPLICATION_NAME_KEY => crate::core::PIPEWIRE_CLIENT_NAME,
+                crate::core::PIPEWIRE_MEDIA_CATEGORY_KEY => crate::core::PIPEWIRE_MEDIA_CATEGORY,
+            }
+            .into(),
+        ))?;
 
         info!("Connected to PipeWire server");
 
