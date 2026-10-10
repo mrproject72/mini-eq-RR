@@ -1276,6 +1276,10 @@ impl MiniEqWindow {
                             continue; // proxy still arriving; retry next tick
                         }
                         if let Some(be) = backend.borrow_mut().as_mut() {
+                            log::debug!(
+                                "push loop: dev={dev} selected={selected} bands={} preamp={preamp_db}",
+                                bands.len()
+                            );
                             if *dev == selected && !selected.is_empty() {
                                 be.set_device_bands(dev, bands.clone());
                                 be.set_device_preamp(dev, preamp_db);
