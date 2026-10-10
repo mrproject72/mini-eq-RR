@@ -18,6 +18,35 @@ pub const GRAPH_PLOT_RIGHT: f64 = 62.0;
 pub const GRAPH_PLOT_TOP: f64 = 26.0;
 pub const GRAPH_PLOT_BOTTOM: f64 = 34.0;
 
+/// The plot rect inside a `width`×`height` widget: `(left, right, top,
+/// bottom)` gutters (upstream `graph_plot_bounds`). The drag editing and the
+/// draw functions must agree on this.
+pub fn plot_bounds(width: f64, height: f64) -> (f64, f64, f64, f64) {
+    (
+        GRAPH_PLOT_LEFT,
+        width - GRAPH_PLOT_RIGHT,
+        GRAPH_PLOT_TOP,
+        height - GRAPH_PLOT_BOTTOM,
+    )
+}
+
+/// A band dot's position for hit-testing: x at the band frequency, y at the
+/// TOTAL response at that frequency (so the dot sits on the curve, matching
+/// the draw function).
+pub fn band_dot_position(
+    band_frequency: f64,
+    bands: &[crate::core::EqBand],
+    preamp_db: f64,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    let x = frequency_to_x(band_frequency, width, GRAPH_PLOT_LEFT, GRAPH_PLOT_RIGHT);
+    let response =
+        crate::core::total_response_db(bands, preamp_db, crate::core::SAMPLE_RATE, band_frequency);
+    let y = db_to_y(response, height, GRAPH_PLOT_TOP, GRAPH_PLOT_BOTTOM);
+    (x, y)
+}
+
 /// Map a frequency to an x pixel inside the plot area (upstream
 /// `frequency_to_x`): log-spaced between the axis ends, inset by the margins.
 pub fn frequency_to_x(frequency: f64, width: f64, left: f64, right: f64) -> f64 {
@@ -285,8 +314,15 @@ impl EqGraph {
         analyzer_area.set_hexpand(true);
         let state_clone = state.clone();
         analyzer_area.set_draw_func(move |_area, ctx, width, height| {
-            let levels = &state_clone.borrow().analyzer_levels;
-            EqGraph::draw_analyzer(ctx, width, height, levels);
+            let s = state_clone.borrow();
+            EqGraph::draw_analyzer(
+                ctx,
+                width,
+                height,
+                &s.analyzer_levels,
+                s.analyzer_display_gain_db,
+                s.analyzer_active,
+            );
         });
 
         let response_area = gtk4::DrawingArea::new();
@@ -605,8 +641,49 @@ impl EqGraph {
     /// a separate `DrawingArea` covering the whole widget, so it has to inset
     /// by the margins itself or the spectrum sits a label width away from the
     /// frequency axis it is meant to line up with.
-    fn draw_analyzer(ctx: &Context, width: i32, height: i32, levels: &[f64]) {
-        if levels.is_empty() {
+    /// The x42-style display shaping (upstream
+    /// `analyzer_db_to_display_norm`): hide very low noise, expand the
+    /// musical range. `db` is the spectrum level in dBFS + the display gain.
+    fn analyzer_db_to_display_norm(db: f64) -> f64 {
+        let deflection = if db < -70.0 {
+            0.0
+        } else if db < -60.0 {
+            (db + 70.0) * 0.25
+        } else if db < -50.0 {
+            ((db + 60.0) * 0.5) + 2.5
+        } else if db < -40.0 {
+            ((db + 50.0) * 0.75) + 7.5
+        } else if db < -30.0 {
+            ((db + 40.0) * 1.5) + 15.0
+        } else if db < -20.0 {
+            ((db + 30.0) * 2.0) + 30.0
+        } else if db < 6.0 {
+            ((db + 20.0) * 2.5) + 50.0
+        } else {
+            115.0
+        };
+        (deflection / 115.0).clamp(0.0, 1.0)
+    }
+
+    /// Normalized spectrum level (0..1) -> the shaped display norm, through
+    /// dBFS + the display gain (upstream `analyzer_level_to_display_norm`).
+    fn analyzer_level_to_display_norm(level: f64, display_gain_db: f64) -> f64 {
+        let db = crate::analyzer::ANALYZER_DB_FLOOR
+            + (level.clamp(0.0, 1.0) * crate::analyzer::ANALYZER_DB_FLOOR.abs());
+        Self::analyzer_db_to_display_norm(db + display_gain_db)
+    }
+
+    fn draw_analyzer(
+        ctx: &Context,
+        width: i32,
+        height: i32,
+        levels: &[f64],
+        display_gain_db: f64,
+        monitor_active: bool,
+    ) {
+        // Early-out unless something is actually audible (upstream checks
+        // `any(level > 0.01)`).
+        if levels.is_empty() || !levels.iter().any(|&l| l > 0.01) {
             return;
         }
 
@@ -623,25 +700,99 @@ impl EqGraph {
         if plot_width <= 0.0 || plot_height <= 0.0 {
             return;
         }
+
+        // Palette + alpha by appearance and monitor state (upstream
+        // `analyzer_plot_palette`): dimmed when the monitor is off.
         let dark = crate::appearance::style_manager_is_dark();
-        let (r, g, b) = if dark {
-            (0.33, 0.78, 0.90)
+        let (bar_rgba, line_rgba) = if dark {
+            (
+                (0.33, 0.78, 0.90, if monitor_active { 0.15 } else { 0.06 }),
+                (0.58, 0.90, 0.98, if monitor_active { 0.32 } else { 0.14 }),
+            )
         } else {
-            (0.03, 0.46, 0.60)
+            (
+                (0.03, 0.46, 0.60, if monitor_active { 0.17 } else { 0.07 }),
+                (0.00, 0.34, 0.50, if monitor_active { 0.36 } else { 0.15 }),
+            )
         };
 
         let bar_count = levels.len().min(crate::analyzer::ANALYZER_BIN_COUNT);
-        let bar_width = plot_width / bar_count as f64;
-        // A 1 px gap, but never wider than a third of the bar, so narrow bars
-        // stay visible (upstream `cached_analyzer_bar_geometry`).
-        let gap = 1.5f64.min(bar_width * 0.35);
-        ctx.set_source_rgba(r, g, b, 0.15);
-        for (i, &level) in levels.iter().take(bar_count).enumerate() {
-            let bar_height = (level * plot_height).clamp(0.0, plot_height);
-            let x = left + i as f64 * bar_width;
-            let y = height - bottom - bar_height;
-            ctx.rectangle(x, y, (bar_width - gap).max(1.0), bar_height);
+        // Log-spaced bar geometry from the bin centre frequencies and their
+        // band edges (the helpers existed unused); the uniform-x variant put
+        // the 25 Hz bar where 1 kHz belongs.
+        let centers = crate::analyzer::analyzer_bin_center_frequencies(
+            bar_count,
+            EQ_FREQUENCY_MIN_HZ,
+            EQ_FREQUENCY_MAX_HZ,
+        );
+        let edges = crate::analyzer::analyzer_band_edges(&centers);
+        let axis_min = edges.first().copied().unwrap_or(EQ_FREQUENCY_MIN_HZ);
+        let axis_max = edges.last().copied().unwrap_or(EQ_FREQUENCY_MAX_HZ);
+        let freq_to_x = |frequency: f64| -> f64 {
+            let usable = (plot_width).max(1.0);
+            let pos = ((frequency.clamp(axis_min, axis_max).log10() - axis_min.log10())
+                / (axis_max.log10() - axis_min.log10()))
+            .clamp(0.0, 1.0);
+            left + usable * pos
+        };
+        let plot_right = left + plot_width;
+
+        let mut spectrum_points: Vec<(f64, f64)> = Vec::with_capacity(bar_count * 2 + 2);
+        for (index, &level) in levels.iter().take(bar_count).enumerate() {
+            let raw_x0 = freq_to_x(edges[index]);
+            let raw_x1 = freq_to_x(edges[index + 1]);
+            let center_x = freq_to_x(centers[index]);
+            let bucket_width = raw_x1 - raw_x0;
+            let inner_gap = if bar_count > 1 {
+                1.5f64.min(bucket_width * 0.35)
+            } else {
+                0.0
+            };
+            let x0 = if index == 0 {
+                left
+            } else {
+                raw_x0 + inner_gap / 2.0
+            };
+            let x1 = if index == bar_count - 1 {
+                plot_right
+            } else {
+                raw_x1 - inner_gap / 2.0
+            };
+            let (x0, bar_width) = if x1 <= x0 {
+                let x0 = (center_x - 0.5).clamp(left, (plot_right - 1.0).max(left));
+                (x0, 1.0)
+            } else {
+                (x0, x1 - x0)
+            };
+
+            let normalized = Self::analyzer_level_to_display_norm(level, display_gain_db);
+            let y = (height - bottom) - (plot_height * normalized);
+            let bar_height = ((height - bottom) - y).max(1.0);
+            ctx.set_source_rgba(bar_rgba.0, bar_rgba.1, bar_rgba.2, bar_rgba.3);
+            ctx.rectangle(x0, y, bar_width, bar_height);
             ctx.fill().unwrap();
+
+            // The stepped line: the bar's left edge -> centre -> (the next
+            // iteration extends it to the next bar's left edge).
+            if spectrum_points.is_empty() {
+                spectrum_points.push((x0, y));
+            }
+            spectrum_points.push((center_x, y));
+            spectrum_points.push((x0 + bar_width, y));
+        }
+
+        // The 1.3 px stepped line through the bar tops (upstream appends a
+        // Gsk stroke; Cairo polyline here).
+        if spectrum_points.len() > 1 {
+            ctx.set_source_rgba(line_rgba.0, line_rgba.1, line_rgba.2, line_rgba.3);
+            ctx.set_line_width(1.3);
+            ctx.new_path();
+            let (x, y) = spectrum_points[0];
+            ctx.move_to(x, y);
+            for (x, y) in &spectrum_points[1..] {
+                ctx.line_to(*x, *y);
+            }
+            ctx.stroke().unwrap();
         }
     }
 

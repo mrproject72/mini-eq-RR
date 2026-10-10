@@ -328,8 +328,9 @@ impl MiniEqWindow {
         // (the gold-path regression): a device with no linked preset leaves
         // the faders untouched, and the next payload push writes the other
         // device's curve into its chain.
-        let device_curve_memory: Rc<RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64)>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let device_curve_memory: Rc<
+            RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64, Option<String>)>>,
+        > = Rc::new(RefCell::new(HashMap::new()));
         // Filled once the editor exists; the callbacks below are created first
         // so they can be handed to the editor's constructor.
         let editor_cell: Rc<RefCell<Option<Rc<BandEditor>>>> = Rc::new(RefCell::new(None));
@@ -425,22 +426,26 @@ impl MiniEqWindow {
         // preset curve back into the faders (the incoming device's own).
         // Used by the output-device switch handlers; see
         // `device_curve_memory`.
-        let snapshot_device_curve: Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64)> = {
+        let snapshot_device_curve: Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64, Option<String>)> = {
             let registry = fader_registry.clone();
             let smooth = utility.headroom.borrow().smooth.clone();
             let spread = utility.headroom.borrow().smooth_spread_bands.clone();
             let headroom = utility.headroom.clone();
+            let presets = utility.presets.clone();
             Rc::new(move || {
                 (
                     fader_band_snapshot(&registry, smooth.get(), spread.get()),
                     headroom.borrow().preamp_value(),
+                    presets.borrow().current_preset_name(),
                 )
             })
         };
-        let restore_device_curve: Rc<dyn Fn(&[crate::core::EqBand], f64)> = {
+        let restore_device_curve: Rc<dyn Fn(&[crate::core::EqBand], f64, Option<String>)> = {
             let registry = fader_registry.clone();
             let headroom = utility.headroom.clone();
-            Rc::new(move |bands, preamp| {
+            let presets = utility.presets.clone();
+            Rc::new(move |bands, preamp, name| {
+                presets.borrow_mut().set_current_preset_name(name);
                 headroom.borrow().set_preamp_value(preamp);
                 let solo_active = crate::core::bands_have_solo(bands);
                 for (i, band) in bands.iter().enumerate() {
@@ -508,6 +513,319 @@ impl MiniEqWindow {
                 refresh();
             }) as Rc<dyn Fn(usize)>
         };
+
+        // Graph drag editing (upstream on_graph_pressed / drag_begin /
+        // drag_update / drag_end): a click selects the nearest band by
+        // log-frequency distance; grabbing a dot (32 px) and dragging moves
+        // frequency (X) and gain (Y) with the other bands' contribution
+        // subtracted so the dot stays under the mouse; Shift + vertical drags
+        // Q. Edits land on the faders through the same owner-authoritative
+        // paths a fader drag uses, so the peak clamp, the Smooth coupling and
+        // the debounced DSP push all apply.
+        {
+            struct GraphDrag {
+                band_index: Option<usize>,
+                start_q: Option<f64>,
+                start_point: Option<(f64, f64)>,
+                edit_active: bool,
+            }
+            impl Default for GraphDrag {
+                fn default() -> Self {
+                    Self {
+                        band_index: None,
+                        start_q: None,
+                        start_point: None,
+                        edit_active: false,
+                    }
+                }
+            }
+            let drag_state: Rc<RefCell<GraphDrag>> = Rc::new(RefCell::new(GraphDrag::default()));
+            let registry = fader_registry.clone();
+            let graph = utility.graph.clone();
+            let headroom = utility.headroom.clone();
+            let selection = selection_callback.clone();
+            let gain_request = gain_request.clone();
+            let refresh = refresh_editor.clone();
+
+            let snapshot_bands = {
+                let registry = registry.clone();
+                let smooth = headroom.borrow().smooth.clone();
+                let spread = headroom.borrow().smooth_spread_bands.clone();
+                move || fader_band_snapshot(&registry, smooth.get(), spread.get())
+            };
+            let preamp_db = {
+                let headroom = headroom.clone();
+                move || headroom.borrow().preamp_value()
+            };
+            let redraw = {
+                let graph = graph.clone();
+                move || graph.borrow().response_area.queue_draw()
+            };
+
+            // Click: select the nearest band (log-frequency distance), the
+            // same rule upstream uses.
+            let click = gtk4::GestureClick::new();
+            {
+                let drag_state = drag_state.clone();
+                let graph = graph.clone();
+                let selection = selection.clone();
+                let snapshot_bands = snapshot_bands.clone();
+                click.connect_pressed(move |_, _press_count, x, _y| {
+                    drag_state.borrow_mut().band_index = None;
+                    let snapshot = snapshot_bands();
+                    if snapshot.is_empty() {
+                        return;
+                    }
+                    let (width, height) = {
+                        let g = graph.borrow();
+                        (
+                            g.response_area.width() as f64,
+                            g.response_area.height() as f64,
+                        )
+                    };
+                    if width <= 0.0 || height <= 0.0 {
+                        return;
+                    }
+                    let freq_at_x = crate::window_graph::x_to_frequency(
+                        x,
+                        width,
+                        crate::window_graph::GRAPH_PLOT_LEFT,
+                        crate::window_graph::GRAPH_PLOT_RIGHT,
+                    );
+                    // Nearest by log-frequency distance, preferring effective
+                    // (active, not solo-muted) bands like upstream's
+                    // visible_active preference.
+                    let solo_active = crate::core::bands_have_solo(&snapshot);
+                    let mut best: Option<(usize, f64)> = None;
+                    for band in &snapshot {
+                        if band.mute {
+                            continue;
+                        }
+                        let effective = crate::core::band_is_effective(band, solo_active);
+                        let dist = ((band.frequency.max(10.0)).log10()
+                            - freq_at_x.max(10.0).log10())
+                        .abs()
+                            - if effective { 0.0 } else { 0.35 };
+                        if best.is_none_or(|(_, d)| dist < d) {
+                            best = Some((band.index, dist));
+                        }
+                    }
+                    if let Some((index, _)) = best {
+                        selection(index);
+                        drag_state.borrow_mut().band_index = Some(index);
+                    }
+                });
+            }
+            graph.borrow().response_area.add_controller(click.clone());
+
+            let drag_gesture = gtk4::GestureDrag::new();
+            {
+                let drag_state = drag_state.clone();
+                let registry = registry.clone();
+                let graph = graph.clone();
+                let selection = selection.clone();
+                let gain_request = gain_request.clone();
+                let refresh = refresh.clone();
+                let snapshot_bands = snapshot_bands.clone();
+                let preamp_db = preamp_db.clone();
+                let redraw = redraw.clone();
+
+                let sb_begin = snapshot_bands.clone();
+                let pd_begin = preamp_db.clone();
+                let sb_update = snapshot_bands.clone();
+                let pd_update = preamp_db.clone();
+
+                let ds_update = drag_state.clone();
+                let g_update = graph.clone();
+                let reg_update = registry.clone();
+                let gr_update = gain_request.clone();
+                let rf_update = refresh.clone();
+                let rd_update = redraw.clone();
+
+                let ds_begin = drag_state.clone();
+                let g_begin = graph.clone();
+                let sel_begin = selection.clone();
+
+                drag_gesture.connect_drag_begin(move |_gesture, start_x, start_y| {
+                    let snapshot_bands = &sb_begin;
+                    let preamp_db = &pd_begin;
+                    let drag_state = &ds_begin;
+                    let graph = &g_begin;
+                    let selection = &sel_begin;
+                    *drag_state.borrow_mut() = GraphDrag::default();
+                    let snapshot = snapshot_bands();
+                    let preamp = preamp_db();
+                    if snapshot.is_empty() {
+                        return;
+                    }
+                    let (width, height) = {
+                        let g = graph.borrow();
+                        (
+                            g.response_area.width() as f64,
+                            g.response_area.height() as f64,
+                        )
+                    };
+                    if width <= 0.0 || height <= 0.0 {
+                        return;
+                    }
+                    // Hit-test every active band's dot: 32 px, the upstream
+                    // GRAPH_POINT_HIT_RADIUS_PX.
+                    let mut best: Option<(usize, f64, f64, f64)> = None;
+                    for band in &snapshot {
+                        if band.mute {
+                            continue;
+                        }
+                        let (bx, by) = crate::window_graph::band_dot_position(
+                            band.frequency,
+                            &snapshot,
+                            preamp,
+                            width,
+                            height,
+                        );
+                        let dist = ((bx - start_x).powi(2) + (by - start_y).powi(2)).sqrt();
+                        if dist < 32.0 && best.is_none_or(|(_, d, _, _)| dist < d) {
+                            best = Some((band.index, dist, bx, by));
+                        }
+                    }
+                    let Some((index, _, px, py)) = best else {
+                        return;
+                    };
+                    {
+                        let mut st = drag_state.borrow_mut();
+                        st.band_index = Some(index);
+                        st.start_q = snapshot.iter().find(|b| b.index == index).map(|b| b.q);
+                        st.start_point = Some((px, py));
+                    }
+                    selection(index);
+                });
+
+                drag_gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+                    let snapshot_bands = &sb_update;
+                    let preamp_db = &pd_update;
+                    let drag_state = &ds_update;
+                    let graph = &g_update;
+                    let registry = &reg_update;
+                    let gain_request = &gr_update;
+                    let refresh = &rf_update;
+                    let redraw = &rd_update;
+                    let index = match drag_state.borrow().band_index {
+                        Some(i) => i,
+                        None => return,
+                    };
+                    // 2 px threshold separates a click from a drag (upstream
+                    // graph_drag_threshold_passed).
+                    if !drag_state.borrow().edit_active {
+                        if (offset_x * offset_x + offset_y * offset_y).sqrt() < 2.0 {
+                            return;
+                        }
+                        drag_state.borrow_mut().edit_active = true;
+                    }
+                    let (width, height) = {
+                        let g = graph.borrow();
+                        (
+                            g.response_area.width() as f64,
+                            g.response_area.height() as f64,
+                        )
+                    };
+                    if width <= 0.0 || height <= 0.0 {
+                        return;
+                    }
+                    let is_shift = gesture
+                        .current_event_state()
+                        .contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                    let snapshot = snapshot_bands();
+                    let preamp = preamp_db();
+                    let Some(band) = snapshot.iter().find(|b| b.index == index).cloned() else {
+                        return;
+                    };
+                    if is_shift {
+                        // Shift + vertical: Q only, from the drag start.
+                        let start_q = drag_state.borrow().start_q.unwrap_or(band.q);
+                        let new_q = (start_q - offset_y * 0.005)
+                            .clamp(crate::core::EQ_Q_MIN, crate::core::EQ_Q_MAX);
+                        edit_fader(registry, index, |f| {
+                            f.q_value = new_q;
+                        });
+                    } else {
+                        // X -> frequency: the dot's ORIGINAL x plus the offset,
+                        // so the dot tracks the mouse delta (upstream keeps
+                        // drag_start_point_x for exactly this).
+                        let (px, py) = drag_state.borrow().start_point.unwrap_or((0.0, 0.0));
+                        let freq = crate::window_graph::x_to_frequency(
+                            px + offset_x,
+                            width,
+                            crate::window_graph::GRAPH_PLOT_LEFT,
+                            crate::window_graph::GRAPH_PLOT_RIGHT,
+                        );
+                        let gain_capable = matches!(
+                            band.filter_type,
+                            crate::core::FilterType::Bell
+                                | crate::core::FilterType::HiShelf
+                                | crate::core::FilterType::LoShelf
+                                | crate::core::FilterType::Sin
+                        );
+                        // Y -> gain with every other band's contribution
+                        // subtracted, so the dot stays under the mouse on the
+                        // combined curve.
+                        if gain_capable {
+                            let curr_y = py + offset_y;
+                            let target_db = crate::window_graph::y_to_db(
+                                curr_y,
+                                height,
+                                crate::window_graph::GRAPH_PLOT_TOP,
+                                crate::window_graph::GRAPH_PLOT_BOTTOM,
+                            );
+                            let mut others = snapshot.clone();
+                            if let Some(b) = others.iter_mut().find(|b| b.index == index) {
+                                b.filter_type = crate::core::FilterType::Off;
+                            }
+                            let db_others = crate::core::total_response_db(
+                                &others,
+                                preamp,
+                                crate::core::SAMPLE_RATE,
+                                freq,
+                            );
+                            let mut new_gain = target_db - db_others;
+                            if matches!(
+                                band.filter_type,
+                                crate::core::FilterType::LoShelf | crate::core::FilterType::HiShelf
+                            ) {
+                                // At centre frequency a shelf provides half
+                                // its gain in dB.
+                                new_gain *= 2.0;
+                            }
+                            // The owner-authoritative path: peak clamp, the
+                            // Smooth neighbour coupling, the fader edit.
+                            gain_request(index, new_gain);
+                        }
+                        edit_fader(registry, index, |f| {
+                            f.frequency = freq.clamp(
+                                crate::core::EQ_FREQUENCY_MIN_HZ,
+                                crate::core::EQ_FREQUENCY_MAX_HZ,
+                            );
+                            f.frequency_label =
+                                crate::window_band_fader::format_frequency_label(f.frequency);
+                        });
+                    }
+                    // Keep the faders' drawn state and the curve in step with
+                    // the drag; the debounced DSP push follows from the
+                    // payload change.
+                    for fader in registry.borrow().iter() {
+                        fader.borrow().drawing_area.queue_draw();
+                    }
+                    refresh();
+                    redraw();
+                });
+
+                drag_gesture.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
+                    *drag_state.borrow_mut() = GraphDrag::default();
+                });
+            }
+            graph
+                .borrow()
+                .response_area
+                .add_controller(drag_gesture.clone());
+        }
 
         let band_editor = Rc::new(BandEditor::new(BandEditorCallbacks {
             frequency_changed: {
@@ -1581,9 +1899,9 @@ impl MiniEqWindow {
                     be.set_selected_sink(&chosen);
                 }
                 match device_curve_memory.borrow().get(&chosen).cloned() {
-                    Some((bands, preamp)) => {
+                    Some((bands, preamp, name)) => {
                         log::debug!("Output {chosen}: restored its remembered curve");
-                        restore_device_curve(&bands, preamp);
+                        restore_device_curve(&bands, preamp, name);
                     }
                     None => {
                         apply_output_preset_for_sink(
@@ -2629,9 +2947,11 @@ fn apply_remote_command(
     monitor_switch: &gtk4::Switch,
     monitor_summary: &gtk4::Label,
     route_state_handler: &Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>>,
-    device_curve_memory: &Rc<RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64)>>>,
-    snapshot_device_curve: &Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64)>,
-    restore_device_curve: &Rc<dyn Fn(&[crate::core::EqBand], f64)>,
+    device_curve_memory: &Rc<
+        RefCell<HashMap<String, (Vec<crate::core::EqBand>, f64, Option<String>)>>,
+    >,
+    snapshot_device_curve: &Rc<dyn Fn() -> (Vec<crate::core::EqBand>, f64, Option<String>)>,
+    restore_device_curve: &Rc<dyn Fn(&[crate::core::EqBand], f64, Option<String>)>,
 ) {
     use crate::remote_control::RemoteCommand;
     match cmd {
@@ -2742,9 +3062,9 @@ fn apply_remote_command(
                 be.set_selected_sink(&chosen);
             }
             match device_curve_memory.borrow().get(&chosen).cloned() {
-                Some((bands, preamp)) => {
+                Some((bands, preamp, name)) => {
                     log::debug!("D-Bus output {chosen}: restored its remembered curve");
-                    restore_device_curve(&bands, preamp);
+                    restore_device_curve(&bands, preamp, name);
                 }
                 None => apply_output_preset_for_sink(&chosen, output_preset_identity, presets),
             }

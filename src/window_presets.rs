@@ -532,6 +532,14 @@ impl PresetPanel {
             .unwrap_or_default()
     }
 
+    /// Set the displayed preset name without loading it (the per-device
+    /// curve-memory restore replays remembered edits and needs the name to
+    /// agree with what the user last had on this device).
+    pub fn set_current_preset_name(&mut self, name: Option<String>) {
+        self.current_preset_name = name;
+        self.update_state_chip();
+    }
+
     pub fn update_state_chip(&mut self) {
         let signature = self
             .get_signature_callback
