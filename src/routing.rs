@@ -2454,6 +2454,12 @@ impl RoutingEngine {
         self.routed_targets.lock().unwrap().clear();
         *self.last_route_target.lock().unwrap() = None;
         self.routed = false;
+        // Every chain is down: no device wants a chain any more. Without
+        // this the event-driven adoption would re-adopt the just-restored
+        // streams (their records are gone and their targets changed, which
+        // flags streams dirty) into chains that are about to be destroyed
+        // -- the shutdown disconnect.
+        self.eq_wanted.clear();
         // Every chain is down: no stream may keep a fallback link anywhere,
         // and no pending verification may fire afterwards. Drop the whole
         // Sandbox: the restore metadata writes above are discarded by the

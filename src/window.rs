@@ -1349,9 +1349,15 @@ impl MiniEqWindow {
                         }
                         if let Some(be) = backend.borrow_mut().as_mut() {
                             log::debug!(
-                                "push loop: dev={dev} selected={selected} bands={} gains={:?} preamp={preamp_db}",
+                                "push loop: dev={dev} selected={selected} bands={} gains={:?} types={:?} preamp={preamp_db}",
                                 bands.len(),
-                                bands.iter().map(|b| b.gain_db).collect::<Vec<_>>()
+                                bands.iter().map(|b| b.gain_db).collect::<Vec<_>>(),
+                                bands
+                                    .iter()
+                                    .map(|b| crate::filter_chain::native_biquad_label(
+                                        b.filter_type
+                                    ))
+                                    .collect::<Vec<_>>(),
                             );
                             // Only the SELECTED device's edits are the band
                             // payload: the faders show its curve, and pushing
@@ -1371,11 +1377,15 @@ impl MiniEqWindow {
                                 // `Sin` bell while the chain carries `Bell` --
                                 // both render as `bq_peaking`, so comparing
                                 // enums would rebuild on every tick and stop
-                                // the audio on every drag.
+                                // the audio on every drag. The graph's band
+                                // count is fixed at creation (default_bands
+                                // carries all MAX_BANDS, the tail inactive):
+                                // a payload shorter than the graph is a PREFIX
+                                // push, not a topology change.
                                 let types_differ = be
                                     .device_bands(dev)
                                     .map(|cur| {
-                                        cur.len() != bands.len()
+                                        bands.len() > cur.len()
                                             || cur.iter().zip(&bands).any(|(a, b)| {
                                                 crate::filter_chain::native_biquad_label(
                                                     a.filter_type,
@@ -1698,6 +1708,7 @@ impl MiniEqWindow {
         // running a second OS thread.
         {
             let backend = backend.clone();
+            let app_state_for_pump = app_state.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
                 if let Some(be) = backend.borrow_mut().as_mut() {
                     be.pump();
@@ -1711,8 +1722,12 @@ impl MiniEqWindow {
                     be.process_pending_verifies();
                     // Event-driven adoption: the registry/metadata listeners
                     // flag arrivals and moves; drain the flag into one pass.
-                    // Idle cost is a single flag check.
-                    if be.take_streams_dirty() {
+                    // Idle cost is a single flag check. Skipped while the UI
+                    // is tearing down: the exit restore changes every
+                    // stream's target (flagging them dirty) and re-adopting
+                    // them into chains that are about to be destroyed is
+                    // exactly the shutdown disconnect.
+                    if be.take_streams_dirty() && !app_state_for_pump.shutting_down() {
                         match be.adopt_new_streams() {
                             Ok(n) if n > 0 => {
                                 log::info!("Adopted {n} new stream(s) into device chains")

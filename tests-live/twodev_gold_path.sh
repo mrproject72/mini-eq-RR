@@ -34,7 +34,7 @@ if [ "$FLATPAK" = 1 ]; then
   start_app() { setsid nohup flatpak run --env=RUST_LOG=info "$APP_ID" >"$1" 2>&1 < /dev/null & disown; }
   kill_app() { flatpak kill "$APP_ID" >/dev/null 2>&1; kill "$APP_PID" 2>/dev/null; }
 else
-  start_app() { setsid nohup env RUST_LOG=info ./target/release/mini-eq-rr >"$1" 2>&1 < /dev/null & disown; }
+  start_app() { setsid nohup env RUST_LOG=debug ./target/release/mini-eq-rr >"$1" 2>&1 < /dev/null & disown; }
   kill_app() { kill "$APP_PID" 2>/dev/null; }
 fi
 DEV_A="alsa_output.pci-0000_04_00.6.analog-stereo"
@@ -168,13 +168,25 @@ PID_B=$!
 sleep 5
 echo "baseline: $(stream_links)"
 
-# --- 4. app launch + device 1: select, apply curve 1, route --------------------
+# --- 4. app launch + device 1: the USER'S order -- route on BEFORE the preset ---
+# Enabling the EQ first is how the enable oscillation was found: the chain is
+# built from the linked preset while the faders still hold the defaults, and
+# a type/topology mismatch between them must NEVER trigger a chain rebuild
+# (route -> unroute -> rebuild -> re-route disconnects the audio).
 start_app "$SCRATCH/app.log"
 APP_PID=$!
 sleep 6
 $DBUS call SetOutputSink "s:$DEV_A" >/dev/null
-$DBUS call SetPreset s:gold_loud >/dev/null
 dbus_bool SetRoutingEnabled true
+sleep 6
+module_reloads() {
+  # grep -c prints the count (0) even when it exits 1 -- do not add a
+  # fallback echo or the output becomes "0\n0" and breaks the [ -le ] test.
+  grep -c 'module unloaded' "$1" 2>/dev/null || true
+}
+RELOADS_AT_ENABLE="$(module_reloads "$SCRATCH/app.log")"
+check "step 2a: no chain rebuild on enable (topology stable)" bash -c "[ '$RELOADS_AT_ENABLE' -le 0 ]"
+$DBUS call SetPreset s:gold_loud >/dev/null
 sleep 8
 OUT_A="$(eq_out_for "$DEV_A")"; OUT_B="$(eq_out_for "$DEV_B")"
 RMS_A1="$(rms_of "$OUT_A")"
@@ -221,6 +233,22 @@ check "step 6a: both streams back on their devices (not pathless/EQ)" python3 -c
 s = '''$LINKS_AFTER'''
 assert s != 'NO-LINKS', 'streams pathless after quit'
 assert 'mini_eq_sink' not in s, f'still linked into EQ after quit: {s}'"
+# The shutdown re-adoption: the exit restore changes every stream's target,
+# flagging them dirty; if the tick re-adopts them into the dying chains the
+# streams bounce one last time (the shutdown disconnect). The links above
+# are the +4s FINAL state -- also assert they are STABLE by re-checking
+# after a settle, and that no adoption ran after the restore in the log.
+sleep 3
+LINKS_SETTLED="$(stream_links)"
+check "step 6a2: links stable after settle (no re-adoption bounce)" python3 -c "
+assert '''$LINKS_AFTER''' == '''$LINKS_SETTLED''', f'links moved after quit: $LINKS_AFTER -> $LINKS_SETTLED'"
+check "step 6a3: no adoption after the exit restore (log)" bash -c "
+[ \"\$(grep -c 'Adopted' \"$SCRATCH/app.log\" | tail -1)\" ] || true
+last_restore=\$(grep -n 'Unroute complete' \"$SCRATCH/app.log\" | tail -1 | cut -d: -f1)
+last_adopt=\$(grep -n 'Adopted' \"$SCRATCH/app.log\" | tail -1 | cut -d: -f1)
+[ -z \"\$last_restore\" ] && exit 0
+[ -z \"\$last_adopt\" ] && exit 0
+[ \"\$last_adopt\" -lt \"\$last_restore\" ]"
 check "step 6b: players alive after quit" bash -c "
 kill -0 $PID_A 2>/dev/null && kill -0 $PID_B 2>/dev/null"
 check "step 6c: app exited on Quit" bash -c "! kill -0 $APP_PID 2>/dev/null"

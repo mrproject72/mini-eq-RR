@@ -823,6 +823,17 @@ impl PipeWireBackend {
         }
         let was_wanted = self.routing.is_device_eq_enabled(physical_sink);
         if self.device_chains.borrow().contains_key(physical_sink) {
+            let cur = self.device_bands(physical_sink).unwrap_or_default();
+            log::info!(
+                "Chain rebuild for {physical_sink}: current types {:?} vs new {:?}",
+                cur.iter()
+                    .map(|b| crate::filter_chain::native_biquad_label(b.filter_type))
+                    .collect::<Vec<_>>(),
+                bands
+                    .iter()
+                    .map(|b| crate::filter_chain::native_biquad_label(b.filter_type))
+                    .collect::<Vec<_>>(),
+            );
             // Hand the streams back first: the chain's death drops every
             // link into it, and a deliberate restore is faster and more
             // predictable than WirePlumber's recovery. The device's EQ off
