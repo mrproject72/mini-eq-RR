@@ -753,9 +753,22 @@ impl MiniEqWindow {
                         // X -> frequency: the dot's ORIGINAL x plus the offset,
                         // so the dot tracks the mouse delta (upstream keeps
                         // drag_start_point_x for exactly this).
-                        let (px, py) = drag_state.borrow().start_point.unwrap_or((0.0, 0.0));
+                        // The mouse's ABSOLUTE widget-local position (the
+                        // gesture start + the offset): the previous
+                        // dot-relative form (the dot's stored pixel + the
+                        // offset) produced 20 Hz from a rightward drag -- the
+                        // stored dot x was computed against a stale/other
+                        // frame. The mouse-absolute form has no stored state
+                        // to go stale; the grab is <= 32 px, so the initial
+                        // snap is imperceptible.
+                        let (start_x, start_y) = match gesture.start_point() {
+                            Some(p) => p,
+                            None => return,
+                        };
+                        let mouse_x = start_x + offset_x;
+                        let mouse_y = start_y + offset_y;
                         let freq = crate::window_graph::x_to_frequency(
-                            px + offset_x,
+                            mouse_x,
                             width,
                             crate::window_graph::GRAPH_PLOT_LEFT,
                             crate::window_graph::GRAPH_PLOT_RIGHT,
@@ -771,9 +784,8 @@ impl MiniEqWindow {
                         // subtracted, so the dot stays under the mouse on the
                         // combined curve.
                         if gain_capable {
-                            let curr_y = py + offset_y;
                             let target_db = crate::window_graph::y_to_db(
-                                curr_y,
+                                mouse_y,
                                 height,
                                 crate::window_graph::GRAPH_PLOT_TOP,
                                 crate::window_graph::GRAPH_PLOT_BOTTOM,
@@ -1202,6 +1214,8 @@ impl MiniEqWindow {
             // gate both -- which is exactly what upstream's `analyzer_frozen`
             // does to `on_analyzer_levels` / `on_analyzer_loudness`.
             let app_for_exit = app.clone();
+            let window_for_exit = window.clone();
+            let state_for_exit = app_state.clone();
             let last_state_signature: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
             let presets_for_chip = utility.presets.clone();
             let monitor_frozen = utility.monitor.frozen.clone();
@@ -1409,6 +1423,13 @@ impl MiniEqWindow {
                 // the streams, and every player goes silent.
                 if crate::exit_guard::take_terminate_request() {
                     log::warn!("termination signal received: shutting down cleanly");
+                    // The same path the D-Bus Quit takes: close the window so
+                    // the close-request handler runs the full routing restore
+                    // while the main loop is still alive. `Application::quit`
+                    // alone would kill the loop first and the shutdown
+                    // restore cannot round-trip PipeWire without it.
+                    state_for_exit.set_shutting_down(true);
+                    window_for_exit.close();
                     app_for_exit.quit();
                     return ControlFlow::Break;
                 }
